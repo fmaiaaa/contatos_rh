@@ -141,6 +141,18 @@ def atualizar_contacto(sf, contacto_id, novos_dados):
         print(f"Erro ao atualizar contacto: {e}")
 
 
+def criar_contato_payload(sf, payload: dict):
+    """
+    Cria um único Contact com o dict já montado (campos de API).
+    Retorna (id_ou_None, erro_texto_ou_None).
+    """
+    try:
+        res = sf.Contact.create(payload)
+        return res.get("id"), None
+    except Exception as e:
+        return None, str(e)
+
+
 def preenchimento_em_massa(sf, lista_contactos):
     """
     Insere vários contactos de uma vez usando a API Bulk. (Massa)
