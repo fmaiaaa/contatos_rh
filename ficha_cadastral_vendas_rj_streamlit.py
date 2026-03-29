@@ -1324,6 +1324,304 @@ def cabecalho_planilha() -> List[str]:
     ]
 
 
+def _norm_cabecalho_planilha(s: str) -> str:
+    """Normaliza texto de cabeçalho para casar com colunas da planilha."""
+    return " ".join((s or "").strip().split()).casefold()
+
+
+def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[str, Any]:
+    """
+    Converte uma linha da aba Corretores (valores alinhados aos cabeçalhos) em dict de chaves do formulário.
+    Cabeçalhos devem corresponder aos rótulos em CAMPOS (como em `cabecalho_planilha`).
+    """
+    hmap: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        key = _norm_cabecalho_planilha(h)
+        if key and key not in hmap:
+            hmap[key] = i
+    # Garante células alinhadas ao número de colunas do cabeçalho
+    if len(cells) < len(headers):
+        cells = list(cells) + [""] * (len(headers) - len(cells))
+    dados: Dict[str, Any] = {}
+    for c in CAMPOS:
+        lab = _norm_cabecalho_planilha(c["label"])
+        idx = hmap.get(lab)
+        if idx is None:
+            for i, h in enumerate(headers):
+                if (h or "").strip() == c["label"]:
+                    idx = i
+                    break
+        raw = ""
+        if idx is not None and idx < len(cells):
+            raw = cells[idx]
+        tipo = c["tipo"]
+        if tipo == "multiselect":
+            if not (raw or "").strip():
+                dados[c["key"]] = []
+            else:
+                partes = [p.strip() for p in re.split(r"[;\n]", str(raw)) if p.strip()]
+                dados[c["key"]] = partes
+        elif tipo == "number":
+            s = (str(raw).strip() if raw is not None else "")
+            if not s:
+                dados[c["key"]] = None
+            else:
+                try:
+                    dados[c["key"]] = float(s.replace(",", "."))
+                except ValueError:
+                    dados[c["key"]] = None
+        elif tipo == "checkbox":
+            v = (str(raw).strip().lower() if raw is not None else "")
+            dados[c["key"]] = v in ("true", "1", "sim", "yes", "verdadeiro", "x")
+        else:
+            dados[c["key"]] = (str(raw).strip() if raw is not None else "") or ""
+    return dados
+
+
+def ler_planilha_corretores_bruta(
+    creds_dict: Dict[str, Any],
+    spreadsheet_id: str,
+    worksheet_name: str,
+) -> Tuple[List[str], List[List[str]]]:
+    """Cabeçalho (linha 1) e linhas de dados seguintes (ignora linhas totalmente vazias)."""
+    gc = _cliente_gspread(creds_dict)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    all_v = ws.get_all_values()
+    if not all_v:
+        return [], []
+    headers = list(all_v[0])
+    rows: List[List[str]] = []
+    for r in all_v[1:]:
+        if any((c or "").strip() for c in r):
+            rows.append(list(r))
+    return headers, rows
+
+
+def _preview_linha_planilha(headers: List[str], cells: List[str]) -> str:
+    d = dados_dict_de_linha_planilha(headers, cells)
+    nome = (d.get("nome_completo") or "").strip()[:36]
+    em = (d.get("email") or "").strip()[:32]
+    partes = [p for p in (nome, em) if p]
+    return " · ".join(partes) if partes else "(sem nome/e-mail visível)"
+
+
+def _teste_planilha_sf_habilitado() -> bool:
+    """Ative com FICHA_TEST_PLANILHA=1 ou ?test_planilha=1 na URL (ferramenta de desenvolvimento)."""
+    if os.environ.get("FICHA_TEST_PLANILHA", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        v = st.query_params.get("test_planilha", "")
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _aplicar_dados_teste_ao_session_state(dados: Dict[str, Any]) -> None:
+    """Grava valores no session_state e no snapshot para todas as etapas enxergarem os dados."""
+    ss = st.session_state
+    snap = dict(ss.get("ficha_snap_campos") or {})
+    for c in CAMPOS:
+        k = c["key"]
+        if k not in dados:
+            continue
+        ss[f"fld_{k}"] = dados[k]
+        snap[k] = dados[k]
+    ss["ficha_snap_campos"] = snap
+
+
+def _executar_teste_criar_sf_de_linha_planilha(
+    *,
+    row_1based_sheet: int,
+    headers: List[str],
+    cells: List[str],
+    atualizar_status_nesta_linha: bool,
+    anexar_nova_linha_duplicada: bool,
+    enviar_email_boas_vindas: bool,
+) -> Tuple[bool, str]:
+    """
+    Monta payload a partir da linha da planilha, cria contato no Salesforce.
+    Retorna (ok, mensagem_html_ou_texto).
+    """
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if not creds:
+        return False, "Configure **[google_sheets]** nos Secrets (SERVICE_ACCOUNT_JSON)."
+
+    gs: Dict[str, Any] = {}
+    if hasattr(st, "secrets"):
+        try:
+            gs = dict(st.secrets.get("google_sheets", {}))
+        except Exception:
+            gs = {}
+    sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
+    wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
+
+    dados = dados_dict_de_linha_planilha(headers, cells)
+    dados = enriquecer_derivados_vendas_rj(dados)
+    erros = validar_obrigatorios(dados)
+    if erros:
+        lista = "<br>".join(f"• {html.escape(e)}" for e in erros)
+        return False, f"<strong>Validação:</strong><br>{lista}"
+
+    _aplicar_secrets_sf()
+    if not _credenciais_salesforce_ok():
+        return False, "Salesforce não configurado (Secrets / variáveis USER, PASSWORD, TOKEN)."
+    if not _SF_SDK_DISPONIVEL:
+        return False, "Pacote **simple_salesforce** não instalado."
+
+    payload, avisos = montar_payload_salesforce(dados)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados))
+
+    row_num_atualizar = row_1based_sheet
+
+    if anexar_nova_linha_duplicada:
+        try:
+            linha = linha_planilha(dados)
+            cab = cabecalho_planilha()
+            row_num_atualizar = anexar_linha(linha, cab, sid, wname, creds)
+        except Exception as e:
+            return False, f"Erro ao anexar linha na planilha: {html.escape(str(e))}"
+
+    sf = conectar_salesforce()
+    if not sf:
+        if atualizar_status_nesta_linha and row_num_atualizar >= 2:
+            try:
+                atualizar_status_envio_salesforce(
+                    sid, wname, creds, row_num_atualizar, "Erro",
+                    "Falha ao conectar ao Salesforce.", "",
+                )
+            except Exception:
+                pass
+        return False, "Falha ao conectar ao Salesforce (credenciais ou rede)."
+
+    cid, err = criar_contato_payload(sf, payload)
+    link = _url_contact(cid) if cid else ""
+
+    if atualizar_status_nesta_linha and row_num_atualizar >= 2:
+        try:
+            if cid:
+                atualizar_status_envio_salesforce(sid, wname, creds, row_num_atualizar, "Sucesso", "", link)
+            else:
+                atualizar_status_envio_salesforce(
+                    sid, wname, creds, row_num_atualizar, "Erro",
+                    str(err)[:49000] if err else "Erro desconhecido", "",
+                )
+        except Exception as ex:
+            avisos.append(f"Planilha (status): {ex}")
+
+    if enviar_email_boas_vindas:
+        try:
+            _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
+        except Exception as ex:
+            avisos.append(f"E-mail: {ex}")
+
+    av_txt = ""
+    if avisos:
+        av_txt = "<br><strong>Avisos:</strong><br>" + "<br>".join(f"• {html.escape(str(a))}" for a in avisos)
+
+    if cid:
+        url_esc = html.escape(link)
+        return True, (
+            f"<strong>Contato criado.</strong> Id: <code>{html.escape(str(cid))}</code><br>"
+            f'<a href="{url_esc}" target="_blank" rel="noopener">Abrir no Salesforce</a>'
+            f"{av_txt}"
+        )
+    return False, f"<strong>Erro Salesforce:</strong> {html.escape(str(err) if err else 'desconhecido')}{av_txt}"
+
+
+def _render_sidebar_teste_planilha_sf() -> None:
+    """Painel na sidebar: escolher linha da planilha e testar criação no SF (sem preencher o formulário manualmente)."""
+    with st.sidebar:
+        st.markdown("##### Teste rápido — planilha → Salesforce")
+        st.caption(
+            "Lê a aba **Corretores** (mesmo ID/aba dos Secrets). **Não** exige LGPD. "
+            "Desative em produção: remova `FICHA_TEST_PLANILHA` e o parâmetro `test_planilha` da URL."
+        )
+        if st.button("Carregar linhas da planilha", key="test_pl_carregar"):
+            creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+            if not creds:
+                st.error("Secrets **google_sheets** ausente ou JSON inválido.")
+            else:
+                gs: Dict[str, Any] = {}
+                if hasattr(st, "secrets"):
+                    try:
+                        gs = dict(st.secrets.get("google_sheets", {}))
+                    except Exception:
+                        gs = {}
+                sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
+                wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
+                try:
+                    h, rows = ler_planilha_corretores_bruta(creds, sid, wname)
+                    st.session_state["test_pl_headers"] = h
+                    st.session_state["test_pl_rows"] = rows
+                    st.success(f"{len(rows)} linha(s) com dados (cabeçalho: {len(h)} colunas).")
+                except Exception as e:
+                    st.error(f"Falha ao ler a planilha: {e}")
+
+        headers = list(st.session_state.get("test_pl_headers") or [])
+        rows = list(st.session_state.get("test_pl_rows") or [])
+        if not rows or not headers:
+            st.info("Clique em **Carregar linhas da planilha** e escolha a aba configurada em **WORKSHEET_NAME**.")
+            return
+
+        labels = [
+            f"Linha {i + 2} — {_preview_linha_planilha(headers, rows[i])}"
+            for i in range(len(rows))
+        ]
+        opts_idx = list(range(len(labels)))
+        escolha = st.selectbox(
+            "Linha da planilha (linha 2 = primeira de dados)",
+            opts_idx,
+            format_func=lambda i: labels[i],
+            key="test_pl_select_idx",
+        )
+        idx = int(escolha) if escolha is not None else 0
+        row_1based = idx + 2
+
+        atualizar = st.checkbox(
+            "Atualizar **Envio?**, **Log / erro** e **Link do contato** na planilha "
+            "(na linha escolhida; se duplicar abaixo, na **linha nova**)",
+            value=True,
+            key="test_pl_atualizar_status",
+        )
+        duplicar = st.checkbox(
+            "Antes do SF, **anexar** cópia da linha no fim da aba (mantém a linha original intacta)",
+            value=False,
+            key="test_pl_duplicar_linha",
+        )
+        mail_test = st.checkbox("Disparar também **e-mail de boas-vindas** (mais lento)", value=False, key="test_pl_mail")
+
+        if st.button("Carregar esta linha no formulário", key="test_pl_aplicar_form"):
+            cells = rows[idx]
+            dados = enriquecer_derivados_vendas_rj(dados_dict_de_linha_planilha(headers, cells))
+            _aplicar_dados_teste_ao_session_state(dados)
+            st.session_state["ficha_secao_idx"] = 0
+            st.success("Formulário preenchido a partir da planilha. Revise as etapas e envie se quiser.")
+            st.rerun()
+
+        if st.button("Criar contato no Salesforce (teste)", type="primary", key="test_pl_criar_sf"):
+            cells = rows[idx]
+            ok, msg = _executar_teste_criar_sf_de_linha_planilha(
+                row_1based_sheet=row_1based,
+                headers=headers,
+                cells=cells,
+                atualizar_status_nesta_linha=atualizar,
+                anexar_nova_linha_duplicada=duplicar,
+                enviar_email_boas_vindas=mail_test,
+            )
+            if ok:
+                st.markdown(
+                    f'<div class="ficha-alert ficha-alert--azul">{msg}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="ficha-alert ficha-alert--vermelho">{msg}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
 def secoes_ordenadas() -> List[str]:
     presentes = {c["sec"] for c in CAMPOS}
     return [s for s in SEC_ORDER if s in presentes]
@@ -3678,11 +3976,18 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador, **links** �
 
 def main():
     fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    # Só variável de ambiente aqui: `st.query_params` não pode vir antes de `set_page_config`.
+    _abrir_sidebar_teste = os.environ.get("FICHA_TEST_PLANILHA", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     st.set_page_config(
         page_title="Credenciamento | Direcional Vendas RJ",
         page_icon=str(fav) if fav else None,
         layout="centered",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded" if _abrir_sidebar_teste else "collapsed",
     )
     _aplicar_secrets_sf()
     aplicar_estilo()
@@ -3690,6 +3995,9 @@ def main():
 
     ss = st.session_state
     ss.setdefault("ficha_sucesso", False)
+
+    if _teste_planilha_sf_habilitado():
+        _render_sidebar_teste_planilha_sf()
 
     if ss.get("ficha_sucesso"):
         if not ss.get("ficha_popup_recursos_ok"):
