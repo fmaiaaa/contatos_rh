@@ -48,7 +48,7 @@ except ImportError:
 
 COR_AZUL_ESC = "#044b99"
 COR_VERMELHO = "#e30613"
-COR_FUNDO = "#fcfdfe"
+COR_FUNDO = "#044b99"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
 COR_TEXTO_MUTED = "#64748b"
