@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
+_DIR_APP = Path(__file__).resolve().parent
+
 # --- Salesforce (simple_salesforce; antes: salesforce_api.py) ---
 try:
     from simple_salesforce import Salesforce, SalesforceAuthenticationFailed
