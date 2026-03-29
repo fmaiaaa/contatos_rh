@@ -17,6 +17,7 @@ import smtplib
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape_para_pdf
 
 # Módulos locais: no Cloud os .py podem estar só na raiz, só em salesforce/ ou mistos
 # (ex.: corretor_campos na raiz e google_sheets_corretor só em salesforce/).
@@ -43,10 +44,12 @@ import streamlit as st
 import ficha_seguranca
 
 from corretor_campos import (
+    ATIVIDADE_VENDAS_RJ_OPTS,
     CAMPOS,
     NOMES_CONTA_FIXOS,
     cabecalho_planilha,
     campos_por_secao_visiveis,
+    email_contato_formato_valido,
     enriquecer_derivados_vendas_rj,
     linha_planilha,
     montar_payload_salesforce,
@@ -133,6 +136,14 @@ LINKS_POS_CADASTRO: list[tuple[str, str]] = [
     ("Entrar no grupo — WhatsApp", URL_WHATSAPP_EQUIPE),
 ]
 
+# Texto institucional do e-mail automático (apresentação + materiais de vendas).
+_APRESENTACAO_DIRECIONAL_PLAIN = (
+    "A Direcional Engenharia é uma das principais empresas de incorporação e construção do Brasil, "
+    "com histórico de entregas, foco em qualidade e relacionamento transparente com clientes e parceiros. "
+    "Na operação Direcional Vendas Rio de Janeiro, você integra nossa rede comercial com acesso a "
+    "materiais, treinamentos e ferramentas para atuar com nossos empreendimentos."
+)
+
 # Popup pós-cadastro: mesma altura do minimapa e do iframe do YouTube (largura 100% do diálogo)
 POPUP_MAPA_ALTURA_PX = 320
 
@@ -172,6 +183,12 @@ def _aplicar_secrets_sf():
                 os.environ["SALESFORCE_PASSWORD"] = str(sec["PASSWORD"]).strip()
             if sec.get("TOKEN"):
                 os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"]).strip()
+            os.environ.pop("SF_RECORD_TYPE_ID", None)
+            for rt_key in ("RECORD_TYPE_ID", "record_type_id", "RECORD_TYPE_CORRETOR"):
+                rt = str(sec.get(rt_key) or "").strip()
+                if rt and rt.lower() not in ("omit", "none", "false", "-", "0"):
+                    os.environ["SF_RECORD_TYPE_ID"] = rt
+                    break
     except Exception:
         pass
 
@@ -767,6 +784,8 @@ def _widget_campo(c: dict):
             opts = _opcoes_nome_conta()
             if not opts:
                 opts = list(NOMES_CONTA_FIXOS)
+        elif k == "atividade":
+            opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
         if k == "possui_creci":
             opts = ["Sim", "Não"]
             return st.selectbox(
@@ -1000,27 +1019,50 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
         ) from e
 
     def _registrar_fonte_pdf() -> str:
+        """Registra TTF com suporte a UTF-8 (acentos PT-BR). Sem TTF, usa Helvetica + cp1252 em _cell_txt."""
         candidatos: list[str] = []
-        if platform.system() == "Windows":
+        sysname = platform.system()
+        if sysname == "Windows":
             w = os.environ.get("WINDIR", r"C:\Windows")
             candidatos.extend(
                 [
+                    os.path.join(w, "Fonts", "arialuni.ttf"),
                     os.path.join(w, "Fonts", "arial.ttf"),
                     os.path.join(w, "Fonts", "Arial.ttf"),
-                    os.path.join(w, "Fonts", "arialuni.ttf"),
+                ]
+            )
+        elif sysname == "Darwin":
+            candidatos.extend(
+                [
+                    "/Library/Fonts/Arial Unicode.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                    "/Library/Fonts/Arial.ttf",
                 ]
             )
         else:
-            candidatos.extend(
-                [
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                ]
-            )
-        for p in candidatos:
-            if os.path.isfile(p):
+            # Linux (Streamlit Cloud, Docker): caminhos usuais de pacotes de fontes
+            for root in ("/usr/share/fonts", "/usr/local/share/fonts"):
+                if not os.path.isdir(root):
+                    continue
+                for sub, nome in (
+                    ("truetype/dejavu", "DejaVuSans.ttf"),
+                    ("TTF", "DejaVuSans.ttf"),
+                    ("truetype/liberation", "LiberationSans-Regular.ttf"),
+                    ("truetype/noto", "NotoSans-Regular.ttf"),
+                    ("truetype/freefont", "FreeSans.ttf"),
+                ):
+                    p = os.path.join(root, sub, nome)
+                    if os.path.isfile(p):
+                        candidatos.append(p)
+        # Fonte junto ao app (deploy: copiar DejaVuSans.ttf para assets/fonts/)
+        _font_app = _DIR_APP / "assets" / "fonts" / "DejaVuSans.ttf"
+        if _font_app.is_file():
+            candidatos.insert(0, str(_font_app))
+
+        for path in candidatos:
+            if os.path.isfile(path):
                 try:
-                    pdfmetrics.registerFont(TTFont("FichaPdfFont", p))
+                    pdfmetrics.registerFont(TTFont("FichaPdfFont", path))
                     return "FichaPdfFont"
                 except Exception:
                     continue
@@ -1062,10 +1104,20 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
     st_body = ParagraphStyle(name="Corpo", parent=styles["Normal"], fontName=font, fontSize=9, leading=12)
 
     def _cell_txt(x: Any) -> str:
+        """Texto seguro para Paragraph: TTF aceita Unicode; Helvetica usa WinAnsi (cp1252) para PT-BR."""
         s = str(x) if x is not None else ""
-        if font == "Helvetica":
-            return s.encode("ascii", "replace").decode("ascii")
-        return s
+        if font != "Helvetica":
+            return s
+        # Helvetica no ReportLab = WinAnsiEncoding (~cp1252): português completo, sem «?» nos acentos.
+        try:
+            return s.encode("cp1252", "replace").decode("cp1252")
+        except Exception:
+            return s
+
+    def _para_celula(s: str) -> Paragraph:
+        """Células da tabela como Paragraph (Unicode + acentos) com escape XML mínimo."""
+        t = _xml_escape_para_pdf(_cell_txt(s)).replace("\n", "<br/>")
+        return Paragraph(t, st_body)
 
     largura = 17 * cm
     story: list = []
@@ -1111,11 +1163,14 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
             vtxt = "; ".join(str(x) for x in val)
         else:
             vtxt = str(val)
-        linhas_tab.append([_cell_txt(label), _cell_txt(vtxt)])
+        linhas_tab.append([_para_celula(label), _para_celula(vtxt)])
 
     if linhas_tab:
         hdr_bg = colors.HexColor("#e8eef5")
-        t = Table([["Campo", "Resposta"]] + linhas_tab, colWidths=[6 * cm, 11 * cm])
+        t = Table(
+            [[_para_celula("Campo"), _para_celula("Resposta")]] + linhas_tab,
+            colWidths=[6 * cm, 11 * cm],
+        )
         t.setStyle(
             TableStyle(
                 [
@@ -1139,9 +1194,12 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
 
 
 def montar_corpo_email_boas_vindas(
-    dados: dict[str, Any], link_contato_sf: str | None
+    dados: dict[str, Any],
+    link_contato_sf: str | None,
+    *,
+    tem_pdf_anexo: bool,
 ) -> tuple[str, str]:
-    """Texto simples + HTML do e-mail automático (agradecimento + links do popup)."""
+    """Corpo do e-mail automático: apresentação Direcional, cadastro, materiais de vendas e PDF."""
     nome = _nome_candidato_ficha(dados)
     nome_esc = html.escape(nome)
     logo = html.escape(URL_LOGO_DIRECIONAL_EMAIL)
@@ -1169,18 +1227,38 @@ def montar_corpo_email_boas_vindas(
             f"Abrir seu cadastro no Salesforce</a></li>"
         )
 
+    bloco_pdf_plain = (
+        "Anexamos neste e-mail o PDF da sua ficha cadastral (cópia do que você enviou pelo formulário).\n\n"
+        if tem_pdf_anexo
+        else "Não foi possível gerar o PDF automaticamente neste envio; use o popup do formulário "
+        "(após o cadastro) para baixar a cópia ou solicitar reenvio.\n\n"
+    )
+    bloco_pdf_html = (
+        f'<p style="margin:0 0 16px 0;padding:14px 16px;background:{COR_INPUT_BG};border-radius:10px;'
+        f'border-left:4px solid {verm};font-size:14px;line-height:1.55;color:#334155;">'
+        f"<strong>PDF em anexo:</strong> segue a cópia em PDF da sua ficha cadastral.</p>"
+        if tem_pdf_anexo
+        else f'<p style="margin:0 0 16px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">'
+        f"Se o PDF não estiver disponível neste e-mail, abra o <strong>popup de boas-vindas</strong> no "
+        f"formulário para baixar ou reenviar a cópia.</p>"
+    )
+
     plain = (
         f"Olá, {nome},\n\n"
-        "Recebemos o seu cadastro na Direcional Vendas RJ. Agradecemos a confiança — "
-        "está tudo registrado e você já faz parte da nossa base.\n\n"
-        "Materiais e links úteis:\n"
+        "Bem-vindo(a) à Direcional Vendas Rio de Janeiro.\n\n"
+        "Recebemos o seu cadastro com sucesso. Você já está registrado(a) em nossa base — "
+        "agradecemos a confiança e o tempo dedicado.\n\n"
+        "--- A Direcional ---\n"
+        f"{_APRESENTACAO_DIRECIONAL_PLAIN}\n\n"
+        "--- Materiais e canais para sua atuação ---\n"
         + "\n".join(linhas_txt)
         + "\n\n"
-        "No formulário, o popup de boas-vindas também traz o mapa de empreendimentos e o vídeo do simulador. "
-        "Se você fechou o popup, pode voltar ao link do formulário para conferir.\n\n"
-        "Quando disponível, este e-mail inclui o PDF da sua ficha em anexo.\n\n"
+        + bloco_pdf_plain
+        + "No popup do formulário você também encontra o mapa de empreendimentos e o vídeo do simulador.\n\n"
         "Direcional Engenharia · Vendas Rio de Janeiro"
     )
+
+    apresent_esc = html.escape(_APRESENTACAO_DIRECIONAL_PLAIN)
 
     html_body = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -1196,26 +1274,38 @@ box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
 </td>
 </tr>
 <tr>
-<td style="padding:28px 24px 12px 24px;">
-<p style="margin:0 0 12px 0;font-size:20px;font-weight:700;color:{azul};text-align:center;">Cadastro recebido</p>
-<p style="margin:0;font-size:15px;line-height:1.6;color:#475569;text-align:center;">
-Olá, <strong>{nome_esc}</strong> — <strong>você está cadastrado(a)</strong> na Direcional Vendas RJ.
-Agradecemos a confiança e o tempo dedicado; é uma alegria ter você na nossa operação.
+<td style="padding:28px 24px 8px 24px;">
+<p style="margin:0 0 8px 0;font-size:20px;font-weight:700;color:{azul};text-align:center;">
+Bem-vindo(a) à Direcional Vendas RJ</p>
+<p style="margin:0;font-size:15px;line-height:1.65;color:#475569;text-align:center;">
+Olá, <strong>{nome_esc}</strong> — <strong>seu cadastro foi recebido</strong> e você já integra nossa operação comercial.
+Obrigado(a) por escolher seguir conosco.
 </p>
 </td>
 </tr>
-<tr><td style="padding:8px 28px 8px 28px;">
-<p style="margin:0 0 8px 0;font-size:14px;font-weight:700;color:{azul};">Materiais e links úteis</p>
+<tr><td style="padding:16px 28px 8px 28px;">
+<p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">A Direcional</p>
+<p style="margin:0;font-size:14px;line-height:1.65;color:#475569;">{apresent_esc}</p>
+</td></tr>
+<tr><td style="padding:16px 28px 8px 28px;">
+<p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">Materiais e canais para vendas</p>
+<p style="margin:0 0 12px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
+Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe — os mesmos recursos do formulário.
+</p>
 <ul style="margin:0;padding-left:18px;color:#334155;font-size:14px;">
 {"".join(itens_html)}
 </ul>
-<p style="margin:20px 0 0 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-No popup do formulário você também encontra o <strong>mapa de empreendimentos</strong> e o <strong>vídeo</strong> do simulador na mesma largura.
+</td></tr>
+<tr><td style="padding:8px 28px 8px 28px;">
+{bloco_pdf_html}
+<p style="margin:0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
+No <strong>popup de boas-vindas</strong> do formulário há também o <strong>mapa de empreendimentos</strong> e o
+<strong>vídeo</strong> do simulador (mesma experiência visual do cadastro).
 </p>
 </td></tr>
-<tr><td style="padding:16px 24px 28px 24px;">
+<tr><td style="padding:20px 24px 28px 24px;border-top:1px solid {borda};">
 <p style="margin:0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">
-PDF da ficha em anexo, quando disponível · Direcional Engenharia · Vendas Rio de Janeiro
+Direcional Engenharia · Vendas Rio de Janeiro
 </p>
 </td></tr>
 </table>
@@ -1225,6 +1315,30 @@ PDF da ficha em anexo, quando disponível · Direcional Engenharia · Vendas Rio
 </html>"""
 
     return plain, html_body
+
+
+def _smtp_erro_amigavel(exc: BaseException) -> str:
+    """Evita exibir dict/tuple cru do Gmail (ex.: destinatário «K» inválido)."""
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        partes: list[str] = []
+        rec = getattr(exc, "recipients", None) or {}
+        for addr, tup in rec.items():
+            if isinstance(tup, tuple) and len(tup) >= 2:
+                cod, raw = tup[0], tup[1]
+                msg = (
+                    raw.decode("utf-8", "replace")
+                    if isinstance(raw, (bytes, bytearray))
+                    else str(raw)
+                )
+                partes.append(f"{addr}: código {cod} — {msg[:280]}")
+            else:
+                partes.append(f"{addr}: {tup}")
+        if partes:
+            return (
+                "O servidor recusou o destinatário. Confira se o **E-mail** no formulário está completo "
+                "(ex.: nome@empresa.com.br). Detalhe: " + " | ".join(partes[:2])
+            )
+    return str(exc)
 
 
 def enviar_email_boas_vindas_candidato(
@@ -1240,12 +1354,21 @@ def enviar_email_boas_vindas_candidato(
     dest = (dados.get("email") or "").strip()
     if not dest:
         return False, "E-mail do candidato não informado no formulário."
+    if not email_contato_formato_valido(dest):
+        return False, "E-mail do cadastro inválido — use formato nome@dominio.com (evite abreviações como uma única letra)."
 
     nome = _nome_candidato_ficha(dados)
-    plain, html_body = montar_corpo_email_boas_vindas(dados, link_contato_sf)
+    tem_pdf = bool(pdf_bytes)
+    plain, html_body = montar_corpo_email_boas_vindas(
+        dados, link_contato_sf, tem_pdf_anexo=tem_pdf
+    )
 
     msg = MIMEMultipart()
-    msg["Subject"] = f"Cadastro recebido — Direcional Vendas RJ — {nome}"
+    msg["Subject"] = (
+        f"Bem-vindo(a) — Direcional Vendas RJ | Ficha e materiais — {nome}"
+        if tem_pdf
+        else f"Bem-vindo(a) — Direcional Vendas RJ | Cadastro recebido — {nome}"
+    )
     msg["From"] = cfg["from_addr"]
     msg["To"] = dest
 
@@ -1268,9 +1391,9 @@ def enviar_email_boas_vindas_candidato(
             server.starttls()
             server.login(cfg["user"], cfg["password"])
             server.sendmail(cfg["from_addr"], [dest], msg.as_string())
-        return True, "E-mail de boas-vindas enviado para o endereço do cadastro."
+        return True, "E-mail enviado (apresentação, materiais e PDF, se gerado) para o e-mail do cadastro."
     except Exception as e:
-        return False, str(e)
+        return False, _smtp_erro_amigavel(e)
 
 
 def _tentar_enviar_email_boas_vindas(dados: dict[str, Any], contact_id: str | None) -> None:
@@ -1302,6 +1425,8 @@ def _get_smtp_from_secrets():
         user = (s.get("sender_email") or s.get("SMTP_USER") or "").strip()
         password = (s.get("sender_password") or s.get("SMTP_PASSWORD") or "").strip()
         to_fixed = (s.get("to_email") or s.get("TO_EMAIL") or "").strip()
+        if to_fixed and not email_contato_formato_valido(to_fixed):
+            to_fixed = ""
         return {
             "host": host,
             "port": port,
@@ -1326,6 +1451,11 @@ def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra
         to_list.append(destinatario_extra.strip())
     if not to_list:
         return False, "Informe um e-mail de destino no campo abaixo (ou to_email em [ficha_email], opcional)."
+    for addr in to_list:
+        if not email_contato_formato_valido(addr):
+            return False, (
+                f"E-mail de destino inválido ({addr!r}) — use formato completo nome@dominio.com."
+            )
 
     nome = _nome_candidato_ficha(dados)
     msg = MIMEMultipart()
@@ -1356,7 +1486,7 @@ def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra
             server.sendmail(cfg["from_addr"], to_list, msg.as_string())
         return True, "E-mail enviado com sucesso."
     except Exception as e:
-        return False, str(e)
+        return False, _smtp_erro_amigavel(e)
 
 
 def _section_container():
@@ -1669,11 +1799,10 @@ def _dialog_recursos_pos_cadastro() -> None:
 
     st.markdown(
         """
-**Recebemos o seu cadastro com sucesso.** Agradecemos a confiança e o tempo dedicado —
-é uma alegria ter você na **Direcional Vendas RJ**.
+**Recebemos o seu cadastro com sucesso.** Você deve ter recebido **automaticamente** no seu e-mail do cadastro
+uma mensagem com **apresentação da Direcional**, **links de materiais de vendas** e, quando possível, o **PDF da ficha** em anexo.
 
-Confira no **mapa** os empreendimentos, o **vídeo** do simulador (mesma largura do mapa), os **links** úteis,
-depois sua **cópia em PDF** e o **envio por e-mail**.
+Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador, **links** úteis, **download do PDF** e opção de **reenviar** o PDF para outro e-mail.
         """.strip()
     )
     st.markdown("##### Empreendimentos no mapa")
@@ -1742,14 +1871,18 @@ depois sua **cópia em PDF** e o **envio por e-mail**.
     else:
         st.caption("Instale **reportlab** para gerar o PDF.")
 
-    st.markdown("##### Receber por e-mail")
+    st.markdown("##### Reenviar PDF por e-mail (opcional)")
+    st.caption(
+        "O PDF com resumo da ficha já foi enviado ao **e-mail do cadastro** (se o servidor de e-mail estiver configurado). "
+        "Use abaixo para encaminhar uma cópia a outro endereço."
+    )
     mail_extra = st.text_input(
         "Outro e-mail (opcional)",
         placeholder="seu@email.com",
         key="fc_mail_extra_popup",
         label_visibility="visible",
     )
-    if st.button("Enviar PDF por e-mail", use_container_width=True, key="ficha_popup_enviar_email"):
+    if st.button("Reenviar PDF por e-mail", use_container_width=True, key="ficha_popup_enviar_email"):
         if pdf_bytes is None:
             _alert_vermelho("PDF indisponível.")
         else:
@@ -1825,8 +1958,9 @@ def main():
         msg_mail = ss.get("ficha_email_boas_vindas_msg") or ""
         if ok_mail is True:
             _alert_azul(
-                "**Enviamos um e-mail para o endereço informado no cadastro** com o agradecimento, "
-                "os mesmos links úteis do popup e o PDF da ficha (quando disponível)."
+                "**Enviamos um e-mail automático** para o endereço do cadastro com **apresentação da Direcional**, "
+                "**materiais e links de vendas**, **PDF da ficha em anexo** (quando a geração funcionar) e link do "
+                "Salesforce, se o contato tiver sido criado."
             )
         elif ok_mail is False and msg_mail:
             _alert_vermelho_html(
@@ -1835,9 +1969,8 @@ def main():
             )
 
         st.caption(
-            "A **cópia em PDF** e o **reenvio por e-mail** no popup são opcionais — você já deve ter recebido "
-            "o resumo no **e-mail do cadastro**. No popup: mapa, vídeo e links. "
-            "Se fechou o popup, inicie um novo cadastro só para reabri-lo."
+            "No popup: mapa, vídeo e **reenvio opcional** do PDF. O **e-mail principal** (com apresentação, links e PDF) "
+            "já foi disparado para o e-mail do formulário ao concluir o envio."
         )
 
         if st.button("Começar um novo cadastro", use_container_width=True):

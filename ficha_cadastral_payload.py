@@ -14,8 +14,8 @@ import re
 from datetime import date
 from typing import Any
 
-# Record Type "Corretor" — mesmo id usado em criar_contato_cmd.py
-RECORD_TYPE_CORRETOR = "012f1000000n6nN"
+# Defina o Id do tipo de registro da sua org (ou deixe vazio para omitir RecordTypeId no insert).
+RECORD_TYPE_CORRETOR = ""
 
 BASE_URL_CONTACT_VIEW = "https://direcional.lightning.force.com/lightning/r/Contact"
 
@@ -95,9 +95,11 @@ def montar_payload_salesforce_ficha(dados: dict[str, Any]) -> tuple[dict[str, An
         "Regional__c": "RJ",
         "Observacoes__c": obs,
         "Contrato__c": contrato_txt,
-        "RecordTypeId": RECORD_TYPE_CORRETOR,
         "Data_da_Entrevista__c": date.today().isoformat(),
     }
+    rt = (RECORD_TYPE_CORRETOR or "").strip()
+    if rt:
+        payload["RecordTypeId"] = rt
 
     if cpf:
         payload["CPF__c"] = cpf

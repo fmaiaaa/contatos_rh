@@ -6,11 +6,41 @@ Mapeamento para API + planilha Google.
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-RECORD_TYPE_CORRETOR = "012f1000000n6nN"
+# Id legado removido: em outra org gera INVALID_CROSS_REFERENCE_KEY. Defina [salesforce] RECORD_TYPE_ID nos Secrets.
+RECORD_TYPE_CORRETOR = ""
+
+_SF_ID_15_18 = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
+
+_EMAIL_CONTATO_RE = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+)
+
+
+def email_contato_formato_valido(val: Any) -> bool:
+    """Validação simples de e-mail para formulário e SMTP (evita destinos como «K»)."""
+    s = (str(val).strip() if val is not None else "") or ""
+    if not s or len(s) > 254:
+        return False
+    return bool(_EMAIL_CONTATO_RE.match(s))
+
+
+def record_type_id_contato_payload() -> str:
+    """
+    Id do tipo de registro Contact (ex.: Corretor), só se configurado e com formato Id SF.
+    Sem valor válido, retorna vazio e o payload omite RecordTypeId (usa padrão do usuário da API).
+    """
+    for candidate in (
+        (os.environ.get("SF_RECORD_TYPE_ID") or "").strip(),
+        (RECORD_TYPE_CORRETOR or "").strip(),
+    ):
+        if candidate and _SF_ID_15_18.match(candidate):
+            return candidate
+    return ""
 
 # Ordem das seções no Salesforce (não alterar sem checar o layout no org)
 SEC_ORDER: Tuple[str, ...] = (
@@ -92,7 +122,17 @@ SEXOS = ["--Nenhum--", "Masculino", "Feminino"]
 
 CAMISETAS = ["--Nenhum--", "PP", "P", "M", "G", "GG", "XGG"]
 
-UNIDADES_NEGOCIO = ["--Nenhum--", "Direcional", "Parceiros (Externo)"]
+# Valores exibidos no formulário Vendas RJ (mapeados para o picklist SF em `montar_payload_salesforce`).
+UNIDADE_REDE_OUTRA_IMOBILIARIA = "Outra imobiliária (parceira)"
+UNIDADES_NEGOCIO = [
+    "--Nenhum--",
+    "Direcional",
+    "Riva",
+    UNIDADE_REDE_OUTRA_IMOBILIARIA,
+]
+
+# Atividade restrita ao fluxo Vendas RJ (picklist SF: Corretor Parceiro, Corretor, Captador).
+ATIVIDADE_VENDAS_RJ_OPTS = ["--Nenhum--", "Corretor Parceiro", "Corretor", "Captador"]
 
 TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Telefone", "Chave aleatória"]
 
@@ -410,13 +450,24 @@ def _campos_def() -> List[Campo]:
             req=True,
         ),
         _z(
+            key="unidade_negocio",
+            label="Fará parte de qual rede? *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Unidade_Negocio__c",
+            opcoes=UNIDADES_NEGOCIO,
+            req=True,
+            help="Direcional, Riva ou imobiliária parceira (externa).",
+        ),
+        _z(
             key="atividade",
-            label="Atividade *",
+            label="Função na operação *",
             sec="Informações para contato",
             tipo="select",
             sf="Atividade__c",
             opcoes=ATIVIDADE_OPTS,
             req=True,
+            help="No fluxo Vendas RJ o formulário restringe a Corretor Parceiro, Corretor (próprio) e Captador. Corretor = corretor próprio. Parceira externa: gravado como Corretor Parceiro.",
         ),
         _z(
             key="escolaridade",
@@ -435,15 +486,6 @@ def _campos_def() -> List[Campo]:
             sf="Data_da_Entrevista__c",
             req=False,
             help="Definida automaticamente na data do envio.",
-        ),
-        _z(
-            key="unidade_negocio",
-            label="Unidade Negócio",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Unidade_Negocio__c",
-            opcoes=UNIDADES_NEGOCIO,
-            req=False,
         ),
         _z(
             key="data_transferencia_parceiro",
@@ -732,7 +774,7 @@ def _campos_def() -> List[Campo]:
             tipo="select",
             sf="Tipo_Corretor__c",
             opcoes=TIPO_CORRETOR_OPTS,
-            req=True,
+            req=False,
         ),
         _z(
             key="faturamento_comissao",
@@ -846,7 +888,7 @@ CAMPOS: List[Campo] = _campos_def()
 
 # Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
 # valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
-# atividade: sempre «Corretor» (enriquecer_derivados_vendas_rj).
+# tipo_corretor / multiplicadores / apelido / datas: enriquecer_derivados_vendas_rj.
 CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
     {
         "codigo_pessoa_uau",
@@ -858,7 +900,7 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
         "origem",
         "account_id",
         "owner_id",
-        "atividade",
+        "tipo_corretor",
         "apelido",
         "data_entrevista",
         "data_contrato",
@@ -897,6 +939,10 @@ def campos_por_secao_visiveis(
         d = dados or {}
         if (str(d.get("possui_creci") or "").strip()) != "Sim":
             cols = [c for c in cols if c["key"] == "possui_creci"]
+    if sec == "Informações para contato":
+        d = dados or {}
+        if _norm_picklist(d.get("unidade_negocio")) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+            cols = [c for c in cols if c["key"] != "atividade"]
     return cols
 
 
@@ -955,6 +1001,10 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
             continue
+        if c["key"] == "atividade" and _norm_picklist(
+            dados.get("unidade_negocio")
+        ) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+            continue
         if not c.get("req"):
             continue
         k = c["key"]
@@ -979,6 +1029,9 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     nc = (dados.get("nome_completo") or "").strip()
     if not nc:
         erros.append("Nome completo *")
+    em = (dados.get("email") or "").strip()
+    if em and not email_contato_formato_valido(em):
+        erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
     return list(dict.fromkeys(erros))
 
 
@@ -991,6 +1044,13 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     erros: List[str] = []
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            continue
+        if (
+            c["key"] == "atividade"
+            and sec == "Informações para contato"
+            and _norm_picklist(dados.get("unidade_negocio"))
+            == UNIDADE_REDE_OUTRA_IMOBILIARIA
+        ):
             continue
         if c["sec"] != sec or not c.get("req"):
             continue
@@ -1017,6 +1077,10 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         nc = (dados.get("nome_completo") or "").strip()
         if not nc:
             erros.append("Nome completo *")
+    if sec == "Dados para Contato":
+        em = (dados.get("email") or "").strip()
+        if em and not email_contato_formato_valido(em):
+            erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
     return list(dict.fromkeys(erros))
 
 
@@ -1031,7 +1095,10 @@ def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> No
 
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    payload: Dict[str, Any] = {"RecordTypeId": RECORD_TYPE_CORRETOR}
+    payload: Dict[str, Any] = {}
+    rt = record_type_id_contato_payload()
+    if rt:
+        payload["RecordTypeId"] = rt
     avisos: List[str] = []
     extras_obs: List[str] = []
 
@@ -1094,6 +1161,20 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
         if tipo == "select":
             s = _norm_picklist(raw)
+            if key == "unidade_negocio":
+                smap = {
+                    "Direcional": "Direcional",
+                    "Riva": "Direcional",
+                    UNIDADE_REDE_OUTRA_IMOBILIARIA: "Parceiros (Externo)",
+                }
+                s2 = smap.get(s)
+                if s2:
+                    payload[sf] = s2
+                elif s:
+                    payload[sf] = s
+                if s == "Riva":
+                    extras_obs.append("Rede de atuação informada: Riva")
+                continue
             if s:
                 payload[sf] = s
             continue
@@ -1122,12 +1203,38 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
 def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Regras Vendas RJ: Atividade__c sempre «Corretor»; apelido = primeiro nome + _RJ01;
-    datas de entrevista/contrato/credenciamento = hoje; multiplicadores 0,9 e 1
-    (ajuste na org se o campo for percentual diferente).
+    Regras Vendas RJ: rede (Direcional/Riva/parceira) → tipo de corretor e Unidade SF;
+    parceira → Atividade Corretor Parceiro e Origem RH; função → multiplicadores;
+    apelido e datas automáticos.
     """
     out = dict(dados)
-    out["atividade"] = "Corretor"
+    rede = _norm_picklist(out.get("unidade_negocio"))
+
+    if rede == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+        out["atividade"] = "Corretor Parceiro"
+        out["origem"] = "RH"
+    else:
+        act = _norm_picklist(out.get("atividade"))
+        out["atividade"] = act if act else "Corretor"
+
+    if rede in ("Direcional", "Riva"):
+        out["tipo_corretor"] = "Direcional Vendas – Autônomos"
+    elif rede:
+        out["tipo_corretor"] = "Parceiros (Externo)"
+    else:
+        out["tipo_corretor"] = ""
+
+    act_final = out.get("atividade") or ""
+    if act_final == "Captador":
+        out["multiplicador_nivel"] = 0.9
+        out["multiplicador_regime"] = 1.0
+    elif act_final in ("Corretor", "Corretor Parceiro"):
+        out["multiplicador_nivel"] = 1.0
+        out["multiplicador_regime"] = 1.0
+    else:
+        out["multiplicador_nivel"] = 1.0
+        out["multiplicador_regime"] = 1.0
+
     nc = (out.get("nome_completo") or "").strip()
     primeiro = nc.split(None, 1)[0] if nc else ""
     out["apelido"] = f"{primeiro}_RJ01" if primeiro else ""
@@ -1135,8 +1242,6 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     out["data_entrevista"] = hoje
     out["data_contrato"] = hoje
     out["data_credenciamento"] = hoje
-    out["multiplicador_nivel"] = 0.9
-    out["multiplicador_regime"] = 1.0
     if (str(out.get("possui_creci") or "").strip()) != "Sim":
         for k in CAMPOS_CRECI_DETALHES:
             out[k] = ""

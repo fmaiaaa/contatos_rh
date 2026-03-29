@@ -9,6 +9,71 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+# Fim do bloco PEM em JSON de service account (Google)
+_PEM_END_MARKERS = (
+    "-----END PRIVATE KEY-----",
+    "-----END RSA PRIVATE KEY-----",
+    "-----END ENCRYPTED PRIVATE KEY-----",
+)
+
+
+def _reparar_private_key_json_com_quebras_literais(s: str) -> str:
+    """
+    Muitos ambientes colam o JSON com a chave PEM em várias linhas reais dentro da string,
+    o que quebra `json.loads`. Reescape o valor de private_key como uma única string JSON.
+    """
+    k = s.find('"private_key"')
+    if k == -1:
+        k = s.find("'private_key'")
+    if k == -1:
+        return s
+    colon = s.find(":", k)
+    if colon == -1:
+        return s
+    q_open = s.find('"', colon)
+    if q_open == -1:
+        return s
+    val_start = q_open + 1
+    rest = s[val_start:]
+    end_pem = -1
+    for mark in _PEM_END_MARKERS:
+        p = rest.find(mark)
+        if p != -1:
+            end_pem = p + len(mark)
+            break
+    if end_pem == -1:
+        return s
+    pem = rest[:end_pem]
+    after = rest[end_pem:]
+    i = 0
+    while i < len(after) and after[i] in " \t\r\n":
+        i += 1
+    if i >= len(after) or after[i] != '"':
+        return s
+    tail = after[i + 1 :]
+    inner_esc = json.dumps(pem)[1:-1]
+    return s[:val_start] + inner_esc + '"' + tail
+
+
+def _parse_json_conta_servico_google(s: str) -> Optional[Dict[str, Any]]:
+    """Tenta json.loads; se falhar, repara private_key e tenta de novo."""
+    s = s.strip().lstrip("\ufeff")
+    if not s:
+        return None
+    candidates = (s, _reparar_private_key_json_com_quebras_literais(s))
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            parsed = json.loads(cand)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
 # ID padrão da planilha informada pelo usuário
 DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
 DEFAULT_WORKSHEET_NAME = "Corretores"
@@ -18,30 +83,30 @@ DEFAULT_COL_NOME_CONTA = "Nome da Conta"
 
 
 def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
-    """Lê JSON da conta de serviço a partir de st.secrets['google_sheets']."""
-    if st_secrets is None:
+    """Lê JSON da conta de serviço a partir de st.secrets['google_sheets']. Nunca propaga exceção."""
+    try:
+        if st_secrets is None:
+            return None
+        gs = (
+            st_secrets.get("google_sheets")
+            if hasattr(st_secrets, "get")
+            else st_secrets["google_sheets"]
+        )
+    except (KeyError, TypeError, AttributeError):
         return None
     try:
-        gs = st_secrets.get("google_sheets") if hasattr(st_secrets, "get") else st_secrets["google_sheets"]
-    except (KeyError, TypeError):
-        return None
-    if not gs:
-        return None
-    raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
-    if not raw:
-        return None
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s.startswith("\ufeff"):
-            s = s.lstrip("\ufeff")
-        try:
-            parsed = json.loads(s)
-        except (json.JSONDecodeError, TypeError, ValueError):
+        if not gs:
             return None
-        return parsed if isinstance(parsed, dict) else None
-    return None
+        raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
+        if not raw:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            return _parse_json_conta_servico_google(raw)
+        return None
+    except Exception:
+        return None
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
