@@ -112,7 +112,6 @@ SEC_ORDER: Tuple[str, ...] = (
     "Dados Familiares",
     "Dados Bancários Pessoa Física",
     "CRECI/TTI",
-    "Contrato e dados PJ",
     "Dados Integração",
     "Preferência de contato",
 )
@@ -548,15 +547,6 @@ def _campos_def() -> List[Campo]:
             req=False,
             help="Definida automaticamente na data do envio.",
         ),
-        _z(
-            key="data_transferencia_parceiro",
-            label="Data Transferência Corretor Parceiro",
-            sec="Informações para contato",
-            tipo="date",
-            sf="Data_Transferencia_Corretor_Parceiro__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
         # ——— Dados Pessoais ———
         _z(
             key="birthdate",
@@ -827,63 +817,20 @@ def _campos_def() -> List[Campo]:
             sf=None,
             req=False,
         ),
-        # ——— Contrato e dados PJ (continuação do layout após CRECI) ———
+        # ——— Dados Integração (campos ocultos: tipo/datas preenchidos pelo enriquecedor Vendas RJ) ———
         _z(
             key="tipo_corretor",
             label="Tipo Corretor *",
-            sec="Contrato e dados PJ",
+            sec="Dados Integração",
             tipo="select",
             sf="Tipo_Corretor__c",
             opcoes=TIPO_CORRETOR_OPTS,
             req=False,
         ),
         _z(
-            key="faturamento_comissao",
-            label="Faturamento Comissão",
-            sec="Contrato e dados PJ",
-            tipo="text",
-            sf=None,
-            req=False,
-            help="Gravado na planilha; no SF pode ser somente leitura.",
-        ),
-        _z(
-            key="faturamento_comissao_2",
-            label="Faturamento Comissão (2)",
-            sec="Contrato e dados PJ",
-            tipo="text",
-            sf=None,
-            req=False,
-        ),
-        _z(key="cnpj", label="CNPJ", sec="Contrato e dados PJ", tipo="text", sf="CNPJ__c", req=False),
-        _z(
-            key="razao_social",
-            label="Razão Social",
-            sec="Contrato e dados PJ",
-            tipo="text",
-            sf="Razao_Social__c",
-            req=False,
-        ),
-        _z(
-            key="fornecedor_uau",
-            label="Cadastrado como Fornecedor no UAU?",
-            sec="Contrato e dados PJ",
-            tipo="select",
-            sf="Cadastrado_como_Fornecedor_no_UAU__c",
-            opcoes=FORNECEDOR_UAU_OPTS,
-            req=False,
-        ),
-        _z(
-            key="contrato_texto",
-            label="Contrato",
-            sec="Contrato e dados PJ",
-            tipo="textarea",
-            sf="Contrato__c",
-            req=False,
-        ),
-        _z(
             key="data_contrato",
             label="Data Contrato",
-            sec="Contrato e dados PJ",
+            sec="Dados Integração",
             tipo="date",
             sf="Data_Contrato__c",
             req=False,
@@ -892,20 +839,11 @@ def _campos_def() -> List[Campo]:
         _z(
             key="data_credenciamento",
             label="Data Credenciamento",
-            sec="Contrato e dados PJ",
+            sec="Dados Integração",
             tipo="date",
             sf="Data_Credenciamento__c",
             req=False,
             help="Definida automaticamente na data do envio.",
-        ),
-        _z(
-            key="contrato_observacao",
-            label="Contrato (observação / referência)",
-            sec="Contrato e dados PJ",
-            tipo="textarea",
-            sf=None,
-            req=False,
-            help="Segundo bloco Contrato do layout Salesforce (texto livre).",
         ),
         # ——— Dados Integração ———
         _z(
@@ -1884,7 +1822,6 @@ TAB_LABELS: dict[str, str] = {
     "Dados Familiares": "Família",
     "Dados Bancários Pessoa Física": "Bancário PF",
     "CRECI/TTI": "CRECI",
-    "Contrato e dados PJ": "Contrato / PJ",
     "Dados Integração": "Integração",
     "Preferência de contato": "Preferências",
 }
@@ -3264,43 +3201,96 @@ def _render_secao_formulario(secoes: list[str]) -> None:
         )
         cols = campos_por_secao_visiveis(sec, _coletar_dados_formulario_completo())
         mid = (len(cols) + 1) // 2
-        if len(cols) <= 3:
-            for c in cols:
-                _widget_campo(c)
-        else:
-            left, right = st.columns(2)
-            for i, c in enumerate(cols):
-                with left if i < mid else right:
+        # st.form: ao usar «Avançar» / «Enviar», todos os valores da etapa são gravados de uma vez
+        # (evita depender de Enter ou blur em text_input/select).
+        form_key = f"ficha_etapa_{idx}"
+        with st.form(form_key, clear_on_submit=False, border=False):
+            if len(cols) <= 3:
+                for c in cols:
                     _widget_campo(c)
+            else:
+                left, right = st.columns(2)
+                for i, c in enumerate(cols):
+                    with left if i < mid else right:
+                        _widget_campo(c)
 
-        # Mesma largura dos campos: botões dentro do mesmo container da seção.
-        if idx < n - 1:
             st.markdown("<br/>", unsafe_allow_html=True)
-            col_voltar, col_avancar = st.columns(2)
-            with col_voltar:
-                if st.button(
-                    "Voltar",
-                    use_container_width=True,
-                    key="ficha_nav_voltar",
-                    disabled=(idx <= 0),
-                ):
-                    ss["ficha_secao_idx"] = idx - 1
-                    ss.pop("ficha_erros_secao", None)
-                    ss.pop("ficha_erros_secao_idx", None)
+            if idx < n - 1:
+                col_voltar, col_avancar = st.columns(2)
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(idx <= 0),
+                    )
+                with col_avancar:
+                    clicou_avancar = st.form_submit_button(
+                        "Avançar",
+                        type="primary",
+                        use_container_width=True,
+                    )
+            else:
+                st.markdown(
+                    '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
+                    unsafe_allow_html=True,
+                )
+                st.text_input(
+                    "Company website",
+                    key="ficha_hp_website",
+                    label_visibility="collapsed",
+                    max_chars=96,
+                )
+                st.markdown(
+                    '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
+                    "credenciamento na Direcional, conforme a LGPD. "
+                    '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.checkbox(
+                    "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. "
+                    "(campo obrigatório)",
+                    key="fld_lgpd_ficha",
+                    label_visibility="collapsed",
+                )
+                col_voltar, col_enviar = st.columns(2)
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(len(secoes) <= 1),
+                    )
+                with col_enviar:
+                    clicou_enviar = st.form_submit_button(
+                        "Enviar meu cadastro",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+        if idx < n - 1:
+            if clicou_voltar:
+                ss["ficha_secao_idx"] = idx - 1
+                ss.pop("ficha_erros_secao", None)
+                ss.pop("ficha_erros_secao_idx", None)
+                st.rerun()
+            if clicou_avancar:
+                dados = _coletar_dados_formulario_completo()
+                erros_sec = validar_obrigatorios_secao(sec, dados)
+                if erros_sec:
+                    ss["ficha_erros_secao"] = erros_sec
+                    ss["ficha_erros_secao_idx"] = idx
                     st.rerun()
-            with col_avancar:
-                if st.button("Avançar", type="primary", use_container_width=True, key="ficha_nav_avancar"):
-                    dados = _coletar_dados_formulario_completo()
-                    erros_sec = validar_obrigatorios_secao(sec, dados)
-                    if erros_sec:
-                        ss["ficha_erros_secao"] = erros_sec
-                        ss["ficha_erros_secao_idx"] = idx
-                        st.rerun()
-                    _snapshot_persistir_secao_atual(sec)
-                    ss.pop("ficha_erros_secao", None)
-                    ss.pop("ficha_erros_secao_idx", None)
-                    ss["ficha_secao_idx"] = idx + 1
-                    st.rerun()
+                _snapshot_persistir_secao_atual(sec)
+                ss.pop("ficha_erros_secao", None)
+                ss.pop("ficha_erros_secao_idx", None)
+                ss["ficha_secao_idx"] = idx + 1
+                st.rerun()
+        else:
+            if clicou_voltar:
+                ss.pop("ficha_erros_envio", None)
+                ss["ficha_secao_idx"] = max(0, len(secoes) - 2)
+                st.rerun()
+            if clicou_enviar:
+                _processar_envio_cadastro()
 
         if ss.get("ficha_erros_secao_idx") == idx and ss.get("ficha_erros_secao"):
             lista = "<br>".join(f"• {html.escape(e)}" for e in ss["ficha_erros_secao"])
@@ -3543,7 +3533,7 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador, **links** �
 
         render_mapa_empreendimentos_streamlit(
             altura_px=POPUP_MAPA_ALTURA_PX,
-            streamlit_key="mapa_empreendimentos_folium_popup",
+            streamlit_key="mapa_empreendimentos_folium_popup_v3",
         )
     except Exception as e:
         st.caption(f"Mapa indisponível: {e}")
@@ -3749,55 +3739,18 @@ def main():
     secoes = secoes_com_campos_visiveis()
     _render_secao_formulario(secoes)
 
-    ultima = len(secoes) > 0 and int(st.session_state.get("ficha_secao_idx", 0)) == len(secoes) - 1
-    if ultima:
-        st.markdown("---")
-        st.markdown(
-            '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
-            unsafe_allow_html=True,
-        )
-        st.text_input(
-            "Company website",
-            key="ficha_hp_website",
-            label_visibility="collapsed",
-            max_chars=96,
-        )
-        st.markdown(
-            '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
-            "credenciamento na Direcional, conforme a LGPD. "
-            '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
-            unsafe_allow_html=True,
-        )
-        st.checkbox(
-            "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. "
-            "(campo obrigatório)",
-            key="fld_lgpd_ficha",
-            label_visibility="collapsed",
-        )
-        if st.button("Enviar meu cadastro", type="primary", use_container_width=True, key="ficha_enviar"):
-            _processar_envio_cadastro()
-        if st.button(
-            "Voltar",
-            use_container_width=True,
-            key="ficha_voltar_ultima",
-            disabled=(len(secoes) <= 1),
-        ):
-            ss.pop("ficha_erros_envio", None)
-            ss["ficha_secao_idx"] = max(0, len(secoes) - 2)
-            st.rerun()
-
-        fe = ss.get("ficha_erros_envio")
-        if fe:
-            kind = fe.get("kind")
-            if kind == "validation":
-                linhas = "<br>".join(f"• {html.escape(e)}" for e in fe.get("items") or [])
-                _alert_vermelho_html(
-                    f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
-                )
-            elif kind == "html":
-                _alert_vermelho_html(fe.get("html") or "")
-            elif kind == "text":
-                _alert_vermelho(fe.get("text") or "")
+    fe = ss.get("ficha_erros_envio")
+    if fe:
+        kind = fe.get("kind")
+        if kind == "validation":
+            linhas = "<br>".join(f"• {html.escape(e)}" for e in fe.get("items") or [])
+            _alert_vermelho_html(
+                f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
+            )
+        elif kind == "html":
+            _alert_vermelho_html(fe.get("html") or "")
+        elif kind == "text":
+            _alert_vermelho(fe.get("text") or "")
 
 
 if __name__ == "__main__":
