@@ -9,12 +9,24 @@ from __future__ import annotations
 import base64
 import html
 import io
+import json
 import os
 import platform
 import re
 import smtplib
+import sys
 from datetime import date, datetime
 from pathlib import Path
+
+# Módulos locais (corretor_campos, google_sheets_corretor, …): no Cloud o .py pode estar
+# na raiz do repo e corretor_campos.py em subpasta salesforce/ (ou o inverso).
+_DIR_APP = Path(__file__).resolve().parent
+for _p in (_DIR_APP, _DIR_APP / "salesforce", _DIR_APP.parent / "salesforce"):
+    if (_p / "corretor_campos.py").is_file():
+        _sp = str(_p.resolve())
+        if _sp not in sys.path:
+            sys.path.insert(0, _sp)
+        break
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -37,11 +49,14 @@ from corretor_campos import (
     validar_obrigatorios_secao,
 )
 from google_sheets_corretor import (
+    DEFAULT_COL_NOME_CONTA,
+    DEFAULT_GERENTES_WORKSHEET,
     DEFAULT_SPREADSHEET_ID,
     DEFAULT_WORKSHEET_NAME,
     _credenciais_de_secrets,
     anexar_linha,
     atualizar_status_envio_salesforce,
+    listar_nomes_conta_aba_gerentes,
 )
 
 try:
@@ -77,8 +92,6 @@ URL_LOGO_DIRECIONAL_EMAIL = (
     "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
 )
 
-_DIR_APP = Path(__file__).resolve().parent
-
 # Logos na raiz (mesma pasta deste .py ou raiz do repositório) — upload manual
 LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
 FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
@@ -103,6 +116,16 @@ URL_YOUTUBE_SIMULADOR_EMBED = "https://www.youtube.com/embed/dE42s0g7K-c"
 URL_DIRI_ACADEMY = "https://diriacademy.skore.io/login"
 URL_SALESFORCE_VENDAS = "https://direcional.my.site.com/vendas"
 URL_WHATSAPP_EQUIPE = "https://chat.whatsapp.com/KnZg4Zax3Z20viB7XEWvmo"
+
+# Mesmos links do popup — reutilizados no e-mail automático de boas-vindas.
+LINKS_POS_CADASTRO: list[tuple[str, str]] = [
+    ("Materiais de marketing (Linktree)", URL_LINKTREE_MARKETING),
+    ("Pedir acesso ao simulador de negociação", URL_FORM_SIMULADOR),
+    ("Vídeo — como usar o simulador (YouTube)", URL_YOUTUBE_SIMULADOR),
+    ("Treinamentos — Diri Academy", URL_DIRI_ACADEMY),
+    ("Salesforce (portal de vendas)", URL_SALESFORCE_VENDAS),
+    ("Entrar no grupo — WhatsApp", URL_WHATSAPP_EQUIPE),
+]
 
 # Popup pós-cadastro: mesma altura do minimapa e do iframe do YouTube (largura 100% do diálogo)
 POPUP_MAPA_ALTURA_PX = 320
@@ -624,8 +647,60 @@ def _cabecalho_pagina(*, com_intro_formulario: bool = False) -> None:
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _nomes_conta_coluna_gerentes_cached(
+    spreadsheet_id: str,
+    worksheet_gerentes: str,
+    coluna_nome_conta: str,
+    creds_json: str,
+) -> tuple[str, ...]:
+    """Cache por planilha/aba/coluna/credencial (JSON estável) — evita ler a aba a cada rerun."""
+    try:
+        creds = json.loads(creds_json)
+        nomes = listar_nomes_conta_aba_gerentes(
+            spreadsheet_id,
+            creds,
+            worksheet_name=worksheet_gerentes,
+            column_header=coluna_nome_conta,
+        )
+        return tuple(nomes)
+    except Exception:
+        return tuple()
+
+
 def _opcoes_nome_conta() -> list[str]:
-    """Lista fixa de nomes de conta: [ficha_defaults].account_names ou .account_name ou fallback."""
+    """
+    Opções do select «Nome da conta»: valores únicos da coluna **Nome da Conta** na aba **Gerentes**
+    da mesma planilha Google (Secrets [google_sheets]). Se a leitura falhar ou vier vazia,
+    usa [ficha_defaults] account_names / account_name ou NOMES_CONTA_FIXOS.
+    """
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if creds:
+        gs: dict[str, Any] = {}
+        if hasattr(st, "secrets"):
+            try:
+                gs = dict(st.secrets.get("google_sheets", {}))
+            except Exception:
+                gs = {}
+        sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)).strip()
+        ws_g = str(
+            gs.get("GERENTES_WORKSHEET")
+            or gs.get("gerentes_worksheet")
+            or DEFAULT_GERENTES_WORKSHEET
+        ).strip() or DEFAULT_GERENTES_WORKSHEET
+        col_nc = str(
+            gs.get("NOME_CONTA_COLUMN")
+            or gs.get("nome_conta_column")
+            or DEFAULT_COL_NOME_CONTA
+        ).strip() or DEFAULT_COL_NOME_CONTA
+        try:
+            creds_json = json.dumps(creds, sort_keys=True)
+        except (TypeError, ValueError):
+            creds_json = "{}"
+        tupla = _nomes_conta_coluna_gerentes_cached(sid, ws_g, col_nc, creds_json)
+        if tupla:
+            return list(tupla)
+
     fd = _ficha_defaults_de_secrets()
     raw = fd.get("account_names")
     if isinstance(raw, list) and raw:
@@ -686,6 +761,17 @@ def _widget_campo(c: dict):
             opts = _opcoes_nome_conta()
             if not opts:
                 opts = list(NOMES_CONTA_FIXOS)
+        if k == "possui_creci":
+            opts = ["Sim", "Não"]
+            return st.selectbox(
+                widget_label,
+                options=opts,
+                index=None,
+                placeholder="Selecione se possui CRECI",
+                key=sk,
+                help=help_txt,
+                label_visibility=lv,
+            )
         cur = st.session_state.get(sk)
         if cur is not None and cur not in opts:
             st.session_state[sk] = opts[0]
@@ -699,11 +785,56 @@ def _widget_campo(c: dict):
 
 
 def _coletar_dados_formulario() -> dict[str, Any]:
+    """Somente chaves presentes no session_state (etapa atual + campos sem widget)."""
     out: dict[str, Any] = {}
     for c in CAMPOS:
         sk = f"fld_{c['key']}"
         out[c["key"]] = st.session_state.get(sk)
     return out
+
+
+def _coletar_dados_formulario_completo() -> dict[str, Any]:
+    """
+    Mescla snapshot das etapas já confirmadas (ficha_snap_campos) com o session_state.
+    Necessário porque só a etapa corrente monta widgets — ao avançar, o Streamlit pode
+    remover valores das etapas anteriores do state.
+    """
+    ss = st.session_state
+    snap = dict(ss.get("ficha_snap_campos") or {})
+    out: dict[str, Any] = {}
+    for c in CAMPOS:
+        k = c["key"]
+        sk = f"fld_{k}"
+        if sk in ss:
+            out[k] = ss[sk]
+        else:
+            out[k] = snap.get(k)
+    return out
+
+
+def _snapshot_persistir_secao_atual(sec: str) -> None:
+    """Grava no snapshot os campos visíveis da etapa atual (chamar após validar «Avançar»)."""
+    ss = st.session_state
+    snap = dict(ss.get("ficha_snap_campos") or {})
+    dados = _coletar_dados_formulario_completo()
+    for c in campos_por_secao_visiveis(sec, dados):
+        k = c["key"]
+        sk = f"fld_{k}"
+        if sk in ss:
+            snap[k] = ss[sk]
+    ss["ficha_snap_campos"] = snap
+
+
+def _garantir_campos_secao_de_snapshot(sec: str) -> None:
+    """Ao voltar ou reabrir uma etapa, repõe fld_* a partir do snapshot se a chave sumiu."""
+    ss = st.session_state
+    snap = ss.get("ficha_snap_campos") or {}
+    dados = _coletar_dados_formulario_completo()
+    for c in campos_por_secao_visiveis(sec, dados):
+        k = c["key"]
+        sk = f"fld_{k}"
+        if sk not in ss and k in snap:
+            ss[sk] = snap[k]
 
 
 def _ficha_defaults_de_secrets() -> dict[str, Any]:
@@ -1001,6 +1132,155 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
+def montar_corpo_email_boas_vindas(
+    dados: dict[str, Any], link_contato_sf: str | None
+) -> tuple[str, str]:
+    """Texto simples + HTML do e-mail automático (agradecimento + links do popup)."""
+    nome = _nome_candidato_ficha(dados)
+    nome_esc = html.escape(nome)
+    logo = html.escape(URL_LOGO_DIRECIONAL_EMAIL)
+    azul = COR_AZUL_ESC
+    verm = COR_VERMELHO
+    borda = COR_BORDA
+
+    linhas_txt: list[str] = []
+    itens_html: list[str] = []
+    for label, url in LINKS_POS_CADASTRO:
+        linhas_txt.append(f"- {label}: {url}")
+        itens_html.append(
+            f'<li style="margin:10px 0;line-height:1.45;">'
+            f'<a href="{html.escape(url)}" style="color:{azul};font-weight:600;text-decoration:none;">'
+            f"{html.escape(label)}</a>"
+            f'<br><span style="font-size:12px;color:{COR_TEXTO_MUTED};word-break:break-all;">{html.escape(url)}</span>'
+            f"</li>"
+        )
+    if link_contato_sf:
+        linhas_txt.append(f"- Seu cadastro no Salesforce: {link_contato_sf}")
+        itens_html.append(
+            f'<li style="margin:10px 0;line-height:1.45;">'
+            f'<a href="{html.escape(link_contato_sf)}" '
+            f'style="color:{azul};font-weight:600;text-decoration:none;">'
+            f"Abrir seu cadastro no Salesforce</a></li>"
+        )
+
+    plain = (
+        f"Olá, {nome},\n\n"
+        "Recebemos o seu cadastro na Direcional Vendas RJ. Agradecemos a confiança — "
+        "está tudo registrado e você já faz parte da nossa base.\n\n"
+        "Materiais e links úteis:\n"
+        + "\n".join(linhas_txt)
+        + "\n\n"
+        "No formulário, o popup de boas-vindas também traz o mapa de empreendimentos e o vídeo do simulador. "
+        "Se você fechou o popup, pode voltar ao link do formulário para conferir.\n\n"
+        "Quando disponível, este e-mail inclui o PDF da sua ficha em anexo.\n\n"
+        "Direcional Engenharia · Vendas Rio de Janeiro"
+    )
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:24px;background:#f1f5f9;font-family:'Segoe UI',Inter,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;">
+<tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;
+box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
+<tr>
+<td align="center" style="background:{azul};padding:22px 20px;border-bottom:4px solid {verm};">
+<img src="{logo}" alt="Direcional Engenharia" width="168" style="display:block;max-width:100%;height:auto;">
+</td>
+</tr>
+<tr>
+<td style="padding:28px 24px 12px 24px;">
+<p style="margin:0 0 12px 0;font-size:20px;font-weight:700;color:{azul};text-align:center;">Cadastro recebido</p>
+<p style="margin:0;font-size:15px;line-height:1.6;color:#475569;text-align:center;">
+Olá, <strong>{nome_esc}</strong> — <strong>você está cadastrado(a)</strong> na Direcional Vendas RJ.
+Agradecemos a confiança e o tempo dedicado; é uma alegria ter você na nossa operação.
+</p>
+</td>
+</tr>
+<tr><td style="padding:8px 28px 8px 28px;">
+<p style="margin:0 0 8px 0;font-size:14px;font-weight:700;color:{azul};">Materiais e links úteis</p>
+<ul style="margin:0;padding-left:18px;color:#334155;font-size:14px;">
+{"".join(itens_html)}
+</ul>
+<p style="margin:20px 0 0 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
+No popup do formulário você também encontra o <strong>mapa de empreendimentos</strong> e o <strong>vídeo</strong> do simulador na mesma largura.
+</p>
+</td></tr>
+<tr><td style="padding:16px 24px 28px 24px;">
+<p style="margin:0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">
+PDF da ficha em anexo, quando disponível · Direcional Engenharia · Vendas Rio de Janeiro
+</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+    return plain, html_body
+
+
+def enviar_email_boas_vindas_candidato(
+    dados: dict[str, Any],
+    pdf_bytes: bytes | None,
+    link_contato_sf: str | None,
+) -> tuple[bool, str]:
+    """Envia ao e-mail do formulário o agradecimento + links (e PDF se houver)."""
+    cfg = _get_smtp_from_secrets()
+    if not cfg or not cfg["host"] or not cfg["user"]:
+        return False, "SMTP não configurado ([ficha_email] nos Secrets)."
+
+    dest = (dados.get("email") or "").strip()
+    if not dest:
+        return False, "E-mail do candidato não informado no formulário."
+
+    nome = _nome_candidato_ficha(dados)
+    plain, html_body = montar_corpo_email_boas_vindas(dados, link_contato_sf)
+
+    msg = MIMEMultipart()
+    msg["Subject"] = f"Cadastro recebido — Direcional Vendas RJ — {nome}"
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = dest
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain, "plain", "utf-8"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt)
+
+    if pdf_bytes:
+        part = MIMEApplication(pdf_bytes, _subtype="pdf")
+        part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename="ficha_cadastral_direcional_vendas_rj.pdf",
+        )
+        msg.attach(part)
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["user"], cfg["password"])
+            server.sendmail(cfg["from_addr"], [dest], msg.as_string())
+        return True, "E-mail de boas-vindas enviado para o endereço do cadastro."
+    except Exception as e:
+        return False, str(e)
+
+
+def _tentar_enviar_email_boas_vindas(dados: dict[str, Any], contact_id: str | None) -> None:
+    """Dispara o e-mail automático; não interrompe o fluxo se falhar."""
+    ss = st.session_state
+    pdf_bytes: bytes | None = None
+    try:
+        pdf_bytes = gerar_pdf_ficha(dados)
+    except Exception:
+        pass
+    link = _url_contact(contact_id) if contact_id else None
+    ok, msg = enviar_email_boas_vindas_candidato(dados, pdf_bytes, link)
+    ss["ficha_email_boas_vindas_ok"] = ok
+    ss["ficha_email_boas_vindas_msg"] = msg
+
+
 def _get_smtp_from_secrets():
     """
     Lê [ficha_email] nos Secrets. Chaves esperadas:
@@ -1093,6 +1373,7 @@ def _render_secao_formulario(secoes: list[str]) -> None:
     idx = max(0, min(int(ss["ficha_secao_idx"]), n - 1))
     ss["ficha_secao_idx"] = idx
     sec = secoes[idx]
+    _garantir_campos_secao_de_snapshot(sec)
 
     if ss.get("ficha_erros_secao_idx") is not None and int(ss["ficha_erros_secao_idx"]) != idx:
         ss.pop("ficha_erros_secao", None)
@@ -1116,7 +1397,7 @@ def _render_secao_formulario(secoes: list[str]) -> None:
             f'<p class="section-head">{sec}</p>',
             unsafe_allow_html=True,
         )
-        cols = campos_por_secao_visiveis(sec)
+        cols = campos_por_secao_visiveis(sec, _coletar_dados_formulario_completo())
         mid = (len(cols) + 1) // 2
         if len(cols) <= 3:
             for c in cols:
@@ -1144,12 +1425,13 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                     st.rerun()
             with col_avancar:
                 if st.button("Avançar", type="primary", use_container_width=True, key="ficha_nav_avancar"):
-                    dados = _coletar_dados_formulario()
+                    dados = _coletar_dados_formulario_completo()
                     erros_sec = validar_obrigatorios_secao(sec, dados)
                     if erros_sec:
                         ss["ficha_erros_secao"] = erros_sec
                         ss["ficha_erros_secao_idx"] = idx
                         st.rerun()
+                    _snapshot_persistir_secao_atual(sec)
                     ss.pop("ficha_erros_secao", None)
                     ss.pop("ficha_erros_secao_idx", None)
                     ss["ficha_secao_idx"] = idx + 1
@@ -1175,6 +1457,9 @@ def _limpar_session_formulario():
         "ficha_secao_idx",
         "ficha_erros_secao",
         "ficha_erros_secao_idx",
+        "ficha_snap_campos",
+        "ficha_email_boas_vindas_ok",
+        "ficha_email_boas_vindas_msg",
         "ficha_erros_envio",
         "ficha_seg_t0",
         "ficha_rl_envios_ts",
@@ -1257,7 +1542,11 @@ def _processar_envio_cadastro() -> None:
     if not ok_sec:
         ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
         return
-    dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario())
+    secoes_env = secoes_com_campos_visiveis()
+    idx_env = max(0, min(int(ss.get("ficha_secao_idx", 0)), len(secoes_env) - 1))
+    if secoes_env:
+        _snapshot_persistir_secao_atual(secoes_env[idx_env])
+    dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario_completo())
     erros = validar_obrigatorios(dados)
     if not ss.get("fld_lgpd_ficha"):
         erros.append("Concordância LGPD *")
@@ -1310,6 +1599,7 @@ def _processar_envio_cadastro() -> None:
             sid, wname, creds, row_num, "Erro", "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).", ""
         )
         ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        _tentar_enviar_email_boas_vindas(dados, None)
         ss["ficha_sucesso"] = True
         st.rerun()
         return
@@ -1319,6 +1609,7 @@ def _processar_envio_cadastro() -> None:
             sid, wname, creds, row_num, "Erro", "Módulo salesforce_api não encontrado.", ""
         )
         ss["sf_erro"] = "Módulo salesforce_api não encontrado."
+        _tentar_enviar_email_boas_vindas(dados, None)
         ss["ficha_sucesso"] = True
         st.rerun()
         return
@@ -1335,6 +1626,7 @@ def _processar_envio_cadastro() -> None:
         )
         ss["sf_erro"] = "Falha ao conectar ao Salesforce."
         ss["sf_avisos"] = avisos
+        _tentar_enviar_email_boas_vindas(dados, None)
         ss["ficha_sucesso"] = True
         st.rerun()
         return
@@ -1351,6 +1643,7 @@ def _processar_envio_cadastro() -> None:
         ss["sf_erro"] = str(err) if err else "Erro desconhecido ao criar contato."
 
     ss["sf_avisos"] = avisos
+    _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
     ss["ficha_sucesso"] = True
     st.rerun()
 
@@ -1522,9 +1815,23 @@ def main():
             lista = "<br>".join(f"• {html.escape(a)}" for a in avisos)
             _alert_vermelho_html(f"<strong>Avisos:</strong><br>{lista}")
 
+        ok_mail = ss.get("ficha_email_boas_vindas_ok")
+        msg_mail = ss.get("ficha_email_boas_vindas_msg") or ""
+        if ok_mail is True:
+            _alert_azul(
+                "**Enviamos um e-mail para o endereço informado no cadastro** com o agradecimento, "
+                "os mesmos links úteis do popup e o PDF da ficha (quando disponível)."
+            )
+        elif ok_mail is False and msg_mail:
+            _alert_vermelho_html(
+                f"<strong>E-mail automático:</strong> {html.escape(msg_mail)} "
+                "(confira [ficha_email] nos Secrets e o campo <strong>E-mail</strong> no formulário.)"
+            )
+
         st.caption(
-            "A **cópia em PDF** e o **envio por e-mail** ficam no **popup** de boas-vindas "
-            "(junto do mapa, vídeo e links). Se você já fechou o popup, inicie um novo cadastro para abri-lo de novo."
+            "A **cópia em PDF** e o **reenvio por e-mail** no popup são opcionais — você já deve ter recebido "
+            "o resumo no **e-mail do cadastro**. No popup: mapa, vídeo e links. "
+            "Se fechou o popup, inicie um novo cadastro só para reabri-lo."
         )
 
         if st.button("Começar um novo cadastro", use_container_width=True):
@@ -1536,6 +1843,8 @@ def main():
             ss.pop("sf_avisos", None)
             ss.pop("ficha_secao_idx", None)
             ss.pop("ficha_popup_recursos_ok", None)
+            ss.pop("ficha_email_boas_vindas_ok", None)
+            ss.pop("ficha_email_boas_vindas_msg", None)
             st.rerun()
 
         st.markdown(

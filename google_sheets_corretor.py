@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional
 # ID padrão da planilha informada pelo usuário
 DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
 DEFAULT_WORKSHEET_NAME = "Corretores"
+# Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
+DEFAULT_GERENTES_WORKSHEET = "Gerentes"
+DEFAULT_COL_NOME_CONTA = "Nome da Conta"
 
 
 def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
@@ -115,6 +118,45 @@ def atualizar_status_envio_salesforce(
         col = headers.index(h) + 1
         cell = f"{_col_letter(col)}{row_1based}"
         ws.update(cell, [[val]], value_input_option="USER_ENTERED")
+
+
+def listar_nomes_conta_aba_gerentes(
+    spreadsheet_id: str,
+    creds_dict: Dict[str, Any],
+    worksheet_name: str = DEFAULT_GERENTES_WORKSHEET,
+    column_header: str = DEFAULT_COL_NOME_CONTA,
+) -> List[str]:
+    """
+    Lê a planilha indicada, aba `worksheet_name`, e devolve valores únicos e não vazios
+    da coluna cujo cabeçalho (linha 1) coincide com `column_header` (ignora maiúsculas/minúsculas e espaços).
+    """
+    gc = _cliente_gspread(creds_dict)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    rows = ws.get_all_values()
+    if not rows:
+        return []
+    headers = [str(h or "").strip() for h in rows[0]]
+    target = (column_header or "").strip().lower()
+    col_idx = None
+    for i, h in enumerate(headers):
+        if h.strip().lower() == target:
+            col_idx = i
+            break
+    if col_idx is None:
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+    for r in rows[1:]:
+        if col_idx >= len(r):
+            continue
+        v = str(r[col_idx] or "").strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    out.sort(key=lambda s: s.casefold())
+    return out
 
 
 def carimbo_brasilia_iso() -> str:

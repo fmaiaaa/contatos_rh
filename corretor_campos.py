@@ -308,7 +308,7 @@ def _campos_def() -> List[Campo]:
             sf=None,
             opcoes=list(NOMES_CONTA_FIXOS),
             req=True,
-            help="Lista fixa: [ficha_defaults] account_names no Streamlit ou NOMES_CONTA_FIXOS no código.",
+            help="Opções: coluna «Nome da Conta» na aba «Gerentes» da planilha Google ([google_sheets]); senão [ficha_defaults].",
         ),
         _z(
             key="account_id",
@@ -645,6 +645,16 @@ def _campos_def() -> List[Campo]:
         ),
         # ——— CRECI/TTI ———
         _z(
+            key="possui_creci",
+            label="Possui CRECI? *",
+            sec="CRECI/TTI",
+            tipo="select",
+            sf=None,
+            opcoes=["Sim", "Não"],
+            req=True,
+            help="Se sim, os campos de CRECI aparecem abaixo. Se não, avance para a próxima etapa.",
+        ),
+        _z(
             key="data_matricula_tti",
             label="Data Matrícula - TTI",
             sec="CRECI/TTI",
@@ -836,6 +846,7 @@ CAMPOS: List[Campo] = _campos_def()
 
 # Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
 # valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
+# atividade: sempre «Corretor» (enriquecer_derivados_vendas_rj).
 CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
     {
         "codigo_pessoa_uau",
@@ -847,6 +858,7 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
         "origem",
         "account_id",
         "owner_id",
+        "atividade",
         "apelido",
         "data_entrevista",
         "data_contrato",
@@ -856,9 +868,36 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
     }
 )
 
+# Campos da seção CRECI/TTI exibidos só quando «Possui CRECI?» = Sim.
+CAMPOS_CRECI_DETALHES: frozenset[str] = frozenset(
+    {
+        "data_matricula_tti",
+        "tti",
+        "status_creci",
+        "data_conclusao",
+        "creci",
+        "observacoes_creci",
+        "validade_creci",
+        "nome_responsavel",
+        "creci_responsavel",
+        "tipo_comissionamento",
+    }
+)
 
-def campos_por_secao_visiveis(sec: str) -> List[Campo]:
-    return [c for c in CAMPOS if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO]
+
+def campos_por_secao_visiveis(
+    sec: str, dados: Optional[Dict[str, Any]] = None
+) -> List[Campo]:
+    cols = [
+        c
+        for c in CAMPOS
+        if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO
+    ]
+    if sec == "CRECI/TTI":
+        d = dados or {}
+        if (str(d.get("possui_creci") or "").strip()) != "Sim":
+            cols = [c for c in cols if c["key"] == "possui_creci"]
+    return cols
 
 
 def secoes_com_campos_visiveis() -> List[str]:
@@ -1083,10 +1122,12 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
 def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Regras Vendas RJ: apelido = primeiro nome + _RJ01; datas de entrevista/contrato/credenciamento = hoje;
-    multiplicadores 0,9 e 1 (ajuste na org se o campo for percentual diferente).
+    Regras Vendas RJ: Atividade__c sempre «Corretor»; apelido = primeiro nome + _RJ01;
+    datas de entrevista/contrato/credenciamento = hoje; multiplicadores 0,9 e 1
+    (ajuste na org se o campo for percentual diferente).
     """
     out = dict(dados)
+    out["atividade"] = "Corretor"
     nc = (out.get("nome_completo") or "").strip()
     primeiro = nc.split(None, 1)[0] if nc else ""
     out["apelido"] = f"{primeiro}_RJ01" if primeiro else ""
@@ -1096,6 +1137,9 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     out["data_credenciamento"] = hoje
     out["multiplicador_nivel"] = 0.9
     out["multiplicador_regime"] = 1.0
+    if (str(out.get("possui_creci") or "").strip()) != "Sim":
+        for k in CAMPOS_CRECI_DETALHES:
+            out[k] = ""
     return out
 
 
