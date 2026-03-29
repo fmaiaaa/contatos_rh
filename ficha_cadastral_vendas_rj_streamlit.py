@@ -52,6 +52,20 @@ COR_FUNDO = "#04428f"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
 COR_TEXTO_MUTED = "#64748b"
+# Tom mais escuro do vermelho (gradiente do botão primário)
+COR_VERMELHO_ESCURO = "#9e0828"
+
+
+def _hex_rgb_triplet(hex_color: str) -> str:
+    """Converte #RRGGBB em 'r, g, b' para uso em rgba(...)."""
+    x = (hex_color or "").strip().lstrip("#")
+    if len(x) != 6:
+        return "0, 0, 0"
+    return f"{int(x[0:2], 16)}, {int(x[2:4], 16)}, {int(x[4:6], 16)}"
+
+
+RGB_AZUL_CSS = _hex_rgb_triplet(COR_AZUL_ESC)
+RGB_VERMELHO_CSS = _hex_rgb_triplet(COR_VERMELHO)
 
 URL_LOGO_DIRECIONAL_EMAIL = (
     "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
@@ -157,7 +171,7 @@ def aplicar_estilo():
         html, body {{ font-family: 'Inter', sans-serif; color: {COR_AZUL_ESC}; }}
         [data-testid="stAppViewContainer"] {{
             background:
-                linear-gradient(160deg, rgba(0, 44, 93, 0.88) 0%, rgba(0, 44, 93, 0.72) 45%, rgba(227, 6, 19, 0.15) 100%),
+                linear-gradient(160deg, rgba({RGB_AZUL_CSS}, 0.88) 0%, rgba({RGB_AZUL_CSS}, 0.72) 45%, rgba({RGB_VERMELHO_CSS}, 0.15) 100%),
                 url("{bg_url}") center / cover no-repeat !important;
             background-attachment: scroll !important;
         }}
@@ -191,8 +205,8 @@ def aplicar_estilo():
             border-radius: 24px !important;
             border: 1px solid rgba(255, 255, 255, 0.85) !important;
             box-shadow:
-                0 4px 6px -1px rgba(0, 44, 93, 0.08),
-                0 24px 48px -12px rgba(0, 44, 93, 0.22),
+                0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
+                0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.22),
                 inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
             animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
         }}
@@ -264,6 +278,19 @@ def aplicar_estilo():
             font-weight: 600;
             color: #1e293b;
         }}
+        /* Rótulos de campo com asterisco de obrigatoriedade em vermelho */
+        .ficha-input-label {{
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: {COR_AZUL_ESC};
+            margin: 0 0 0.35rem 0;
+            line-height: 1.45;
+        }}
+        .ficha-star-req {{
+            color: {COR_VERMELHO} !important;
+            font-weight: 800;
+            margin-left: 0.12em;
+        }}
         .ficha-hero-bar {{
             height: 4px;
             width: 100%;
@@ -283,7 +310,7 @@ def aplicar_estilo():
             background: rgba(226, 232, 240, 0.95);
             border-radius: 999px;
             overflow: hidden;
-            border: 1px solid rgba(0, 44, 93, 0.08);
+            border: 1px solid rgba({RGB_AZUL_CSS}, 0.08);
         }}
         .ficha-etapas-progress-fill {{
             height: 100%;
@@ -291,7 +318,7 @@ def aplicar_estilo():
             border-radius: 999px;
             background: linear-gradient(90deg, {COR_VERMELHO} 0%, {COR_AZUL_ESC} 100%);
             transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);
-            box-shadow: 0 1px 3px rgba(0, 44, 93, 0.12);
+            box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.12);
         }}
         /* Container com borda (st.container(border=True)) — reforço visual opcional */
         [data-testid="stVerticalBlockBorderWrapper"] {{
@@ -303,12 +330,12 @@ def aplicar_estilo():
             border-radius: 16px;
             padding: 1.1rem 1.35rem 1rem 1.35rem;
             margin-bottom: 1.15rem;
-            box-shadow: 0 1px 3px rgba(0, 44, 93, 0.06);
+            box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.06);
             transition: box-shadow 0.35s ease, transform 0.35s ease;
             animation: fichaFadeIn 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
         }}
         .section-card:hover {{
-            box-shadow: 0 8px 24px -6px rgba(0, 44, 93, 0.12);
+            box-shadow: 0 8px 24px -6px rgba({RGB_AZUL_CSS}, 0.12);
             transform: translateY(-1px);
         }}
         .section-head {{
@@ -330,8 +357,8 @@ def aplicar_estilo():
             transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }}
         div[data-baseweb="input"]:focus-within {{
-            border-color: rgba(0, 44, 93, 0.35) !important;
-            box-shadow: 0 0 0 3px rgba(0, 44, 93, 0.08) !important;
+            border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
+            box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
         }}
         .stButton > button {{
             border-radius: 12px !important;
@@ -339,10 +366,10 @@ def aplicar_estilo():
         }}
         .stButton > button:hover {{
             transform: translateY(-2px);
-            box-shadow: 0 8px 20px -6px rgba(0, 44, 93, 0.25) !important;
+            box-shadow: 0 8px 20px -6px rgba({RGB_AZUL_CSS}, 0.25) !important;
         }}
         .stButton button[kind="primary"] {{
-            background: linear-gradient(180deg, {COR_VERMELHO} 0%, #c50512 100%) !important;
+            background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
             color: #ffffff !important;
             border: none !important;
             font-weight: 700 !important;
@@ -370,7 +397,7 @@ def aplicar_estilo():
             border-radius: 14px !important;
             border: 2px solid {COR_AZUL_ESC} !important;
             background: #ffffff !important;
-            box-shadow: 0 2px 12px rgba(0, 44, 93, 0.1) !important;
+            box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1) !important;
         }}
         div[data-testid="stAlert"] p,
         div[data-testid="stAlert"] span,
@@ -395,7 +422,7 @@ def aplicar_estilo():
             border: 2px solid {COR_AZUL_ESC};
             background: #ffffff;
             color: {COR_AZUL_ESC};
-            box-shadow: 0 2px 12px rgba(0, 44, 93, 0.1);
+            box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1);
         }}
         .ficha-alert--azul strong {{
             color: {COR_AZUL_ESC};
@@ -404,7 +431,7 @@ def aplicar_estilo():
             border: 2px solid {COR_VERMELHO};
             background: #ffffff;
             color: {COR_AZUL_ESC};
-            box-shadow: 0 2px 12px rgba(227, 6, 19, 0.12);
+            box-shadow: 0 2px 12px rgba({RGB_VERMELHO_CSS}, 0.12);
         }}
         .ficha-alert--vermelho strong {{
             color: {COR_VERMELHO};
@@ -429,7 +456,7 @@ def aplicar_estilo():
             overflow: hidden;
             border: 1px solid #e2e8f0;
             background: #0f172a;
-            box-shadow: 0 4px 14px rgba(0, 44, 93, 0.12);
+            box-shadow: 0 4px 14px rgba({RGB_AZUL_CSS}, 0.12);
             box-sizing: border-box;
         }}
         iframe.ficha-popup-video {{
@@ -467,7 +494,7 @@ def _md_bold_to_html(s: str) -> str:
 
 
 def _alert_azul(msg: str) -> None:
-    """Aviso informativo — borda e ênfase azul Direcional (#002c5d)."""
+    """Aviso informativo — borda e ênfase azul Direcional (COR_AZUL_ESC)."""
     st.markdown(
         f'<div class="ficha-alert ficha-alert--azul">{_md_bold_to_html(msg)}</div>',
         unsafe_allow_html=True,
@@ -475,7 +502,7 @@ def _alert_azul(msg: str) -> None:
 
 
 def _alert_vermelho(msg: str) -> None:
-    """Alerta de atenção — borda vermelha Direcional (#e30613), texto azul escuro."""
+    """Alerta de atenção — borda vermelha Direcional (COR_VERMELHO), texto azul escuro."""
     st.markdown(
         f'<div class="ficha-alert ficha-alert--vermelho">{_md_bold_to_html(msg)}</div>',
         unsafe_allow_html=True,
@@ -571,6 +598,14 @@ def _cabecalho_pagina(*, com_intro_formulario: bool = False) -> None:
     )
 
 
+def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
+    """Se o rótulo termina com ' *', devolve texto sem o asterisco e True."""
+    s = (label or "").rstrip()
+    if s.endswith(" *"):
+        return s[:-2].rstrip(), True
+    return label, False
+
+
 def _widget_campo(c: dict):
     k = c["key"]
     sk = f"fld_{k}"
@@ -578,26 +613,47 @@ def _widget_campo(c: dict):
     help_txt = c.get("help")
     tipo = c["tipo"]
 
+    plain, obrig = _label_obrigatorio_partes(label)
+    lv = "collapsed" if obrig else "visible"
+    if obrig:
+        st.markdown(
+            f'<div class="ficha-input-label">{html.escape(plain)} '
+            f'<span class="ficha-star-req" aria-hidden="true">*</span></div>',
+            unsafe_allow_html=True,
+        )
+        widget_label = f"{plain} (campo obrigatório)"
+    else:
+        widget_label = label
+
     if tipo == "text":
-        return st.text_input(label, key=sk, help=help_txt)
+        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "textarea":
-        return st.text_area(label, key=sk, help=help_txt, height=88)
+        return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
     if tipo == "date":
-        return st.text_input(label, key=sk, placeholder="31/12/2024", help=help_txt)
+        return st.text_input(
+            widget_label, key=sk, placeholder="31/12/2024", help=help_txt, label_visibility=lv
+        )
     if tipo == "number":
-        return st.text_input(label, key=sk, help=help_txt or "Use ponto ou vírgula decimal.")
+        return st.text_input(
+            widget_label,
+            key=sk,
+            help=help_txt or "Use ponto ou vírgula decimal.",
+            label_visibility=lv,
+        )
     if tipo == "id":
-        return st.text_input(label, key=sk, help=help_txt)
+        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "select":
         opts = c.get("opcoes") or [""]
         cur = st.session_state.get(sk)
         if cur is not None and cur not in opts:
             st.session_state[sk] = opts[0]
-        return st.selectbox(label, options=opts, key=sk, help=help_txt)
+        return st.selectbox(widget_label, options=opts, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "multiselect":
         opts = c.get("opcoes") or []
-        return st.multiselect(label, options=opts, default=[], key=sk, help=help_txt)
-    return st.text_input(label, key=sk, help=help_txt)
+        return st.multiselect(
+            widget_label, options=opts, default=[], key=sk, help=help_txt, label_visibility=lv
+        )
+    return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
 
 
 def _coletar_dados_formulario() -> dict[str, Any]:
@@ -649,7 +705,7 @@ def _nome_candidato_ficha(dados: dict[str, Any]) -> str:
 
 
 def montar_html_email_ficha_pdf(dados: dict[str, Any]) -> str:
-    """Corpo HTML do e-mail (estilo Direcional: azul #002c5d, vermelho #e30613)."""
+    """Corpo HTML do e-mail (estilo Direcional: azul COR_AZUL_ESC, vermelho COR_VERMELHO)."""
     nome = html.escape(_nome_candidato_ficha(dados))
     cpf = html.escape(str(dados.get("cpf") or ""))
     emitido = html.escape(datetime.now().strftime("%d/%m/%Y %H:%M"))
@@ -673,7 +729,7 @@ def montar_html_email_ficha_pdf(dados: dict[str, Any]) -> str:
             vtxt = html.escape(str(val))
         linhas.append(
             "<tr>"
-            f"<td style=\"padding:10px 12px;border:1px solid {borda};background:#f8fafc;"
+            f"<td style=\"padding:10px 12px;border:1px solid {borda};background:{COR_INPUT_BG};"
             f"font-weight:600;color:{azul};font-size:13px;width:38%;\">{label}</td>"
             f"<td style=\"padding:10px 12px;border:1px solid {borda};color:#334155;font-size:13px;\">{vtxt}</td>"
             "</tr>"
@@ -692,7 +748,7 @@ def montar_html_email_ficha_pdf(dados: dict[str, Any]) -> str:
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;">
 <tr><td align="center">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;
-box-shadow:0 8px 28px rgba(0,44,93,0.08);border:1px solid {borda};">
+box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
 <tr>
 <td align="center" style="background:{azul};padding:22px 20px;border-bottom:4px solid {verm};">
 <img src="{logo}" alt="Direcional Engenharia" width="168" style="display:block;max-width:100%;height:auto;">
@@ -877,7 +933,7 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
                     ("FONTSIZE", (0, 0), (-1, 0), 9),
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor(COR_BORDA)),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fcfdfe")]),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor(COR_INPUT_BG)]),
                 ]
             )
         )
@@ -1438,9 +1494,17 @@ def main():
     ultima = len(secoes) > 0 and int(st.session_state.get("ficha_secao_idx", 0)) == len(secoes) - 1
     if ultima:
         st.markdown("---")
+        st.markdown(
+            '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
+            "credenciamento na Direcional, conforme a LGPD. "
+            '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
+            unsafe_allow_html=True,
+        )
         st.checkbox(
-            "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. *",
+            "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. "
+            "(campo obrigatório)",
             key="fld_lgpd_ficha",
+            label_visibility="collapsed",
         )
         if st.button("Enviar meu cadastro", type="primary", use_container_width=True, key="ficha_enviar"):
             _processar_envio_cadastro()
