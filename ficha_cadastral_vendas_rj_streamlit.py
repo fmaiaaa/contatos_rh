@@ -46,7 +46,7 @@ except ImportError:
     conectar_salesforce = None
     criar_contato_payload = None
 
-COR_AZUL_ESC = "#002c5d"
+COR_AZUL_ESC = "#044b99"
 COR_VERMELHO = "#e30613"
 COR_FUNDO = "#fcfdfe"
 COR_BORDA = "#eef2f6"
