@@ -30,10 +30,17 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
     raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
     if not raw:
         return None
-    if isinstance(raw, str):
-        return json.loads(raw)
     if isinstance(raw, dict):
         return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("\ufeff"):
+            s = s.lstrip("\ufeff")
+        try:
+            parsed = json.loads(s)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
     return None
 
 
