@@ -516,16 +516,6 @@ def _campos_def() -> List[Campo]:
             req=True,
         ),
         _z(
-            key="indicado_por_id",
-            label="Indicado por",
-            sec="Informações para contato",
-            tipo="id",
-            sf="Indicado_por__c",
-            req=False,
-            help="Opcional: Id do **usuário** Salesforce que indicou (15 ou 18 caracteres; costuma começar com **005**). "
-            "Não confunda com Record Type (**012**). Se não tiver o Id exato, deixe em branco.",
-        ),
-        _z(
             key="camiseta",
             label="Camiseta *",
             sec="Informações para contato",
@@ -1026,7 +1016,7 @@ def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
     s = str(val).strip()
     if not s:
         return None
-    if sf_field in ("AccountId", "OwnerId", "Indicado_por__c", "GerenteAnterior__c", "Solicitantedescredenciamento__c"):
+    if sf_field in ("AccountId", "OwnerId", "GerenteAnterior__c", "Solicitantedescredenciamento__c"):
         if _ID_RE.match(s):
             return s
     if sf_field == "Produto_de_Atuacao__c" and _ID_RE.match(s):
