@@ -38,6 +38,7 @@ except ImportError:
 
 _SF_SDK_DISPONIVEL = Salesforce is not None
 
+FICHA_TEST_PLANILHA=1
 
 def conectar_salesforce():
     if not _SF_SDK_DISPONIVEL:
