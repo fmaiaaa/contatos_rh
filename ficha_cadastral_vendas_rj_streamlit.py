@@ -47,7 +47,7 @@ except ImportError:
     criar_contato_payload = None
 
 COR_AZUL_ESC = "#04428f"
-COR_VERMELHO = "#e30613"
+COR_VERMELHO = "#cb0935"
 COR_FUNDO = "#04428f"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
