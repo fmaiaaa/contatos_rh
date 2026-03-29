@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
-Backend: planilha Google + Salesforce (detalhes operacionais fora desta tela).
-"""
 
+Arquivo único para deploy (ex.: Streamlit Cloud): campos, planilha Google, segurança e app.
+Dependências: streamlit, gspread, google-auth, simple_salesforce (requirements.txt).
+"""
 from __future__ import annotations
 
 import base64
@@ -15,65 +16,1791 @@ import platform
 import re
 import smtplib
 import sys
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape_para_pdf
-
-# Módulos locais: no Cloud os .py podem estar só na raiz, só em salesforce/ ou mistos
-# (ex.: corretor_campos na raiz e google_sheets_corretor só em salesforce/).
-_DIR_APP = Path(__file__).resolve().parent
-for _p in (_DIR_APP, _DIR_APP / "salesforce", _DIR_APP.parent / "salesforce"):
-    if not _p.is_dir():
-        continue
-    if not (
-        (_p / "corretor_campos.py").is_file()
-        or (_p / "google_sheets_corretor.py").is_file()
-        or (_p / "ficha_seguranca.py").is_file()
-    ):
-        continue
-    _sp = str(_p.resolve())
-    if _sp not in sys.path:
-        sys.path.insert(0, _sp)
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
-import ficha_seguranca
-
-from corretor_campos import (
-    ATIVIDADE_VENDAS_RJ_OPTS,
-    CAMPOS,
-    NOMES_CONTA_FIXOS,
-    cabecalho_planilha,
-    campos_por_secao_visiveis,
-    email_contato_formato_valido,
-    enriquecer_derivados_vendas_rj,
-    linha_planilha,
-    montar_payload_salesforce,
-    secoes_com_campos_visiveis,
-    validar_obrigatorios,
-    validar_obrigatorios_secao,
-)
-from google_sheets_corretor import (
-    DEFAULT_COL_NOME_CONTA,
-    DEFAULT_GERENTES_WORKSHEET,
-    DEFAULT_SPREADSHEET_ID,
-    DEFAULT_WORKSHEET_NAME,
-    _credenciais_de_secrets,
-    anexar_linha,
-    atualizar_status_envio_salesforce,
-    listar_nomes_conta_aba_gerentes,
-)
-
+# --- Salesforce (simple_salesforce; antes: salesforce_api.py) ---
 try:
-    from salesforce_api import conectar_salesforce, criar_contato_payload
+    from simple_salesforce import Salesforce, SalesforceAuthenticationFailed
 except ImportError:
-    conectar_salesforce = None
-    criar_contato_payload = None
+    Salesforce = None  # type: ignore[misc, assignment]
+    SalesforceAuthenticationFailed = Exception  # type: ignore[misc, assignment]
 
+_SF_SDK_DISPONIVEL = Salesforce is not None
+
+
+def conectar_salesforce():
+    if not _SF_SDK_DISPONIVEL:
+        return None
+    username = (os.environ.get("SALESFORCE_USER") or "").strip()
+    password = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
+    token = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
+    if not username or not password:
+        return None
+    try:
+        if token:
+            return Salesforce(
+                username=username,
+                password=password,
+                security_token=token,
+                domain="login",
+            )
+        return Salesforce(username=username, password=password, domain="login")
+    except SalesforceAuthenticationFailed:
+        return None
+    except Exception:
+        return None
+
+
+def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
+    try:
+        res = sf.Contact.create(payload)
+        return res.get("id"), None
+    except Exception as e:
+        return None, str(e)
+
+
+# =============================================================================
+# INTEGRADO: corretor_campos
+# =============================================================================
+RECORD_TYPE_CORRETOR = ""
+
+_SF_ID_15_18 = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
+
+_EMAIL_CONTATO_RE = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+)
+
+
+def email_contato_formato_valido(val: Any) -> bool:
+    """Validação simples de e-mail para formulário e SMTP (evita destinos como «K»)."""
+    s = (str(val).strip() if val is not None else "") or ""
+    if not s or len(s) > 254:
+        return False
+    return bool(_EMAIL_CONTATO_RE.match(s))
+
+
+def record_type_id_contato_payload() -> str:
+    """
+    Id do tipo de registro Contact (ex.: Corretor), só se configurado e com formato Id SF.
+    Sem valor válido, retorna vazio e o payload omite RecordTypeId (usa padrão do usuário da API).
+    """
+    for candidate in (
+        (os.environ.get("SF_RECORD_TYPE_ID") or "").strip(),
+        (RECORD_TYPE_CORRETOR or "").strip(),
+    ):
+        if candidate and _SF_ID_15_18.match(candidate):
+            return candidate
+    return ""
+
+# Ordem das seções no Salesforce (não alterar sem checar o layout no org)
+SEC_ORDER: Tuple[str, ...] = (
+    "Informações para contato",
+    "Dados Pessoais",
+    "Dados de Usuário",
+    "Dados para Contato",
+    "Dados Familiares",
+    "Dados Bancários Pessoa Física",
+    "CRECI/TTI",
+    "Contrato e dados PJ",
+    "Dados Integração",
+    "Preferência de contato",
+)
+
+SF_OMIT_INSERT = frozenset(
+    {
+        "Blacklist__c",
+        "RetornoIntegracaoContaBancaria__c",
+        "C_digo_Pessoa_UAU__c",
+        "Corretor_Associado__c",
+        "MultiplicadorFinal__c",
+        "Contact_ID__c",
+        "ErroIntegracaoUAU__c",
+        "RetornoIntegracaoPessoa__c",
+        "Data_Descredenciamento__c",
+    }
+)
+
+REGIONAIS = [
+    "--Nenhum--",
+    "AC",
+    "AL",
+    "AM",
+    "AP",
+    "BA",
+    "CE",
+    "DF",
+    "ES",
+    "GO",
+    "MA",
+    "MG",
+    "MS",
+    "MT",
+    "PA",
+    "PE",
+    "PI",
+    "PR",
+    "RJ",
+    "RN",
+    "RO",
+    "RR",
+    "RS",
+    "SC",
+    "SE",
+    "SP",
+    "TO",
+]
+
+ORIGENS = [
+    "--Nenhum--",
+    "RH",
+    "Indicação",
+    "Gerente",
+    "Diretor",
+    "DiRi Talent",
+    "Coordenador",
+    "Gupy",
+    "MARINHA",
+    "Creci",
+    "Parceria Estácio",
+]
+
+STATUS_CORRETOR = ["--Nenhum--", "Ativo", "Inativo", "Pré credenciado", "Reativado"]
+
+SALUTATIONS = ["--Nenhum--", "Sr.", "Sra.", "Dr.", "Dra."]
+
+SEXOS = ["--Nenhum--", "Masculino", "Feminino"]
+
+CAMISETAS = ["--Nenhum--", "PP", "P", "M", "G", "GG", "XGG"]
+
+# Valores exibidos no formulário Vendas RJ (mapeados para o picklist SF em `montar_payload_salesforce`).
+UNIDADE_REDE_OUTRA_IMOBILIARIA = "Outra imobiliária (parceira)"
+UNIDADES_NEGOCIO = [
+    "--Nenhum--",
+    "Direcional",
+    "Riva",
+    UNIDADE_REDE_OUTRA_IMOBILIARIA,
+]
+
+# Atividade restrita ao fluxo Vendas RJ (picklist SF: Corretor Parceiro, Corretor, Captador).
+ATIVIDADE_VENDAS_RJ_OPTS = ["--Nenhum--", "Corretor Parceiro", "Corretor", "Captador"]
+
+TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Telefone", "Chave aleatória"]
+
+ESTADOS_UF = [
+    "--Nenhum--",
+    "AC",
+    "AL",
+    "AM",
+    "AP",
+    "BA",
+    "CE",
+    "DF",
+    "ES",
+    "GO",
+    "MA",
+    "MG",
+    "MS",
+    "MT",
+    "PA",
+    "PE",
+    "PI",
+    "PR",
+    "RJ",
+    "RN",
+    "RO",
+    "RR",
+    "RS",
+    "SC",
+    "SE",
+    "SP",
+    "TO",
+]
+
+POSSUI_FILHOS = ["--Nenhum--", "Sim", "Não"]
+
+TIPO_CONTA_BANCARIA = ["--Nenhum--", "Corrente", "Poupança"]
+
+# Picklists Contact (fonte: salesforce_objetos_describe.json — alinhar ao org ao atualizar o describe)
+_ESTADO_CIVIL = ["Solteiro", "Casado", "Divorciado", "Viúvo"]
+_ESCOLARIDADE = [
+    "Ensino Fundamental",
+    "Ensino Médio",
+    "Superior em Andamento",
+    "Superior Completo",
+    "Mestrado em Andamento",
+    "Mestrado Concluído",
+    "Doutorado em Andamento",
+    "Doutorado Concluído",
+]
+_NACIONALIDADE = ["Brasileiro", "Estrangeira", "Espanhola"]
+_ATIVIDADE = [
+    "Captador",
+    "Estagiário",
+    "Corretor",
+    "Coordenador",
+    "Gerente de Vendas",
+    "Gerente Regional",
+    "Diretor",
+    "Gerente",
+    "Captador Recruta+",
+    "Gerente Recruta+",
+    "Corretor N1",
+    "Gerente de Vendas N1",
+    "Diretor de Vendas",
+    "Analista",
+    "Assistente",
+    "Cliente",
+    "Coordenador de Produto",
+    "Coordenador de Vendas",
+    "Diretor de Incorporação",
+    "Gerente Comercial",
+    "Gerente de Parcerias",
+    "Imobiliária Parceira",
+    "Pasteiro (a)",
+    "Superintendente",
+    "Supervisor",
+    "Autônomo Parceiro",
+    "Corretor Parceiro",
+    "Recepção",
+    "Coordenador de Parcerias",
+]
+_TIPO_CORRETOR = [
+    "Direcional Vendas – GRI (CLT)",
+    "Direcional Vendas – Autônomos",
+    "Parceiros (Externo)",
+]
+_STATUS_CRECI = [
+    "Concluído Provas",
+    "Definitivo",
+    "Estágio",
+    "Matriculado",
+    "Pendente",
+    "Protocolo Definitivo",
+    "Protocolo Estágio",
+    "Pendente Prova",
+]
+_MOTIVO_INATIVIDADE = [
+    "Solicitação do Corretor",
+    "Solicitação do Gerente de Vendas",
+    "Solicitação do Gerente Regional",
+    "Solicitação do Diretor",
+]
+_MOTIVO_DESCREDENCIAMENTO = [
+    "Falta de recurso financeiro",
+    "Oportunidade CLT",
+    "Distância",
+    "Relacionamento com o Gestor",
+    "Baixa performance",
+    "Abandono",
+    "Desistente da Incubadora",
+    "Mudança de Cidade / Estado",
+    "Problemas de Saúde",
+    "Concorrência",
+    "Comportamento Inadequado",
+    "Promoção Interna",
+    "Corretor Parceiro",
+]
+_TIPO_DESLIGAMENTO = ["Ativo", "Passivo"]
+_FORNECEDOR_UAU = ["Não", "Sim"]
+_BANCO = [
+    "001 – Banco do Brasil S.A.",
+    "004 - BANCO DO NORDESTE DO BRASIL S.A.",
+    "033 – Banco Santander (Brasil) S.A.",
+    "070 - BCO BRB SA - BRASILIA",
+    "104 – Caixa Econômica Federal",
+    "121 - Banco Agiplan",
+    "197 – Stone Pagamentos S.A.",
+    "208 – Banco BTG Pactual",
+    "212 - Banco Original S.A.",
+    "218 – Banco Bonsucesso SA",
+    "237 – Banco Bradesco S.A.",
+    "246 - Banco ABC Brasil S.A.",
+    "260 – Banco Nubank",
+    "290 – PagSeguro Internt SA",
+    "318 - BCO BMG COMERCIAL S.A",
+    "323 – Mercado Pago",
+    "336 - BANCO C6 S.A.",
+    "340 – Super digital",
+    "341 – Banco Itaú S.A.",
+    "356 – Banco Real S.A. (antigo)",
+    "364 - Gerencianet",
+    "380 – PicPay",
+    "389 – Banco Mercantil do Brasil S.A.",
+    "399 – HSBC Bank Brasil S.A. – Banco Múltiplo",
+    "403 – CORA SOCIEDADE DE CR",
+    "413 – BV",
+    "422 – Banco Safra S.A.",
+    "453 – Banco Rural S.A.",
+    "473 - Banco Caixa Geral - Brasil S.A.",
+    "623 – Banco Panamericano S.A",
+    "633 – Banco Rendimento S.A.",
+    "637 - Bco Sofisa SA.",
+    "652 – Itaú Unibanco Holding S.A.",
+    "655 – Banco Votorantim S.A.",
+    "735 - BANCO POTTENCIAL S.A.",
+    "745 – Banco Citibank S.A.",
+    "746 - BCO MODAL SA.",
+    "748 – BCO COOP. SICREDI SA",
+    "756 – Banco SICCOB S.A",
+    "77 - BCO INTERMEDIUM SA",
+    "79 - Banco Original Agro",
+    "92 - BANCO BRK",
+    "348 - BANCO XP S.A",
+    "679 - CloudWalk Instituição de Pagamento",
+    "536 – NEON PAGAMENTOS",
+    "335 -  Banco Digio S.A.",
+]
+
+ESTADO_CIVIL_OPTS = ["--Nenhum--"] + _ESTADO_CIVIL
+ESCOLARIDADE_OPTS = ["--Nenhum--"] + _ESCOLARIDADE
+NACIONALIDADE_OPTS = ["--Nenhum--"] + _NACIONALIDADE
+ATIVIDADE_OPTS = ["--Nenhum--"] + _ATIVIDADE
+TIPO_CORRETOR_OPTS = ["--Nenhum--"] + _TIPO_CORRETOR
+STATUS_CRECI_OPTS = ["--Nenhum--"] + _STATUS_CRECI
+MOTIVO_INATIVIDADE_OPTS = ["--Nenhum--"] + _MOTIVO_INATIVIDADE
+MOTIVO_DESCREDENCIAMENTO_OPTS = ["--Nenhum--"] + _MOTIVO_DESCREDENCIAMENTO
+TIPO_DESLIGAMENTO_OPTS = ["--Nenhum--"] + _TIPO_DESLIGAMENTO
+FORNECEDOR_UAU_OPTS = ["--Nenhum--"] + _FORNECEDOR_UAU
+BANCO_OPTS = ["--Nenhum--"] + _BANCO
+
+# Valores alinhados ao picklist do Salesforce (somente opções em português).
+PREFERRED_METHOD_OPTS = [
+    "Telefone de Trabalho",
+    "Telefone residencial",
+    "Celular",
+    "Email de trabalho",
+    "Email pessoal",
+    "Sem preferência",
+]
+
+# Fallback se [ficha_defaults] não tiver account_names — substitua ou use Secrets.
+NOMES_CONTA_FIXOS: Tuple[str, ...] = ("Ajuste em ficha_defaults.account_names",)
+
+Campo = Dict[str, Any]
+
+
+def _z(**kw) -> Campo:
+    return kw
+
+
+def _campos_def() -> List[Campo]:
+    """
+    Ordem idêntica ao formulário Salesforce (Novo Contato: Corretor).
+    * = obrigatório no layout (req=True), salvo quando combinado com outro campo.
+    """
+    return [
+        # ——— Informações para contato ———
+        _z(
+            key="account_name",
+            label="Nome da conta *",
+            sec="Informações para contato",
+            tipo="select",
+            sf=None,
+            opcoes=list(NOMES_CONTA_FIXOS),
+            req=True,
+            help="Opções: coluna «Nome da Conta» na aba «Gerentes» da planilha Google ([google_sheets]); senão [ficha_defaults].",
+        ),
+        _z(
+            key="account_id",
+            label="Nome da conta — Id (Account)",
+            sec="Informações para contato",
+            tipo="id",
+            sf="AccountId",
+            req=False,
+            help="Id Salesforce da conta (18 caracteres).",
+        ),
+        _z(
+            key="owner_id",
+            label="Proprietário do contato",
+            sec="Informações para contato",
+            tipo="id",
+            sf="OwnerId",
+            req=False,
+            help="Id do usuário proprietário (opcional).",
+        ),
+        _z(
+            key="nome_completo",
+            label="Nome completo *",
+            sec="Informações para contato",
+            tipo="text",
+            sf=None,
+            req=True,
+            help="Primeira palavra = nome (Primeiro Nome no Salesforce); o restante = sobrenome. Apelido gerado automaticamente.",
+        ),
+        _z(
+            key="salutation",
+            label="Tratamento",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Salutation",
+            opcoes=SALUTATIONS,
+            req=False,
+        ),
+        _z(
+            key="apelido",
+            label="Apelido",
+            sec="Informações para contato",
+            tipo="text",
+            sf="Apelido__c",
+            req=False,
+            help="Preenchido automaticamente: primeiro nome + _RJ01",
+        ),
+        _z(
+            key="status_corretor",
+            label="Status Corretor *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Status_Corretor__c",
+            opcoes=STATUS_CORRETOR,
+            req=True,
+        ),
+        _z(
+            key="regional",
+            label="Regional *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Regional__c",
+            opcoes=REGIONAIS,
+            req=True,
+        ),
+        _z(
+            key="origem",
+            label="Origem *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Origem__c",
+            opcoes=ORIGENS,
+            req=True,
+        ),
+        _z(
+            key="sexo",
+            label="Sexo *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Sexo__c",
+            opcoes=SEXOS,
+            req=True,
+        ),
+        _z(
+            key="indicado_por_id",
+            label="Indicado por",
+            sec="Informações para contato",
+            tipo="id",
+            sf="Indicado_por__c",
+            req=False,
+            help="Pesquisar Pessoas — Id User (18 caracteres).",
+        ),
+        _z(
+            key="camiseta",
+            label="Camiseta *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Camiseta__c",
+            opcoes=CAMISETAS,
+            req=True,
+        ),
+        _z(
+            key="unidade_negocio",
+            label="Fará parte de qual rede? *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Unidade_Negocio__c",
+            opcoes=UNIDADES_NEGOCIO,
+            req=True,
+            help="Direcional, Riva ou imobiliária parceira (externa).",
+        ),
+        _z(
+            key="atividade",
+            label="Função na operação *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Atividade__c",
+            opcoes=ATIVIDADE_OPTS,
+            req=True,
+            help="No fluxo Vendas RJ o formulário restringe a Corretor Parceiro, Corretor (próprio) e Captador. Corretor = corretor próprio. Parceira externa: gravado como Corretor Parceiro.",
+        ),
+        _z(
+            key="escolaridade",
+            label="Escolaridade",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Escolaridade__c",
+            opcoes=ESCOLARIDADE_OPTS,
+            req=False,
+        ),
+        _z(
+            key="data_entrevista",
+            label="Data da Entrevista",
+            sec="Informações para contato",
+            tipo="date",
+            sf="Data_da_Entrevista__c",
+            req=False,
+            help="Definida automaticamente na data do envio.",
+        ),
+        _z(
+            key="data_transferencia_parceiro",
+            label="Data Transferência Corretor Parceiro",
+            sec="Informações para contato",
+            tipo="date",
+            sf="Data_Transferencia_Corretor_Parceiro__c",
+            req=False,
+            help="Formato: 31/12/2024",
+        ),
+        # ——— Dados Pessoais ———
+        _z(
+            key="birthdate",
+            label="Data de nascimento *",
+            sec="Dados Pessoais",
+            tipo="date",
+            sf="Birthdate",
+            req=True,
+            help="Formato: 31/12/2024",
+        ),
+        _z(
+            key="estado_civil",
+            label="Estado Civil *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="EstadoCivil__c",
+            opcoes=ESTADO_CIVIL_OPTS,
+            req=True,
+        ),
+        _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
+        _z(key="pis", label="PIS", sec="Dados Pessoais", tipo="text", sf="PIS__c", req=False),
+        _z(
+            key="nacionalidade",
+            label="Nacionalidade *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="Nacionalidade__c",
+            opcoes=NACIONALIDADE_OPTS,
+            req=True,
+        ),
+        _z(
+            key="naturalidade",
+            label="Naturalidade *",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf="Naturalidade__c",
+            req=True,
+        ),
+        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
+        _z(
+            key="uf_naturalidade",
+            label="UF Naturalidade *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="UF_Naturalidade__c",
+            opcoes=ESTADOS_UF,
+            req=True,
+        ),
+        _z(
+            key="uf_rg",
+            label="UF RG *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="UF_RG__c",
+            opcoes=ESTADOS_UF,
+            req=True,
+        ),
+        _z(
+            key="tipo_pix",
+            label="Tipo do PIX *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="Tipo_do_PIX__c",
+            opcoes=TIPO_PIX,
+            req=True,
+        ),
+        _z(
+            key="dados_pix",
+            label="Dados para PIX *",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf="Dados_para_PIX__c",
+            req=True,
+        ),
+        # ——— Dados de Usuário ———
+        _z(
+            key="multiplicador_nivel",
+            label="Multiplicador de Nível",
+            sec="Dados de Usuário",
+            tipo="number",
+            sf="Multiplicador__c",
+            req=False,
+        ),
+        _z(
+            key="usuario_uau",
+            label="Usuário UAU",
+            sec="Dados de Usuário",
+            tipo="text",
+            sf="Usu_rio_UAU__c",
+            req=False,
+        ),
+        _z(
+            key="multiplicador_regime",
+            label="Multiplicador de Regime",
+            sec="Dados de Usuário",
+            tipo="number",
+            sf="Multiplicador_de_Regime__c",
+            req=False,
+        ),
+        # ——— Dados para Contato ———
+        _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
+        _z(key="mobile", label="Celular", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=False),
+        _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
+        # ——— Dados Familiares ———
+        _z(
+            key="nome_pai",
+            label="Nome do Pai *",
+            sec="Dados Familiares",
+            tipo="text",
+            sf="Nome_do_Pai__c",
+            req=True,
+        ),
+        _z(
+            key="possui_filhos",
+            label="Possui Filho(s)?",
+            sec="Dados Familiares",
+            tipo="select",
+            sf="Possui_Filho__c",
+            opcoes=POSSUI_FILHOS,
+            req=False,
+        ),
+        _z(
+            key="nome_mae",
+            label="Nome da Mãe *",
+            sec="Dados Familiares",
+            tipo="text",
+            sf="Nome_da_Mae__c",
+            req=True,
+        ),
+        _z(
+            key="qtd_filhos",
+            label="Quantidade de Filhos",
+            sec="Dados Familiares",
+            tipo="number",
+            sf="Quantidade_de_Filhos__c",
+            req=False,
+        ),
+        _z(
+            key="nome_conjuge",
+            label="Nome do Cônjuge",
+            sec="Dados Familiares",
+            tipo="text",
+            sf="Nome_do_Conjuge__c",
+            req=False,
+        ),
+        # ——— Dados Bancários Pessoa Física ———
+        _z(
+            key="banco",
+            label="Banco *",
+            sec="Dados Bancários Pessoa Física",
+            tipo="select",
+            sf="Banco__c",
+            opcoes=BANCO_OPTS,
+            req=True,
+        ),
+        _z(
+            key="conta_bancaria",
+            label="Conta Bancária *",
+            sec="Dados Bancários Pessoa Física",
+            tipo="text",
+            sf="Conta_Banc_ria__c",
+            req=True,
+        ),
+        _z(
+            key="agencia_bancaria",
+            label="Agência Bancária *",
+            sec="Dados Bancários Pessoa Física",
+            tipo="text",
+            sf="Ag_ncia_Banc_ria__c",
+            req=True,
+        ),
+        _z(
+            key="retorno_integracao_bancaria",
+            label="Retorno integração conta bancária",
+            sec="Dados Bancários Pessoa Física",
+            tipo="textarea",
+            sf="RetornoIntegracaoContaBancaria__c",
+            req=False,
+            help="Somente leitura no Salesforce — uso informativo na planilha.",
+        ),
+        _z(
+            key="tipo_conta",
+            label="Tipo de Conta",
+            sec="Dados Bancários Pessoa Física",
+            tipo="select",
+            sf="Tipo_de_Conta__c",
+            opcoes=TIPO_CONTA_BANCARIA,
+            req=False,
+        ),
+        # ——— CRECI/TTI ———
+        _z(
+            key="possui_creci",
+            label="Possui CRECI? *",
+            sec="CRECI/TTI",
+            tipo="select",
+            sf=None,
+            opcoes=["Sim", "Não"],
+            req=True,
+            help="Se sim, os campos de CRECI aparecem abaixo. Se não, avance para a próxima etapa.",
+        ),
+        _z(
+            key="data_matricula_tti",
+            label="Data Matrícula - TTI",
+            sec="CRECI/TTI",
+            tipo="date",
+            sf="Data_Matricula_TTI__c",
+            req=False,
+            help="Formato: 31/12/2024",
+        ),
+        _z(key="tti", label="TTI", sec="CRECI/TTI", tipo="text", sf="TTI__c", req=False),
+        _z(
+            key="status_creci",
+            label="Status CRECI",
+            sec="CRECI/TTI",
+            tipo="select",
+            sf="Status_CRECI__c",
+            opcoes=STATUS_CRECI_OPTS,
+            req=False,
+        ),
+        _z(
+            key="data_conclusao",
+            label="Data de conclusão",
+            sec="CRECI/TTI",
+            tipo="date",
+            sf="Data_de_conclusao__c",
+            req=False,
+            help="Formato: 31/12/2024",
+        ),
+        _z(key="creci", label="CRECI", sec="CRECI/TTI", tipo="text", sf="CRECI__c", req=False),
+        _z(
+            key="observacoes_creci",
+            label="Observações",
+            sec="CRECI/TTI",
+            tipo="textarea",
+            sf="Observacoes__c",
+            req=False,
+        ),
+        _z(
+            key="validade_creci",
+            label="Validade CRECI",
+            sec="CRECI/TTI",
+            tipo="date",
+            sf="Validade_CRECI__c",
+            req=False,
+            help="Formato: 31/12/2024",
+        ),
+        _z(
+            key="nome_responsavel",
+            label="Nome do Responsável",
+            sec="CRECI/TTI",
+            tipo="text",
+            sf="Nome_do_Responsavel__c",
+            req=False,
+        ),
+        _z(
+            key="creci_responsavel",
+            label="CRECI do Responsável",
+            sec="CRECI/TTI",
+            tipo="number",
+            sf="CRECI_do_Responsavel__c",
+            req=False,
+        ),
+        _z(
+            key="tipo_comissionamento",
+            label="Tipo de Comissionamento",
+            sec="CRECI/TTI",
+            tipo="text",
+            sf=None,
+            req=False,
+        ),
+        # ——— Contrato e dados PJ (continuação do layout após CRECI) ———
+        _z(
+            key="tipo_corretor",
+            label="Tipo Corretor *",
+            sec="Contrato e dados PJ",
+            tipo="select",
+            sf="Tipo_Corretor__c",
+            opcoes=TIPO_CORRETOR_OPTS,
+            req=False,
+        ),
+        _z(
+            key="faturamento_comissao",
+            label="Faturamento Comissão",
+            sec="Contrato e dados PJ",
+            tipo="text",
+            sf=None,
+            req=False,
+            help="Gravado na planilha; no SF pode ser somente leitura.",
+        ),
+        _z(
+            key="faturamento_comissao_2",
+            label="Faturamento Comissão (2)",
+            sec="Contrato e dados PJ",
+            tipo="text",
+            sf=None,
+            req=False,
+        ),
+        _z(key="cnpj", label="CNPJ", sec="Contrato e dados PJ", tipo="text", sf="CNPJ__c", req=False),
+        _z(
+            key="razao_social",
+            label="Razão Social",
+            sec="Contrato e dados PJ",
+            tipo="text",
+            sf="Razao_Social__c",
+            req=False,
+        ),
+        _z(
+            key="fornecedor_uau",
+            label="Cadastrado como Fornecedor no UAU?",
+            sec="Contrato e dados PJ",
+            tipo="select",
+            sf="Cadastrado_como_Fornecedor_no_UAU__c",
+            opcoes=FORNECEDOR_UAU_OPTS,
+            req=False,
+        ),
+        _z(
+            key="contrato_texto",
+            label="Contrato",
+            sec="Contrato e dados PJ",
+            tipo="textarea",
+            sf="Contrato__c",
+            req=False,
+        ),
+        _z(
+            key="data_contrato",
+            label="Data Contrato",
+            sec="Contrato e dados PJ",
+            tipo="date",
+            sf="Data_Contrato__c",
+            req=False,
+            help="Definida automaticamente na data do envio.",
+        ),
+        _z(
+            key="data_credenciamento",
+            label="Data Credenciamento",
+            sec="Contrato e dados PJ",
+            tipo="date",
+            sf="Data_Credenciamento__c",
+            req=False,
+            help="Definida automaticamente na data do envio.",
+        ),
+        _z(
+            key="contrato_observacao",
+            label="Contrato (observação / referência)",
+            sec="Contrato e dados PJ",
+            tipo="textarea",
+            sf=None,
+            req=False,
+            help="Segundo bloco Contrato do layout Salesforce (texto livre).",
+        ),
+        # ——— Dados Integração ———
+        _z(
+            key="codigo_pessoa_uau",
+            label="Código Pessoa UAU",
+            sec="Dados Integração",
+            tipo="text",
+            sf="C_digo_Pessoa_UAU__c",
+            req=False,
+        ),
+        _z(
+            key="erro_integracao_uau",
+            label="Erro Integração UAU",
+            sec="Dados Integração",
+            tipo="textarea",
+            sf="ErroIntegracaoUAU__c",
+            req=False,
+        ),
+        _z(
+            key="retorno_integracao_pessoa",
+            label="Retorno Integração Pessoa",
+            sec="Dados Integração",
+            tipo="textarea",
+            sf="RetornoIntegracaoPessoa__c",
+            req=False,
+        ),
+        # ——— Preferência de contato ———
+        _z(
+            key="preferred_contact_method",
+            label="Preferência de contato",
+            sec="Preferência de contato",
+            tipo="multiselect",
+            sf="Preferred_Contact_Method__c",
+            opcoes=PREFERRED_METHOD_OPTS,
+            req=False,
+        ),
+    ]
+
+
+CAMPOS: List[Campo] = _campos_def()
+
+# Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
+# valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
+# tipo_corretor / multiplicadores / apelido / datas: enriquecer_derivados_vendas_rj.
+CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
+    {
+        "codigo_pessoa_uau",
+        "erro_integracao_uau",
+        "retorno_integracao_pessoa",
+        "retorno_integracao_bancaria",
+        "status_corretor",
+        "regional",
+        "origem",
+        "account_id",
+        "owner_id",
+        "tipo_corretor",
+        "apelido",
+        "data_entrevista",
+        "data_contrato",
+        "data_credenciamento",
+        "multiplicador_nivel",
+        "multiplicador_regime",
+    }
+)
+
+# Campos da seção CRECI/TTI exibidos só quando «Possui CRECI?» = Sim.
+CAMPOS_CRECI_DETALHES: frozenset[str] = frozenset(
+    {
+        "data_matricula_tti",
+        "tti",
+        "status_creci",
+        "data_conclusao",
+        "creci",
+        "observacoes_creci",
+        "validade_creci",
+        "nome_responsavel",
+        "creci_responsavel",
+        "tipo_comissionamento",
+    }
+)
+
+
+def campos_por_secao_visiveis(
+    sec: str, dados: Optional[Dict[str, Any]] = None
+) -> List[Campo]:
+    cols = [
+        c
+        for c in CAMPOS
+        if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO
+    ]
+    if sec == "CRECI/TTI":
+        d = dados or {}
+        if (str(d.get("possui_creci") or "").strip()) != "Sim":
+            cols = [c for c in cols if c["key"] == "possui_creci"]
+    if sec == "Informações para contato":
+        d = dados or {}
+        if _norm_picklist(d.get("unidade_negocio")) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+            cols = [c for c in cols if c["key"] != "atividade"]
+    return cols
+
+
+def secoes_com_campos_visiveis() -> List[str]:
+    presentes = {
+        c["sec"] for c in CAMPOS if c["key"] not in CAMPOS_OCULTOS_FORMULARIO
+    }
+    return [s for s in SEC_ORDER if s in presentes]
+
+
+_ID_RE = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
+
+
+def _norm_picklist(val: Any) -> str:
+    """Remove marcador '--Nenhum--' como vazio."""
+    s = (str(val).strip() if val is not None else "") or ""
+    if s in ("--Nenhum--", "Nenhum"):
+        return ""
+    return s
+
+
+def parse_data_br(val: Any) -> Optional[str]:
+    if val is None or (isinstance(val, float) and str(val) == "nan"):
+        return None
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val.isoformat()
+    if isinstance(val, datetime):
+        return val.date().isoformat()
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if sf_field in ("AccountId", "OwnerId", "Indicado_por__c", "GerenteAnterior__c", "Solicitantedescredenciamento__c"):
+        if _ID_RE.match(s):
+            return s
+    if sf_field == "Produto_de_Atuacao__c" and _ID_RE.match(s):
+        return s
+    return None
+
+
+def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
+    erros: List[str] = []
+    for c in CAMPOS:
+        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            continue
+        if c["key"] == "atividade" and _norm_picklist(
+            dados.get("unidade_negocio")
+        ) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+            continue
+        if not c.get("req"):
+            continue
+        k = c["key"]
+        v = dados.get(k)
+        if c["tipo"] == "multiselect":
+            if not v or (isinstance(v, list) and len(v) == 0):
+                erros.append(c["label"])
+            continue
+        if c["tipo"] == "select":
+            if not _norm_picklist(v):
+                erros.append(c["label"])
+            continue
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            erros.append(c["label"])
+    aid = (dados.get("account_id") or "").strip()
+    aname = (dados.get("account_name") or "").strip()
+    if not aid and not aname:
+        erros.append(
+            "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
+            "(ou selecione Nome da conta)."
+        )
+    nc = (dados.get("nome_completo") or "").strip()
+    if not nc:
+        erros.append("Nome completo *")
+    em = (dados.get("email") or "").strip()
+    if em and not email_contato_formato_valido(em):
+        erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+    return list(dict.fromkeys(erros))
+
+
+def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
+    """
+    Valida apenas campos obrigatórios da seção atual (para bloquear «Avançar» no formulário por etapas).
+    Replica a lógica de `validar_obrigatorios` para `c['sec'] == sec` e, na seção
+    «Informações para contato», as regras de conta + nome/sobrenome.
+    """
+    erros: List[str] = []
+    for c in CAMPOS:
+        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            continue
+        if (
+            c["key"] == "atividade"
+            and sec == "Informações para contato"
+            and _norm_picklist(dados.get("unidade_negocio"))
+            == UNIDADE_REDE_OUTRA_IMOBILIARIA
+        ):
+            continue
+        if c["sec"] != sec or not c.get("req"):
+            continue
+        k = c["key"]
+        v = dados.get(k)
+        if c["tipo"] == "multiselect":
+            if not v or (isinstance(v, list) and len(v) == 0):
+                erros.append(c["label"])
+            continue
+        if c["tipo"] == "select":
+            if not _norm_picklist(v):
+                erros.append(c["label"])
+            continue
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            erros.append(c["label"])
+    if sec == "Informações para contato":
+        aid = (dados.get("account_id") or "").strip()
+        aname = (dados.get("account_name") or "").strip()
+        if not aid and not aname:
+            erros.append(
+                "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
+                "(ou selecione Nome da conta)."
+            )
+        nc = (dados.get("nome_completo") or "").strip()
+        if not nc:
+            erros.append("Nome completo *")
+    if sec == "Dados para Contato":
+        em = (dados.get("email") or "").strip()
+        if em and not email_contato_formato_valido(em):
+            erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+    return list(dict.fromkeys(erros))
+
+
+def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
+    """Primeira palavra → FirstName; restante → LastName (sem campos separados no formulário)."""
+    nc = (dados.get("nome_completo") or "").strip()
+    if not nc:
+        return
+    partes = nc.split(None, 1)
+    payload["FirstName"] = partes[0][:40]
+    payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
+
+
+def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    payload: Dict[str, Any] = {}
+    rt = record_type_id_contato_payload()
+    if rt:
+        payload["RecordTypeId"] = rt
+    avisos: List[str] = []
+    extras_obs: List[str] = []
+
+    for c in CAMPOS:
+        key = c["key"]
+        sf = c.get("sf")
+        raw = dados.get(key)
+
+        if key == "nome_completo":
+            continue
+
+        if sf is None:
+            if raw and str(raw).strip() and key not in ("nome_completo",):
+                extras_obs.append(f"{c['label']}: {raw}")
+            continue
+
+        if sf in SF_OMIT_INSERT:
+            if raw and str(raw).strip():
+                extras_obs.append(f"{c['label']}: {raw}")
+            continue
+
+        tipo = c["tipo"]
+
+        if tipo == "date":
+            iso = parse_data_br(raw)
+            if iso:
+                payload[sf] = iso
+            continue
+
+        if tipo == "id":
+            lid = _limpa_id(sf, raw)
+            if lid:
+                payload[sf] = lid
+            elif raw and str(raw).strip():
+                avisos.append(f"{c['label']}: valor não parece Id Salesforce — omitido.")
+            continue
+
+        if tipo == "number":
+            if raw is None or raw == "":
+                continue
+            try:
+                payload[sf] = float(str(raw).replace(",", "."))
+            except ValueError:
+                avisos.append(f"{c['label']}: número inválido — omitido.")
+            continue
+
+        if tipo == "multiselect":
+            if isinstance(raw, list) and raw:
+                payload[sf] = ";".join(raw)
+            continue
+
+        if tipo == "textarea":
+            s = (str(raw).strip() if raw is not None else "") or ""
+            if s:
+                if sf == "Observacoes__c":
+                    extras_obs.insert(0, s)
+                else:
+                    payload[sf] = s
+            continue
+
+        if tipo == "select":
+            s = _norm_picklist(raw)
+            if key == "unidade_negocio":
+                smap = {
+                    "Direcional": "Direcional",
+                    "Riva": "Direcional",
+                    UNIDADE_REDE_OUTRA_IMOBILIARIA: "Parceiros (Externo)",
+                }
+                s2 = smap.get(s)
+                if s2:
+                    payload[sf] = s2
+                elif s:
+                    payload[sf] = s
+                if s == "Riva":
+                    extras_obs.append("Rede de atuação informada: Riva")
+                continue
+            if s:
+                payload[sf] = s
+            continue
+
+        s = (str(raw).strip() if raw is not None else "") or ""
+        if not s:
+            continue
+        payload[sf] = s
+
+    _aplicar_nome_completo(payload, dados)
+
+    acc = dados.get("account_id")
+    acc_txt = dados.get("account_name")
+    if (not acc or not str(acc).strip()) and acc_txt and str(acc_txt).strip():
+        extras_obs.append(f"Nome da conta (referência): {acc_txt}")
+
+    obs_final = (payload.get("Observacoes__c") or "").strip()
+    extra_block = "\n".join(extras_obs)
+    if extra_block:
+        payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
+
+    payload = {k: v for k, v in payload.items() if v is not None and v != ""}
+
+    return payload, avisos
+
+
+def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Regras Vendas RJ: rede (Direcional/Riva/parceira) → tipo de corretor e Unidade SF;
+    parceira → Atividade Corretor Parceiro e Origem RH; função → multiplicadores;
+    apelido e datas automáticos.
+    """
+    out = dict(dados)
+    rede = _norm_picklist(out.get("unidade_negocio"))
+
+    if rede == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+        out["atividade"] = "Corretor Parceiro"
+        out["origem"] = "RH"
+    else:
+        act = _norm_picklist(out.get("atividade"))
+        out["atividade"] = act if act else "Corretor"
+
+    if rede in ("Direcional", "Riva"):
+        out["tipo_corretor"] = "Direcional Vendas – Autônomos"
+    elif rede:
+        out["tipo_corretor"] = "Parceiros (Externo)"
+    else:
+        out["tipo_corretor"] = ""
+
+    act_final = out.get("atividade") or ""
+    if act_final == "Captador":
+        out["multiplicador_nivel"] = 0.9
+        out["multiplicador_regime"] = 1.0
+    elif act_final in ("Corretor", "Corretor Parceiro"):
+        out["multiplicador_nivel"] = 1.0
+        out["multiplicador_regime"] = 1.0
+    else:
+        out["multiplicador_nivel"] = 1.0
+        out["multiplicador_regime"] = 1.0
+
+    nc = (out.get("nome_completo") or "").strip()
+    primeiro = nc.split(None, 1)[0] if nc else ""
+    out["apelido"] = f"{primeiro}_RJ01" if primeiro else ""
+    hoje = date.today().strftime("%d/%m/%Y")
+    out["data_entrevista"] = hoje
+    out["data_contrato"] = hoje
+    out["data_credenciamento"] = hoje
+    if (str(out.get("possui_creci") or "").strip()) != "Sim":
+        for k in CAMPOS_CRECI_DETALHES:
+            out[k] = ""
+    return out
+
+
+def _agora_envio_brasilia() -> tuple[str, str]:
+    """Data/hora legível em Brasília e ISO (mesmo instante)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/Sao_Paulo")
+        now = datetime.now(tz)
+        return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
+    except Exception:
+        now = datetime.now(timezone.utc)
+        return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
+
+
+def linha_planilha(dados: Dict[str, Any]) -> List[str]:
+    data_hora_br, iso = _agora_envio_brasilia()
+    row: List[str] = []
+    for c in CAMPOS:
+        k = c["key"]
+        v = dados.get(k)
+        if c["tipo"] == "multiselect" and isinstance(v, list):
+            row.append("; ".join(v))
+        elif v is None:
+            row.append("")
+        else:
+            row.append(str(v))
+    row.append(data_hora_br)
+    row.append(iso)
+    row.append("")  # Envio? — preenchido após tentativa Salesforce
+    row.append("")  # Log / erro
+    row.append("")  # Link do contato
+    return row
+
+
+def cabecalho_planilha() -> List[str]:
+    return [c["label"] for c in CAMPOS] + [
+        "Data e hora do envio",
+        "Carimbo ISO",
+        "Envio?",
+        "Log / erro",
+        "Link do contato",
+    ]
+
+
+def secoes_ordenadas() -> List[str]:
+    presentes = {c["sec"] for c in CAMPOS}
+    return [s for s in SEC_ORDER if s in presentes]
+
+
+def campos_por_secao(sec: str) -> List[Campo]:
+    return [c for c in CAMPOS if c["sec"] == sec]
+
+# =============================================================================
+# INTEGRADO: google_sheets_corretor
+# =============================================================================
+_PEM_END_MARKERS = (
+    "-----END PRIVATE KEY-----",
+    "-----END RSA PRIVATE KEY-----",
+    "-----END ENCRYPTED PRIVATE KEY-----",
+)
+
+
+def _reparar_private_key_json_com_quebras_literais(s: str) -> str:
+    """
+    Muitos ambientes colam o JSON com a chave PEM em várias linhas reais dentro da string,
+    o que quebra `json.loads`. Reescape o valor de private_key como uma única string JSON.
+    """
+    k = s.find('"private_key"')
+    if k == -1:
+        k = s.find("'private_key'")
+    if k == -1:
+        return s
+    colon = s.find(":", k)
+    if colon == -1:
+        return s
+    q_open = s.find('"', colon)
+    if q_open == -1:
+        return s
+    val_start = q_open + 1
+    rest = s[val_start:]
+    end_pem = -1
+    for mark in _PEM_END_MARKERS:
+        p = rest.find(mark)
+        if p != -1:
+            end_pem = p + len(mark)
+            break
+    if end_pem == -1:
+        return s
+    pem = rest[:end_pem]
+    after = rest[end_pem:]
+    i = 0
+    while i < len(after) and after[i] in " \t\r\n":
+        i += 1
+    if i >= len(after) or after[i] != '"':
+        return s
+    tail = after[i + 1 :]
+    inner_esc = json.dumps(pem)[1:-1]
+    return s[:val_start] + inner_esc + '"' + tail
+
+
+def _parse_json_conta_servico_google(s: str) -> Optional[Dict[str, Any]]:
+    """Tenta json.loads; se falhar, repara private_key e tenta de novo."""
+    s = s.strip().lstrip("\ufeff")
+    if not s:
+        return None
+    candidates = (s, _reparar_private_key_json_com_quebras_literais(s))
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            parsed = json.loads(cand)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+# ID padrão da planilha informada pelo usuário
+DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
+DEFAULT_WORKSHEET_NAME = "Corretores"
+# Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
+DEFAULT_GERENTES_WORKSHEET = "Gerentes"
+DEFAULT_COL_NOME_CONTA = "Nome da Conta"
+
+
+def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
+    """Lê JSON da conta de serviço a partir de st.secrets['google_sheets']. Nunca propaga exceção."""
+    try:
+        if st_secrets is None:
+            return None
+        gs = (
+            st_secrets.get("google_sheets")
+            if hasattr(st_secrets, "get")
+            else st_secrets["google_sheets"]
+        )
+    except (KeyError, TypeError, AttributeError):
+        return None
+    try:
+        if not gs:
+            return None
+        raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
+        if not raw:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            return _parse_json_conta_servico_google(raw)
+        return None
+    except Exception:
+        return None
+
+
+def _cliente_gspread(creds_dict: Dict[str, Any]):
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def _col_letter(n: int) -> str:
+    """Converte índice de coluna 1-based para letra(s) A, B, ..., Z, AA."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def anexar_linha(
+    linha: List[str],
+    cabecalho: List[str],
+    spreadsheet_id: str,
+    worksheet_name: str,
+    creds_dict: Dict[str, Any],
+) -> int:
+    """
+    Garante que a aba existe, cabeçalho na linha 1 (se vazia) e anexa a linha.
+    """
+    gc = _cliente_gspread(creds_dict)
+    sh = gc.open_by_key(spreadsheet_id)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception:
+        ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=max(len(cabecalho), 30))
+
+    existing = ws.get_all_values()
+    if not existing or not any(cell.strip() for cell in existing[0]):
+        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
+    elif len(existing[0]) < len(cabecalho):
+        # Cabeçalho existente mais curto — preenche células faltantes (linha 1)
+        pad = existing[0] + [""] * (len(cabecalho) - len(existing[0]))
+        for i, h in enumerate(cabecalho):
+            if i >= len(pad) or not (pad[i] or "").strip():
+                pad[i] = h
+        ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
+
+    ws.append_row(linha, value_input_option="USER_ENTERED")
+    return len(ws.get_all_values())
+
+
+def atualizar_status_envio_salesforce(
+    spreadsheet_id: str,
+    worksheet_name: str,
+    creds_dict: Dict[str, Any],
+    row_1based: int,
+    envio: str,
+    log_erro: str,
+    link: str,
+) -> None:
+    """
+    Preenche na linha indicada as colunas **Envio?**, **Log / erro** e **Link do contato**
+    (cabeçalhos definidos em corretor_campos.cabecalho_planilha).
+    """
+    gc = _cliente_gspread(creds_dict)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    headers = ws.row_values(1)
+    mapping = {
+        "Envio?": envio,
+        "Log / erro": (log_erro or "")[:49000],
+        "Link do contato": link or "",
+    }
+    for h, val in mapping.items():
+        if h not in headers:
+            continue
+        col = headers.index(h) + 1
+        cell = f"{_col_letter(col)}{row_1based}"
+        ws.update(cell, [[val]], value_input_option="USER_ENTERED")
+
+
+def listar_nomes_conta_aba_gerentes(
+    spreadsheet_id: str,
+    creds_dict: Dict[str, Any],
+    worksheet_name: str = DEFAULT_GERENTES_WORKSHEET,
+    column_header: str = DEFAULT_COL_NOME_CONTA,
+) -> List[str]:
+    """
+    Lê a planilha indicada, aba `worksheet_name`, e devolve valores únicos e não vazios
+    da coluna cujo cabeçalho (linha 1) coincide com `column_header` (ignora maiúsculas/minúsculas e espaços).
+    """
+    gc = _cliente_gspread(creds_dict)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    rows = ws.get_all_values()
+    if not rows:
+        return []
+    headers = [str(h or "").strip() for h in rows[0]]
+    target = (column_header or "").strip().lower()
+    col_idx = None
+    for i, h in enumerate(headers):
+        if h.strip().lower() == target:
+            col_idx = i
+            break
+    if col_idx is None:
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+    for r in rows[1:]:
+        if col_idx >= len(r):
+            continue
+        v = str(r[col_idx] or "").strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    out.sort(key=lambda s: s.casefold())
+    return out
+
+
+def carimbo_brasilia_iso() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/Sao_Paulo")
+        return datetime.now(tz).isoformat(timespec="seconds")
+    except Exception:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+# =============================================================================
+# INTEGRADO: ficha_seguranca
+# =============================================================================
+_RL_JANELA_S = int(os.environ.get("FICHA_RL_JANELA_S", "600"))  # 10 min
+_RL_MAX_JANELA = int(os.environ.get("FICHA_RL_MAX_JANELA", "4"))
+_RL_MAX_DIA = int(os.environ.get("FICHA_RL_MAX_DIA", "12"))
+# Tempo mínimo (s) entre abrir o formulário e enviar (anti-script imediato)
+_TMIN_ENVIO_S = int(os.environ.get("FICHA_TMIN_ENVIO_S", "12"))
+
+_UA_BLOQUEIO_SUBSTR = (
+    "curl/",
+    "wget/",
+    "python-requests",
+    "scrapy",
+    "aiohttp",
+    "httpx",
+    "go-http-client",
+    "java/",
+    "libwww",
+    "httpclient",
+    "axios/",
+)
+
+
+def _headers() -> dict[str, str]:
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is None:
+            return {}
+        hd = getattr(ctx, "headers", None)
+        if hd is None:
+            return {}
+        if isinstance(hd, dict):
+            return {str(k): str(v) for k, v in hd.items()}
+        return {str(k): str(v) for k, v in dict(hd).items()}
+    except Exception:
+        return {}
+
+
+def user_agent() -> str:
+    h = _headers()
+    return (h.get("User-Agent") or h.get("user-agent") or "").strip()
+
+
+def user_agent_bloqueado() -> bool:
+    if os.environ.get("FICHA_DISABLE_UA_CHECK", "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    ua = user_agent().lower()
+    if not ua:
+        # Sem User-Agent (Streamlit sem context.headers ou proxy) — só bloqueia se forçado
+        return os.environ.get("FICHA_BLOCK_EMPTY_UA", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    return any(s in ua for s in _UA_BLOQUEIO_SUBSTR)
+
+
+def _agora() -> float:
+    return time.time()
+
+
+def iniciar_sessao_formulario() -> None:
+    """Marca o instante em que a sessão passou a usar o fluxo do formulário."""
+    ss = st.session_state
+    if ss.get("ficha_seg_t0") is None:
+        ss["ficha_seg_t0"] = _agora()
+
+
+def tempo_minimo_envio_ok() -> tuple[bool, str]:
+    if os.environ.get("FICHA_DISABLE_TMIN", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True, ""
+    ss = st.session_state
+    t0 = ss.get("ficha_seg_t0")
+    if t0 is None:
+        iniciar_sessao_formulario()
+        t0 = ss.get("ficha_seg_t0")
+    try:
+        t0f = float(t0)
+    except (TypeError, ValueError):
+        t0f = _agora()
+    dt = _agora() - t0f
+    if dt < _TMIN_ENVIO_S:
+        return False, (
+            f"Por segurança, aguarde alguns segundos antes de enviar "
+            f"(mínimo {_TMIN_ENVIO_S}s na página)."
+        )
+    return True, ""
+
+
+def limite_taxa_ok() -> tuple[bool, str]:
+    """Limita tentativas de envio por sessão (mitiga abuso e scripts)."""
+    if os.environ.get("FICHA_DISABLE_RL", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True, ""
+    ss = st.session_state
+    now = _agora()
+    ts: list[float] = ss.get("ficha_rl_envios_ts") or []
+    if not isinstance(ts, list):
+        ts = []
+    ts = [float(t) for t in ts if isinstance(t, (int, float))]
+    ts = [t for t in ts if now - t < 86400]
+    recentes = [t for t in ts if now - t < _RL_JANELA_S]
+    if len(recentes) >= _RL_MAX_JANELA:
+        return False, "Muitas tentativas de envio em pouco tempo. Aguarde e tente novamente."
+    if len(ts) >= _RL_MAX_DIA:
+        return False, "Limite diário de tentativas de envio atingido. Tente novamente mais tarde."
+    return True, ""
+
+
+def registrar_tentativa_envio() -> None:
+    """Chamar ao processar um clique em Enviar (antes da validação de campos)."""
+    ss = st.session_state
+    now = _agora()
+    ts: list[float] = ss.get("ficha_rl_envios_ts") or []
+    if not isinstance(ts, list):
+        ts = []
+    ts = [float(t) for t in ts if isinstance(t, (int, float)) and now - t < 86400]
+    ts.append(now)
+    ss["ficha_rl_envios_ts"] = ts
+
+
+def honeypot_ok() -> bool:
+    """Campo oculto: se preenchido, trata como bot (não revelar ao cliente)."""
+    v = st.session_state.get("ficha_hp_website")
+    if v is None:
+        return True
+    if isinstance(v, str) and v.strip():
+        return False
+    return True
+
+
+def verificar_antes_envio() -> tuple[bool, str]:
+    """
+    Ordem: UA → tempo mínimo → honeypot (se existir campo) → taxa.
+    Ao passar, registra a tentativa na janela de rate limit.
+    """
+    if user_agent_bloqueado():
+        return False, "Acesso não autorizado a partir deste cliente."
+    ok, msg = tempo_minimo_envio_ok()
+    if not ok:
+        return False, msg
+    if not honeypot_ok():
+        return False, "Não foi possível concluir o envio. Atualize a página e tente novamente."
+    ok, msg = limite_taxa_ok()
+    if not ok:
+        return False, msg
+    registrar_tentativa_envio()
+    return True, ""
+
+
+def injetar_cliente_e_meta() -> None:
+    """
+    Injeta no documento pai (uma vez): meta robots, referrer, dissuasão leve a DevTools.
+    Desative com FICHA_DISABLE_CLIENT_HARDENING=1 (útil para debug acessível).
+    """
+    if os.environ.get("FICHA_DISABLE_CLIENT_HARDENING", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        import streamlit.components.v1 as components
+    except ImportError:
+        return
+
+    noindex = os.environ.get("FICHA_NOINDEX", "1").strip().lower() not in ("0", "false", "no", "off")
+
+    meta_robots = (
+        "var m=document.createElement('meta');m.name='robots';m.content='noindex,nofollow';hd.appendChild(m);"
+        if noindex
+        else ""
+    )
+    ref = (
+        "var r=document.createElement('meta');r.name='referrer';r.content='strict-origin-when-cross-origin';hd.appendChild(r);"
+    )
+
+    html = f"""
+<div style="display:none" aria-hidden="true">sec</div>
+<script>
+(function() {{
+  try {{
+    var p = window.parent;
+    if (!p || p.__fichaSegInit) return;
+    p.__fichaSegInit = true;
+    var doc = p.document;
+    var hd = doc.head;
+    if (!hd) return;
+    {meta_robots}
+    {ref}
+    doc.addEventListener('contextmenu', function(e) {{ e.preventDefault(); }}, true);
+    doc.addEventListener('keydown', function(e) {{
+      if (e.key === 'F12') {{ e.preventDefault(); return false; }}
+      if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) {{
+        e.preventDefault(); return false;
+      }}
+      if (e.ctrlKey && (e.key === 'u' || e.key === 'U')) {{ e.preventDefault(); return false; }}
+    }}, true);
+  }} catch (err) {{}}
+}})();
+</script>
+"""
+    components.html(html, height=0, scrolling=False)
+
+
+# =============================================================================
+# App Streamlit — Ficha Vendas RJ
+# =============================================================================
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
 COR_FUNDO = "#04428f"
@@ -1674,7 +3401,7 @@ def _processar_envio_cadastro() -> None:
     """Grava planilha, tenta Salesforce e define tela de sucesso."""
     ss = st.session_state
     ss.pop("ficha_erros_envio", None)
-    ok_sec, msg_sec = ficha_seguranca.verificar_antes_envio()
+    ok_sec, msg_sec = verificar_antes_envio()
     if not ok_sec:
         ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
         return
@@ -1740,11 +3467,11 @@ def _processar_envio_cadastro() -> None:
         st.rerun()
         return
 
-    if conectar_salesforce is None or criar_contato_payload is None:
+    if not _SF_SDK_DISPONIVEL:
         atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "Módulo salesforce_api não encontrado.", ""
+            sid, wname, creds, row_num, "Erro", "simple_salesforce não instalado.", ""
         )
-        ss["sf_erro"] = "Módulo salesforce_api não encontrado."
+        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
         _tentar_enviar_email_boas_vindas(dados, None)
         ss["ficha_sucesso"] = True
         st.rerun()
@@ -1908,7 +3635,7 @@ def main():
     )
     _aplicar_secrets_sf()
     aplicar_estilo()
-    ficha_seguranca.injetar_cliente_e_meta()
+    injetar_cliente_e_meta()
 
     ss = st.session_state
     ss.setdefault("ficha_sucesso", False)
@@ -2016,7 +3743,7 @@ def main():
                 st.rerun()
 
     _init_defaults()
-    ficha_seguranca.iniciar_sessao_formulario()
+    iniciar_sessao_formulario()
     secoes = secoes_com_campos_visiveis()
     _render_secao_formulario(secoes)
 
