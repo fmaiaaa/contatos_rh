@@ -6,7 +6,6 @@ e envio opcional via API (simple_salesforce).
 
 from __future__ import annotations
 
-import io
 import os
 import subprocess
 import sys
@@ -32,7 +31,6 @@ from google_sheets_corretor import (
     DEFAULT_WORKSHEET_NAME,
     _credenciais_de_secrets,
     anexar_linha,
-    carimbo_brasilia_iso,
 )
 
 # Cores Direcional
@@ -56,6 +54,21 @@ def _aplicar_secrets_sf():
                 os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"]).strip()
     except Exception:
         pass
+
+
+def _credenciais_salesforce_ok() -> bool:
+    """True se USER, PASSWORD e TOKEN estão no ambiente (Secrets já aplicados)."""
+    u = (os.environ.get("SALESFORCE_USER") or "").strip()
+    p = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
+    t = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
+    return bool(u and p and t)
+
+
+def _credenciais_login_html_ok() -> bool:
+    """User + senha para script de login (token não exigido)."""
+    u = (os.environ.get("SALESFORCE_USER") or "").strip()
+    p = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
+    return bool(u and p)
 
 
 def aplicar_estilo():
@@ -126,6 +139,10 @@ def _widget_campo(c: dict):
         return st.text_input(label, key=sk, help=help_txt)
     if tipo == "select":
         opts = c.get("opcoes") or [""]
+        cur = st.session_state.get(sk)
+        if cur is not None and cur not in opts:
+            # Texto livre antigo ou valor divergente do org — evita erro do selectbox
+            st.session_state[sk] = opts[0]
         return st.selectbox(label, options=opts, key=sk, help=help_txt)
     if tipo == "multiselect":
         opts = c.get("opcoes") or []
@@ -159,27 +176,26 @@ def main():
         unsafe_allow_html=True,
     )
 
-    with st.expander("Credenciais (Salesforce API + login HTML opcional)", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            login = st.text_input("E-mail Salesforce", key="sf_login", placeholder="email@empresa.com.br")
-        with c2:
-            senha = st.text_input("Senha", type="password", key="sf_senha")
-        with c3:
-            token_api = st.text_input(
-                "Security Token (API)",
-                type="password",
-                key="sf_token",
-                help="Para criar contato via API.",
-            )
-        with c4:
-            totp = st.text_input("Authenticator (6 dígitos)", max_chars=6, key="sf_totp", help="Só para exportar HTML.")
+    st.info(
+        "**Salesforce:** use os Secrets do app (`[salesforce]`: USER, PASSWORD, TOKEN). "
+        "Não é necessário digitar credenciais nesta tela."
+    )
+    st.text_input(
+        "Código do Authenticator (6 dígitos)",
+        max_chars=6,
+        key="sf_totp",
+        placeholder="123456",
+        help="Obrigatório apenas ao usar **Login e salvar HTML** se a conta tiver 2FA. "
+        "Credenciais vêm dos Secrets.",
+    )
 
     st.markdown("---")
 
     with st.form("form_corretor", clear_on_submit=False):
         for sec in secoes_ordenadas():
             st.markdown(f'<div class="section-card"><div class="section-head">{sec}</div>', unsafe_allow_html=True)
+            if sec == "Informações para contato":
+                st.caption("**Tipo de registro do contato:** Corretor (Record Type fixo no envio pela API).")
             cols = campos_por_secao(sec)
             # duas colunas quando muitos campos
             mid = (len(cols) + 1) // 2
@@ -226,8 +242,7 @@ def main():
                             gs = {}
                     sid = gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
                     wname = gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME)
-                    ts = carimbo_brasilia_iso()
-                    row = linha_planilha(dados, ts)
+                    row = linha_planilha(dados)
                     anexar_linha(row, cabecalho_planilha(), str(sid), str(wname), creds)
                     st.success(f"Linha gravada na planilha (aba **{wname}**).")
                 except Exception as e:
@@ -235,18 +250,19 @@ def main():
 
     # --- Salesforce API
     if sub_sf:
+        _aplicar_secrets_sf()
         erros = validar_obrigatorios(dados)
         if erros:
             st.error("Preencha os obrigatórios:\n- " + "\n- ".join(erros))
-        elif not login or not senha or not (token_api and str(token_api).strip()):
-            st.error("Informe **e-mail**, **senha** e **Security Token** para a API.")
+        elif not _credenciais_salesforce_ok():
+            st.error(
+                "Configure **`[salesforce]`** nos Secrets do Streamlit: **USER**, **PASSWORD** e **TOKEN** "
+                "(Security Token)."
+            )
         elif conectar_salesforce is None or criar_contato_payload is None:
             st.error("Módulo **salesforce_api** não encontrado.")
         else:
             payload, avisos = montar_payload_salesforce(dados)
-            os.environ["SALESFORCE_USER"] = login.strip()
-            os.environ["SALESFORCE_PASSWORD"] = senha.strip()
-            os.environ["SALESFORCE_TOKEN"] = (token_api or "").strip()
             with st.spinner("Conectando e criando contato..."):
                 sf = conectar_salesforce()
             if not sf:
@@ -268,8 +284,12 @@ def main():
 
     # --- Login HTML (subprocess)
     if sub_html:
-        if not login or not senha:
-            st.error("Preencha **e-mail** e **senha**.")
+        _aplicar_secrets_sf()
+        totp = (st.session_state.get("sf_totp") or "").strip()
+        if not _credenciais_login_html_ok():
+            st.error(
+                "Configure **USER** e **PASSWORD** em **`[salesforce]`** nos Secrets (e TOTP acima se houver 2FA)."
+            )
         else:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             script_login = os.path.join(script_dir, "salesforce_login_salvar_html.py")
@@ -278,15 +298,13 @@ def main():
                 st.error("Arquivo **salesforce_login_salvar_html.py** não encontrado.")
             else:
                 env = os.environ.copy()
-                env["SALESFORCE_USER"] = login.strip()
-                env["SALESFORCE_PASSWORD"] = senha.strip()
-                if totp and str(totp).strip():
-                    env["SALESFORCE_TOTP"] = str(totp).strip()
+                if totp:
+                    env["SALESFORCE_TOTP"] = totp
                 with st.spinner("Login e gravação do HTML..."):
                     try:
                         cmd = [sys.executable, script_login, "--out", arquivo_html]
-                        if totp and str(totp).strip():
-                            cmd.extend(["--totp", str(totp).strip()])
+                        if totp:
+                            cmd.extend(["--totp", totp])
                         r = subprocess.run(
                             cmd,
                             env=env,

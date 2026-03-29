@@ -22,13 +22,15 @@ from typing import Any
 
 import streamlit as st
 
+import ficha_seguranca
+
 from corretor_campos import (
     CAMPOS,
     cabecalho_planilha,
-    campos_por_secao,
+    campos_por_secao_visiveis,
     linha_planilha,
     montar_payload_salesforce,
-    secoes_ordenadas,
+    secoes_com_campos_visiveis,
     validar_obrigatorios,
     validar_obrigatorios_secao,
 )
@@ -52,6 +54,8 @@ COR_FUNDO = "#04428f"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
 COR_TEXTO_MUTED = "#64748b"
+# Rótulos de campos (texto neutro; vermelho só no * via .ficha-star-req)
+COR_TEXTO_LABEL = "#1e293b"
 # Tom mais escuro do vermelho (gradiente do botão primário)
 COR_VERMELHO_ESCURO = "#9e0828"
 
@@ -168,7 +172,7 @@ def aplicar_estilo():
             0% {{ background-position: 0% 50%; }}
             100% {{ background-position: 200% 50%; }}
         }}
-        html, body {{ font-family: 'Inter', sans-serif; color: {COR_AZUL_ESC}; }}
+        html, body {{ font-family: 'Inter', sans-serif; color: {COR_TEXTO_LABEL}; }}
         [data-testid="stAppViewContainer"] {{
             background:
                 linear-gradient(160deg, rgba({RGB_AZUL_CSS}, 0.88) 0%, rgba({RGB_AZUL_CSS}, 0.72) 45%, rgba({RGB_VERMELHO_CSS}, 0.15) 100%),
@@ -278,11 +282,11 @@ def aplicar_estilo():
             font-weight: 600;
             color: #1e293b;
         }}
-        /* Rótulos de campo com asterisco de obrigatoriedade em vermelho */
+        /* Rótulos de campo: texto neutro; só o * em vermelho (.ficha-star-req) */
         .ficha-input-label {{
             font-size: 0.875rem;
             font-weight: 600;
-            color: {COR_AZUL_ESC};
+            color: {COR_TEXTO_LABEL};
             margin: 0 0 0.35rem 0;
             line-height: 1.45;
         }}
@@ -290,6 +294,29 @@ def aplicar_estilo():
             color: {COR_VERMELHO} !important;
             font-weight: 800;
             margin-left: 0.12em;
+        }}
+        /* Widgets Streamlit: rótulos visíveis não herdam azul da marca */
+        [data-testid="stWidgetLabel"] label,
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stWidgetLabel"] {{
+            color: {COR_TEXTO_LABEL} !important;
+        }}
+        div[data-testid="stTextInput"] label,
+        div[data-testid="stTextArea"] label,
+        div[data-testid="stSelectbox"] label,
+        div[data-testid="stMultiSelect"] label,
+        div[data-testid="stCheckbox"] label {{
+            color: {COR_TEXTO_LABEL} !important;
+        }}
+        /* Honeypot: campo após #ficha-hp-anchor (não preencher) */
+        #ficha-hp-anchor ~ div [data-testid="stTextInput"] {{
+            position: absolute !important;
+            left: -9999px !important;
+            width: 1px !important;
+            height: 1px !important;
+            overflow: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
         }}
         .ficha-hero-bar {{
             height: 4px;
@@ -664,14 +691,30 @@ def _coletar_dados_formulario() -> dict[str, Any]:
     return out
 
 
+def _ficha_defaults_de_secrets() -> dict[str, Any]:
+    """Valores fixos não exibidos no formulário — seção [ficha_defaults] nos Secrets."""
+    try:
+        d = st.secrets.get("ficha_defaults", {})
+        return dict(d) if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
 def _init_defaults():
-    """Sugestões padrão para Vendas RJ (podem ser alteradas)."""
+    """Padrões Vendas RJ; regional/origem/status/ids vêm de [ficha_defaults] nos Secrets."""
+    fd = _ficha_defaults_de_secrets()
     if "fld_regional" not in st.session_state:
-        st.session_state["fld_regional"] = "RJ"
+        st.session_state["fld_regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
     if "fld_status_corretor" not in st.session_state:
-        st.session_state["fld_status_corretor"] = "Pré credenciado"
+        st.session_state["fld_status_corretor"] = (
+            str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
+        )
     if "fld_origem" not in st.session_state:
-        st.session_state["fld_origem"] = "Indicação"
+        st.session_state["fld_origem"] = str(fd.get("origem", "Indicação")).strip() or "Indicação"
+    if "fld_account_id" not in st.session_state:
+        st.session_state["fld_account_id"] = str(fd.get("account_id", "")).strip()
+    if "fld_owner_id" not in st.session_state:
+        st.session_state["fld_owner_id"] = str(fd.get("owner_id", "")).strip()
 
 
 def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> list[str]:
@@ -946,15 +989,27 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
 
 
 def _get_smtp_from_secrets():
+    """
+    Lê [ficha_email] nos Secrets. Chaves esperadas:
+      smtp_server, smtp_port (padrão 587), sender_email, sender_password
+    Compatibilidade: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, TO_EMAIL, FROM_EMAIL.
+    Destinatário fixo opcional: to_email ou TO_EMAIL (senão use o campo na tela).
+    """
     try:
         s = st.secrets.get("ficha_email", {})
+        host = (s.get("smtp_server") or s.get("SMTP_HOST") or "").strip()
+        port_raw = s.get("smtp_port", s.get("SMTP_PORT", 587))
+        port = int(port_raw) if port_raw not in (None, "") else 587
+        user = (s.get("sender_email") or s.get("SMTP_USER") or "").strip()
+        password = (s.get("sender_password") or s.get("SMTP_PASSWORD") or "").strip()
+        to_fixed = (s.get("to_email") or s.get("TO_EMAIL") or "").strip()
         return {
-            "host": s.get("SMTP_HOST", "").strip(),
-            "port": int(s.get("SMTP_PORT", 587)),
-            "user": s.get("SMTP_USER", "").strip(),
-            "password": s.get("SMTP_PASSWORD", "").strip(),
-            "to": s.get("TO_EMAIL", "").strip(),
-            "from_addr": s.get("FROM_EMAIL", "").strip() or s.get("SMTP_USER", "").strip(),
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "to": to_fixed,
+            "from_addr": user or (s.get("FROM_EMAIL") or "").strip(),
         }
     except Exception:
         return None
@@ -963,13 +1018,15 @@ def _get_smtp_from_secrets():
 def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra: str | None) -> tuple[bool, str]:
     cfg = _get_smtp_from_secrets()
     if not cfg or not cfg["host"] or not cfg["user"]:
-        return False, "E-mail não configurado (adicione [ficha_email] nos Secrets do Streamlit)."
+        return False, (
+            "E-mail não configurado (adicione [ficha_email] com smtp_server e sender_email nos Secrets)."
+        )
 
     to_list = [cfg["to"]] if cfg["to"] else []
     if destinatario_extra and destinatario_extra.strip():
         to_list.append(destinatario_extra.strip())
     if not to_list:
-        return False, "Defina TO_EMAIL em [ficha_email] ou informe um e-mail abaixo."
+        return False, "Informe um e-mail de destino no campo abaixo (ou to_email em [ficha_email], opcional)."
 
     nome = _nome_candidato_ficha(dados)
     msg = MIMEMultipart()
@@ -1046,12 +1103,7 @@ def _render_secao_formulario(secoes: list[str]) -> None:
             f'<p class="section-head">{sec}</p>',
             unsafe_allow_html=True,
         )
-        if ss.get("ficha_erros_secao_idx") == idx and ss.get("ficha_erros_secao"):
-            lista = "<br>".join(f"• {html.escape(e)}" for e in ss["ficha_erros_secao"])
-            _alert_vermelho_html(
-                f"<strong>Preencha os campos obrigatórios desta etapa:</strong><br>{lista}"
-            )
-        cols = campos_por_secao(sec)
+        cols = campos_por_secao_visiveis(sec)
         mid = (len(cols) + 1) // 2
         if len(cols) <= 3:
             for c in cols:
@@ -1090,6 +1142,12 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                     ss["ficha_secao_idx"] = idx + 1
                     st.rerun()
 
+        if ss.get("ficha_erros_secao_idx") == idx and ss.get("ficha_erros_secao"):
+            lista = "<br>".join(f"• {html.escape(e)}" for e in ss["ficha_erros_secao"])
+            _alert_vermelho_html(
+                f"<strong>Preencha os campos obrigatórios desta etapa:</strong><br>{lista}"
+            )
+
 
 def _limpar_session_formulario():
     for c in CAMPOS:
@@ -1104,6 +1162,10 @@ def _limpar_session_formulario():
         "ficha_secao_idx",
         "ficha_erros_secao",
         "ficha_erros_secao_idx",
+        "ficha_erros_envio",
+        "ficha_seg_t0",
+        "ficha_rl_envios_ts",
+        "ficha_hp_website",
         "ficha_popup_recursos_ok",
         "ficha_modo_teste_design",
     ):
@@ -1179,25 +1241,30 @@ def _ativar_cenario_teste_design() -> None:
 def _processar_envio_cadastro() -> None:
     """Grava planilha, tenta Salesforce e define tela de sucesso."""
     ss = st.session_state
+    ss.pop("ficha_erros_envio", None)
+    ok_sec, msg_sec = ficha_seguranca.verificar_antes_envio()
+    if not ok_sec:
+        ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
+        return
     dados = _coletar_dados_formulario()
     erros = validar_obrigatorios(dados)
     if not ss.get("fld_lgpd_ficha"):
         erros.append("Concordância LGPD *")
     if erros:
-        linhas = "<br>".join(f"• {html.escape(e)}" for e in erros)
-        _alert_vermelho_html(
-            f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
-        )
+        ss["ficha_erros_envio"] = {"kind": "validation", "items": erros}
         return
 
     ss.pop("ficha_modo_teste_design", None)
 
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
-        _alert_vermelho(
-            "Configure **`[google_sheets]`** nos Secrets com `SERVICE_ACCOUNT_JSON` "
-            "(JSON da conta de serviço com acesso à planilha)."
-        )
+        ss["ficha_erros_envio"] = {
+            "kind": "text",
+            "text": (
+                "Configure **[google_sheets]** nos Secrets com `SERVICE_ACCOUNT_JSON` "
+                "(JSON da conta de serviço com acesso à planilha)."
+            ),
+        }
         return
 
     gs = {}
@@ -1215,9 +1282,10 @@ def _processar_envio_cadastro() -> None:
     try:
         row_num = anexar_linha(linha, cab, sid, wname, creds)
     except Exception as e:
-        _alert_vermelho_html(
-            f"<strong>Erro ao gravar na planilha:</strong> {html.escape(str(e))}"
-        )
+        ss["ficha_erros_envio"] = {
+            "kind": "html",
+            "html": f"<strong>Erro ao gravar na planilha:</strong> {html.escape(str(e))}",
+        }
         return
 
     ss["ficha_dados_enviados"] = dados
@@ -1397,6 +1465,7 @@ def main():
     )
     _aplicar_secrets_sf()
     aplicar_estilo()
+    ficha_seguranca.injetar_cliente_e_meta()
 
     ss = st.session_state
     ss.setdefault("ficha_sucesso", False)
@@ -1488,12 +1557,23 @@ def main():
                 st.rerun()
 
     _init_defaults()
-    secoes = secoes_ordenadas()
+    ficha_seguranca.iniciar_sessao_formulario()
+    secoes = secoes_com_campos_visiveis()
     _render_secao_formulario(secoes)
 
     ultima = len(secoes) > 0 and int(st.session_state.get("ficha_secao_idx", 0)) == len(secoes) - 1
     if ultima:
         st.markdown("---")
+        st.markdown(
+            '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
+            unsafe_allow_html=True,
+        )
+        st.text_input(
+            "Company website",
+            key="ficha_hp_website",
+            label_visibility="collapsed",
+            max_chars=96,
+        )
         st.markdown(
             '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
             "credenciamento na Direcional, conforme a LGPD. "
@@ -1514,8 +1594,22 @@ def main():
             key="ficha_voltar_ultima",
             disabled=(len(secoes) <= 1),
         ):
+            ss.pop("ficha_erros_envio", None)
             ss["ficha_secao_idx"] = max(0, len(secoes) - 2)
             st.rerun()
+
+        fe = ss.get("ficha_erros_envio")
+        if fe:
+            kind = fe.get("kind")
+            if kind == "validation":
+                linhas = "<br>".join(f"• {html.escape(e)}" for e in fe.get("items") or [])
+                _alert_vermelho_html(
+                    f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
+                )
+            elif kind == "html":
+                _alert_vermelho_html(fe.get("html") or "")
+            elif kind == "text":
+                _alert_vermelho(fe.get("text") or "")
 
 
 if __name__ == "__main__":

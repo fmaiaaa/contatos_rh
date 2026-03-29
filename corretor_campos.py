@@ -1023,6 +1023,36 @@ def _campos_def() -> List[Campo]:
 
 CAMPOS: List[Campo] = _campos_def()
 
+# Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
+# valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
+CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
+    {
+        "codigo_pessoa_uau",
+        "erro_integracao_uau",
+        "retorno_integracao_pessoa",
+        "retorno_integracao_bancaria",
+        "blacklist_flag",
+        "falso_blacklist",
+        "status_corretor",
+        "regional",
+        "origem",
+        "account_id",
+        "owner_id",
+    }
+)
+
+
+def campos_por_secao_visiveis(sec: str) -> List[Campo]:
+    return [c for c in CAMPOS if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO]
+
+
+def secoes_com_campos_visiveis() -> List[str]:
+    presentes = {
+        c["sec"] for c in CAMPOS if c["key"] not in CAMPOS_OCULTOS_FORMULARIO
+    }
+    return [s for s in SEC_ORDER if s in presentes]
+
+
 _ID_RE = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
 
 
@@ -1069,6 +1099,8 @@ def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
 def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     erros: List[str] = []
     for c in CAMPOS:
+        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            continue
         if not c.get("req"):
             continue
         k = c["key"]
@@ -1106,6 +1138,8 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     """
     erros: List[str] = []
     for c in CAMPOS:
+        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            continue
         if c["sec"] != sec or not c.get("req"):
             continue
         k = c["key"]
