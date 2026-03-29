@@ -77,6 +77,14 @@ RECORD_TYPE_CORRETOR = ""
 
 _SF_ID_15_18 = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
 
+
+def _id_e_record_type_plausivel(rid: str) -> bool:
+    """Record Type Id no Salesforce usa prefixo de chave 012 (005 = usuário, não serve em RecordTypeId)."""
+    if not rid or len(rid) < 3 or not _SF_ID_15_18.match(rid):
+        return False
+    return rid[:3] == "012"
+
+
 _EMAIL_CONTATO_RE = re.compile(
     r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
 )
@@ -90,18 +98,34 @@ def email_contato_formato_valido(val: Any) -> bool:
     return bool(_EMAIL_CONTATO_RE.match(s))
 
 
-def record_type_id_contato_payload() -> str:
+def record_type_id_contato_payload_e_aviso() -> Tuple[str, str]:
     """
-    Id do tipo de registro Contact (ex.: Corretor), só se configurado e com formato Id SF.
-    Sem valor válido, retorna vazio e o payload omite RecordTypeId (usa padrão do usuário da API).
+    Record Type Id de Contact começa com **012**. **005…** é Id de **usuário** → INVALID_CROSS_REFERENCE_KEY.
+    Retorna (id_ou_vazio, aviso_se_config_incorreta).
     """
     for candidate in (
         (os.environ.get("SF_RECORD_TYPE_ID") or "").strip(),
         (RECORD_TYPE_CORRETOR or "").strip(),
     ):
-        if candidate and _SF_ID_15_18.match(candidate):
-            return candidate
-    return ""
+        if not candidate:
+            continue
+        if not _SF_ID_15_18.match(candidate):
+            continue
+        if _id_e_record_type_plausivel(candidate):
+            return candidate, ""
+        return (
+            "",
+            "Secrets **[salesforce] RECORD_TYPE_ID** está incorreto: o valor não é um **Record Type Id** de Contact "
+            "(no Salesforce ele começa com **012**). **005…** é Id de **usuário**, não de tipo de registro. "
+            "Ajuste em **Setup → Object Manager → Contact → Record Types** (abra o tipo, ex.: Corretor, e copie o Id da URL) "
+            "ou remova a chave nos Secrets para usar o tipo padrão da integração.",
+        )
+    return "", ""
+
+
+def record_type_id_contato_payload() -> str:
+    rid, _ = record_type_id_contato_payload_e_aviso()
+    return rid
 
 # Ordem das seções no Salesforce (não alterar sem checar o layout no org)
 SEC_ORDER: Tuple[str, ...] = (
@@ -498,7 +522,8 @@ def _campos_def() -> List[Campo]:
             tipo="id",
             sf="Indicado_por__c",
             req=False,
-            help="Pesquisar Pessoas — Id User (18 caracteres).",
+            help="Opcional: Id do **usuário** Salesforce que indicou (15 ou 18 caracteres; costuma começar com **005**). "
+            "Não confunda com Record Type (**012**). Se não tiver o Id exato, deixe em branco.",
         ),
         _z(
             key="camiseta",
@@ -981,6 +1006,20 @@ def parse_data_br(val: Any) -> Optional[str]:
     return None
 
 
+def _erros_preenchimento_creci_se_sim(dados: Dict[str, Any]) -> List[str]:
+    """Se «Possui CRECI?» = Sim, exige status, número e validade."""
+    if (str(dados.get("possui_creci") or "").strip()) != "Sim":
+        return []
+    er: List[str] = []
+    if not _norm_picklist(dados.get("status_creci")):
+        er.append("Status CRECI *")
+    if not (str(dados.get("creci") or "").strip()):
+        er.append("CRECI *")
+    if not (str(dados.get("validade_creci") or "").strip()):
+        er.append("Validade CRECI *")
+    return er
+
+
 def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
     if val is None:
         return None
@@ -1031,6 +1070,7 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     em = (dados.get("email") or "").strip()
     if em and not email_contato_formato_valido(em):
         erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+    erros.extend(_erros_preenchimento_creci_se_sim(dados))
     return list(dict.fromkeys(erros))
 
 
@@ -1080,6 +1120,8 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         em = (dados.get("email") or "").strip()
         if em and not email_contato_formato_valido(em):
             erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+    if sec == "CRECI/TTI":
+        erros.extend(_erros_preenchimento_creci_se_sim(dados))
     return list(dict.fromkeys(erros))
 
 
@@ -1095,10 +1137,12 @@ def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> No
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     payload: Dict[str, Any] = {}
-    rt = record_type_id_contato_payload()
+    rt, rt_aviso = record_type_id_contato_payload_e_aviso()
     if rt:
         payload["RecordTypeId"] = rt
     avisos: List[str] = []
+    if rt_aviso:
+        avisos.append(rt_aviso)
     extras_obs: List[str] = []
 
     for c in CAMPOS:
@@ -3199,7 +3243,32 @@ def _render_secao_formulario(secoes: list[str]) -> None:
             f'<p class="section-head">{sec}</p>',
             unsafe_allow_html=True,
         )
-        cols = campos_por_secao_visiveis(sec, _coletar_dados_formulario_completo())
+        # Campos que controlam visibilidade de outros devem ficar FORA do st.form: dentro do form
+        # o Streamlit só sincroniza o state no envio, então «Sim» em CRECI não mostraria os demais campos.
+        dados_sec = _coletar_dados_formulario_completo()
+        if sec == "CRECI/TTI":
+            c_pc = next((c for c in CAMPOS if c["key"] == "possui_creci"), None)
+            if c_pc:
+                _widget_campo(c_pc)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] != "possui_creci"
+            ]
+        elif sec == "Informações para contato":
+            c_un = next((c for c in CAMPOS if c["key"] == "unidade_negocio"), None)
+            if c_un:
+                _widget_campo(c_un)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] != "unidade_negocio"
+            ]
+        else:
+            cols = campos_por_secao_visiveis(sec, dados_sec)
+
         mid = (len(cols) + 1) // 2
         # st.form: ao usar «Avançar» / «Enviar», todos os valores da etapa são gravados de uma vez
         # (evita depender de Enter ou blur em text_input/select).
