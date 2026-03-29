@@ -18,15 +18,21 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-# Módulos locais (corretor_campos, google_sheets_corretor, …): no Cloud o .py pode estar
-# na raiz do repo e corretor_campos.py em subpasta salesforce/ (ou o inverso).
+# Módulos locais: no Cloud os .py podem estar só na raiz, só em salesforce/ ou mistos
+# (ex.: corretor_campos na raiz e google_sheets_corretor só em salesforce/).
 _DIR_APP = Path(__file__).resolve().parent
 for _p in (_DIR_APP, _DIR_APP / "salesforce", _DIR_APP.parent / "salesforce"):
-    if (_p / "corretor_campos.py").is_file():
-        _sp = str(_p.resolve())
-        if _sp not in sys.path:
-            sys.path.insert(0, _sp)
-        break
+    if not _p.is_dir():
+        continue
+    if not (
+        (_p / "corretor_campos.py").is_file()
+        or (_p / "google_sheets_corretor.py").is_file()
+        or (_p / "ficha_seguranca.py").is_file()
+    ):
+        continue
+    _sp = str(_p.resolve())
+    if _sp not in sys.path:
+        sys.path.insert(0, _sp)
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
