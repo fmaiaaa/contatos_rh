@@ -59,6 +59,20 @@ URL_LOGO_DIRECIONAL_EMAIL = (
 
 _DIR_APP = Path(__file__).resolve().parent
 
+# Logos na raiz (mesma pasta deste .py ou raiz do repositório) — upload manual
+LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
+FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
+
+
+def _resolver_png_raiz(nome: str) -> Path | None:
+    """Procura o PNG na pasta do app e na pasta pai (raiz do repo no Streamlit Cloud)."""
+    for base in (_DIR_APP, _DIR_APP.parent):
+        p = base / nome
+        if p.is_file():
+            return p
+    return None
+
+
 BASE_URL_CONTACT_VIEW = "https://direcional.lightning.force.com/lightning/r/Contact"
 
 # Recursos exibidos no popup pós-cadastro (corretor)
@@ -477,6 +491,9 @@ def _alert_vermelho_html(inner_html: str) -> None:
 
 
 def _logo_arquivo_local() -> str | None:
+    p_topo = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
+    if p_topo:
+        return str(p_topo)
     for name in ("logo_direcional.png", "logo_direcional.jpg", "logo_direcional.jpeg", "logo.png"):
         p = _DIR_APP / "assets" / name
         if p.is_file():
@@ -1315,9 +1332,10 @@ depois sua **cópia em PDF** e o **envio por e-mail**.
 
 
 def main():
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
     st.set_page_config(
         page_title="Credenciamento | Direcional Vendas RJ",
-        page_icon=None,
+        page_icon=str(fav) if fav else None,
         layout="centered",
         initial_sidebar_state="collapsed",
     )
