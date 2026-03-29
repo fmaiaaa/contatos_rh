@@ -46,13 +46,22 @@ def _cliente_gspread(creds_dict: Dict[str, Any]):
     return gspread.authorize(creds)
 
 
+def _col_letter(n: int) -> str:
+    """Converte índice de coluna 1-based para letra(s) A, B, ..., Z, AA."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
 def anexar_linha(
     linha: List[str],
     cabecalho: List[str],
     spreadsheet_id: str,
     worksheet_name: str,
     creds_dict: Dict[str, Any],
-) -> None:
+) -> int:
     """
     Garante que a aba existe, cabeçalho na linha 1 (se vazia) e anexa a linha.
     """
@@ -75,6 +84,37 @@ def anexar_linha(
         ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
 
     ws.append_row(linha, value_input_option="USER_ENTERED")
+    return len(ws.get_all_values())
+
+
+def atualizar_status_envio_salesforce(
+    spreadsheet_id: str,
+    worksheet_name: str,
+    creds_dict: Dict[str, Any],
+    row_1based: int,
+    envio: str,
+    log_erro: str,
+    link: str,
+) -> None:
+    """
+    Preenche na linha indicada as colunas **Envio?**, **Log / erro** e **Link do contato**
+    (cabeçalhos definidos em corretor_campos.cabecalho_planilha).
+    """
+    gc = _cliente_gspread(creds_dict)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    headers = ws.row_values(1)
+    mapping = {
+        "Envio?": envio,
+        "Log / erro": (log_erro or "")[:49000],
+        "Link do contato": link or "",
+    }
+    for h, val in mapping.items():
+        if h not in headers:
+            continue
+        col = headers.index(h) + 1
+        cell = f"{_col_letter(col)}{row_1based}"
+        ws.update(cell, [[val]], value_input_option="USER_ENTERED")
 
 
 def carimbo_brasilia_iso() -> str:

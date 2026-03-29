@@ -1,19 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Definição dos campos do layout "Novo Contato: Corretor" (Salesforce Contact)
-+ mapeamento para API (nomes reais do org Direcional) e ordem das colunas na planilha Google.
+Layout "Novo Contato: Corretor" — mesma ordem de seções e campos do Salesforce (Lightning).
+Mapeamento para API + planilha Google.
 """
 
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-# Record Type Corretor (ajuste se mudar no org)
 RECORD_TYPE_CORRETOR = "012f1000000n6nN"
 
-# Campos de fórmula / somente leitura / não createable — não enviar no INSERT
+# Ordem das seções no Salesforce (não alterar sem checar o layout no org)
+SEC_ORDER: Tuple[str, ...] = (
+    "Informações para contato",
+    "Dados Pessoais",
+    "Dados de Usuário",
+    "Dados para Contato",
+    "Dados Familiares",
+    "Dados Bancários Pessoa Física",
+    "CRECI/TTI",
+    "Contrato e dados PJ",
+    "Histórico Equipe",
+    "Datas",
+    "Dados Integração",
+    "Anexos",
+    "Preferred Contact Method",
+)
+
 SF_OMIT_INSERT = frozenset(
     {
         "Blacklist__c",
@@ -29,6 +44,7 @@ SF_OMIT_INSERT = frozenset(
 )
 
 REGIONAIS = [
+    "--Nenhum--",
     "AC",
     "AL",
     "AM",
@@ -58,6 +74,7 @@ REGIONAIS = [
 ]
 
 ORIGENS = [
+    "--Nenhum--",
     "RH",
     "Indicação",
     "Gerente",
@@ -70,32 +87,20 @@ ORIGENS = [
     "Parceria Estácio",
 ]
 
-STATUS_CORRETOR = ["Ativo", "Inativo", "Pré credenciado", "Reativado"]
+STATUS_CORRETOR = ["--Nenhum--", "Ativo", "Inativo", "Pré credenciado", "Reativado"]
 
-SALUTATIONS = ["", "Sr.", "Sra.", "Dr.", "Dra."]
+SALUTATIONS = ["--Nenhum--", "Sr.", "Sra.", "Dr.", "Dra."]
 
-SEXOS = ["", "Masculino", "Feminino"]
+SEXOS = ["--Nenhum--", "Masculino", "Feminino"]
 
-CAMISETAS = ["", "PP", "P", "M", "G", "GG", "XGG"]
+CAMISETAS = ["--Nenhum--", "PP", "P", "M", "G", "GG", "XGG"]
 
-UNIDADES_NEGOCIO = [
-    "",
-    "Direcional",
-    "Parceiros (Externo)",
-    # completar conforme org
-]
+UNIDADES_NEGOCIO = ["--Nenhum--", "Direcional", "Parceiros (Externo)"]
 
-TIPO_PIX = [
-    "",
-    "CPF",
-    "CNPJ",
-    "E-mail",
-    "Telefone",
-    "Chave aleatória",
-]
+TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Telefone", "Chave aleatória"]
 
 ESTADOS_UF = [
-    "",
+    "--Nenhum--",
     "AC",
     "AL",
     "AM",
@@ -124,9 +129,152 @@ ESTADOS_UF = [
     "TO",
 ]
 
-POSSUI_FILHOS = ["", "Sim", "Não"]
+POSSUI_FILHOS = ["--Nenhum--", "Sim", "Não"]
 
-TIPO_CONTA_BANCARIA = ["", "Corrente", "Poupança"]
+TIPO_CONTA_BANCARIA = ["--Nenhum--", "Corrente", "Poupança"]
+
+# Picklists Contact (fonte: salesforce_objetos_describe.json — alinhar ao org ao atualizar o describe)
+_ESTADO_CIVIL = ["Solteiro", "Casado", "Divorciado", "Viúvo"]
+_ESCOLARIDADE = [
+    "Ensino Fundamental",
+    "Ensino Médio",
+    "Superior em Andamento",
+    "Superior Completo",
+    "Mestrado em Andamento",
+    "Mestrado Concluído",
+    "Doutorado em Andamento",
+    "Doutorado Concluído",
+]
+_NACIONALIDADE = ["Brasileiro", "Estrangeira", "Espanhola"]
+_ATIVIDADE = [
+    "Captador",
+    "Estagiário",
+    "Corretor",
+    "Coordenador",
+    "Gerente de Vendas",
+    "Gerente Regional",
+    "Diretor",
+    "Gerente",
+    "Captador Recruta+",
+    "Gerente Recruta+",
+    "Corretor N1",
+    "Gerente de Vendas N1",
+    "Diretor de Vendas",
+    "Analista",
+    "Assistente",
+    "Cliente",
+    "Coordenador de Produto",
+    "Coordenador de Vendas",
+    "Diretor de Incorporação",
+    "Gerente Comercial",
+    "Gerente de Parcerias",
+    "Imobiliária Parceira",
+    "Pasteiro (a)",
+    "Superintendente",
+    "Supervisor",
+    "Autônomo Parceiro",
+    "Corretor Parceiro",
+    "Recepção",
+    "Coordenador de Parcerias",
+]
+_TIPO_CORRETOR = [
+    "Direcional Vendas – GRI (CLT)",
+    "Direcional Vendas – Autônomos",
+    "Parceiros (Externo)",
+]
+_STATUS_CRECI = [
+    "Concluído Provas",
+    "Definitivo",
+    "Estágio",
+    "Matriculado",
+    "Pendente",
+    "Protocolo Definitivo",
+    "Protocolo Estágio",
+    "Pendente Prova",
+]
+_MOTIVO_INATIVIDADE = [
+    "Solicitação do Corretor",
+    "Solicitação do Gerente de Vendas",
+    "Solicitação do Gerente Regional",
+    "Solicitação do Diretor",
+]
+_MOTIVO_DESCREDENCIAMENTO = [
+    "Falta de recurso financeiro",
+    "Oportunidade CLT",
+    "Distância",
+    "Relacionamento com o Gestor",
+    "Baixa performance",
+    "Abandono",
+    "Desistente da Incubadora",
+    "Mudança de Cidade / Estado",
+    "Problemas de Saúde",
+    "Concorrência",
+    "Comportamento Inadequado",
+    "Promoção Interna",
+    "Corretor Parceiro",
+]
+_TIPO_DESLIGAMENTO = ["Ativo", "Passivo"]
+_FORNECEDOR_UAU = ["Não", "Sim"]
+_BANCO = [
+    "001 – Banco do Brasil S.A.",
+    "004 - BANCO DO NORDESTE DO BRASIL S.A.",
+    "033 – Banco Santander (Brasil) S.A.",
+    "070 - BCO BRB SA - BRASILIA",
+    "104 – Caixa Econômica Federal",
+    "121 - Banco Agiplan",
+    "197 – Stone Pagamentos S.A.",
+    "208 – Banco BTG Pactual",
+    "212 - Banco Original S.A.",
+    "218 – Banco Bonsucesso SA",
+    "237 – Banco Bradesco S.A.",
+    "246 - Banco ABC Brasil S.A.",
+    "260 – Banco Nubank",
+    "290 – PagSeguro Internt SA",
+    "318 - BCO BMG COMERCIAL S.A",
+    "323 – Mercado Pago",
+    "336 - BANCO C6 S.A.",
+    "340 – Super digital",
+    "341 – Banco Itaú S.A.",
+    "356 – Banco Real S.A. (antigo)",
+    "364 - Gerencianet",
+    "380 – PicPay",
+    "389 – Banco Mercantil do Brasil S.A.",
+    "399 – HSBC Bank Brasil S.A. – Banco Múltiplo",
+    "403 – CORA SOCIEDADE DE CR",
+    "413 – BV",
+    "422 – Banco Safra S.A.",
+    "453 – Banco Rural S.A.",
+    "473 - Banco Caixa Geral - Brasil S.A.",
+    "623 – Banco Panamericano S.A",
+    "633 – Banco Rendimento S.A.",
+    "637 - Bco Sofisa SA.",
+    "652 – Itaú Unibanco Holding S.A.",
+    "655 – Banco Votorantim S.A.",
+    "735 - BANCO POTTENCIAL S.A.",
+    "745 – Banco Citibank S.A.",
+    "746 - BCO MODAL SA.",
+    "748 – BCO COOP. SICREDI SA",
+    "756 – Banco SICCOB S.A",
+    "77 - BCO INTERMEDIUM SA",
+    "79 - Banco Original Agro",
+    "92 - BANCO BRK",
+    "348 - BANCO XP S.A",
+    "679 - CloudWalk Instituição de Pagamento",
+    "536 – NEON PAGAMENTOS",
+    "335 -  Banco Digio S.A.",
+]
+
+ESTADO_CIVIL_OPTS = ["--Nenhum--"] + _ESTADO_CIVIL
+ESCOLARIDADE_OPTS = ["--Nenhum--"] + _ESCOLARIDADE
+NACIONALIDADE_OPTS = ["--Nenhum--"] + _NACIONALIDADE
+ATIVIDADE_OPTS = ["--Nenhum--"] + _ATIVIDADE
+TIPO_CORRETOR_OPTS = ["--Nenhum--"] + _TIPO_CORRETOR
+STATUS_CRECI_OPTS = ["--Nenhum--"] + _STATUS_CRECI
+MOTIVO_INATIVIDADE_OPTS = ["--Nenhum--"] + _MOTIVO_INATIVIDADE
+MOTIVO_DESCREDENCIAMENTO_OPTS = ["--Nenhum--"] + _MOTIVO_DESCREDENCIAMENTO
+TIPO_DESLIGAMENTO_OPTS = ["--Nenhum--"] + _TIPO_DESLIGAMENTO
+FORNECEDOR_UAU_OPTS = ["--Nenhum--"] + _FORNECEDOR_UAU
+BANCO_OPTS = ["--Nenhum--"] + _BANCO
 
 PREFERRED_METHOD_OPTS = [
     "Work phone",
@@ -144,45 +292,57 @@ PREFERRED_METHOD_OPTS = [
     "Sem preferência",
 ]
 
-# Cada entrada: chave interna, rótulo na planilha/UI, seção, tipo (text|date|number|textarea|id|multiselect),
-# nome API Salesforce (None = só planilha / vai para Observacoes), obrigatório, opções (lista ou None)
 Campo = Dict[str, Any]
 
 
+def _z(**kw) -> Campo:
+    return kw
+
+
 def _campos_def() -> List[Campo]:
-    """Lista ordenada de campos (espelha o formulário Salesforce)."""
-    z = lambda **kw: kw  # noqa
+    """
+    Ordem idêntica ao formulário Salesforce (Novo Contato: Corretor).
+    * = obrigatório no layout (req=True), salvo quando combinado com outro campo.
+    """
     return [
-        # Informações para contato
-        z(
-            key="account_id",
-            label="Nome da conta (Id Salesforce 18 caracteres)",
-            sec="Informações para contato",
-            tipo="id",
-            sf="AccountId",
-            req=False,
-            help="Cole o Id da Conta (Account). Obrigatório enviar Id **ou** nome abaixo.",
-        ),
-        z(
+        # ——— Informações para contato ———
+        _z(
             key="account_name",
-            label="Nome da conta (texto livre) *",
+            label="Nome da conta *",
             sec="Informações para contato",
             tipo="text",
             sf=None,
             req=False,
-            help="Obrigatório se não informar o Id da conta acima.",
+            help="Pesquisar Contas — nome exibido na planilha; use Id abaixo para vincular na API.",
         ),
-        z(
+        _z(
+            key="account_id",
+            label="Nome da conta — Id (Account)",
+            sec="Informações para contato",
+            tipo="id",
+            sf="AccountId",
+            req=False,
+            help="Id Salesforce da conta (18 caracteres).",
+        ),
+        _z(
             key="owner_id",
-            label="Proprietário do contato (Id User)",
+            label="Proprietário do contato",
             sec="Informações para contato",
             tipo="id",
             sf="OwnerId",
             req=False,
+            help="Id do usuário proprietário (opcional).",
         ),
-        z(key="first_name", label="Primeiro Nome", sec="Informações para contato", tipo="text", sf="FirstName", req=False),
-        z(key="last_name", label="Sobrenome *", sec="Informações para contato", tipo="text", sf="LastName", req=True),
-        z(
+        _z(
+            key="nome_completo",
+            label="Nome completo *",
+            sec="Informações para contato",
+            tipo="text",
+            sf=None,
+            req=False,
+            help="Se preencher, pode substituir Primeiro nome + Sobrenome (primeira palavra = nome).",
+        ),
+        _z(
             key="salutation",
             label="Tratamento",
             sec="Informações para contato",
@@ -191,8 +351,31 @@ def _campos_def() -> List[Campo]:
             opcoes=SALUTATIONS,
             req=False,
         ),
-        z(key="apelido", label="Apelido *", sec="Informações para contato", tipo="text", sf="Apelido__c", req=True),
-        z(
+        _z(
+            key="first_name",
+            label="Primeiro Nome",
+            sec="Informações para contato",
+            tipo="text",
+            sf="FirstName",
+            req=False,
+        ),
+        _z(
+            key="last_name",
+            label="Sobrenome *",
+            sec="Informações para contato",
+            tipo="text",
+            sf="LastName",
+            req=False,
+        ),
+        _z(
+            key="apelido",
+            label="Apelido *",
+            sec="Informações para contato",
+            tipo="text",
+            sf="Apelido__c",
+            req=True,
+        ),
+        _z(
             key="status_corretor",
             label="Status Corretor *",
             sec="Informações para contato",
@@ -201,25 +384,25 @@ def _campos_def() -> List[Campo]:
             opcoes=STATUS_CORRETOR,
             req=True,
         ),
-        z(
+        _z(
             key="regional",
             label="Regional *",
             sec="Informações para contato",
             tipo="select",
             sf="Regional__c",
-            opcoes=[""] + REGIONAIS,
+            opcoes=REGIONAIS,
             req=True,
         ),
-        z(
+        _z(
             key="origem",
             label="Origem *",
             sec="Informações para contato",
             tipo="select",
             sf="Origem__c",
-            opcoes=[""] + ORIGENS,
+            opcoes=ORIGENS,
             req=True,
         ),
-        z(
+        _z(
             key="sexo",
             label="Sexo *",
             sec="Informações para contato",
@@ -228,15 +411,16 @@ def _campos_def() -> List[Campo]:
             opcoes=SEXOS,
             req=True,
         ),
-        z(
+        _z(
             key="indicado_por_id",
-            label="Indicado por (Id User — Pesquisar Pessoas)",
+            label="Indicado por",
             sec="Informações para contato",
             tipo="id",
             sf="Indicado_por__c",
             req=False,
+            help="Pesquisar Pessoas — Id User (18 caracteres).",
         ),
-        z(
+        _z(
             key="camiseta",
             label="Camiseta *",
             sec="Informações para contato",
@@ -245,32 +429,34 @@ def _campos_def() -> List[Campo]:
             opcoes=CAMISETAS,
             req=True,
         ),
-        z(
+        _z(
             key="atividade",
             label="Atividade *",
             sec="Informações para contato",
-            tipo="text",
+            tipo="select",
             sf="Atividade__c",
+            opcoes=ATIVIDADE_OPTS,
             req=True,
-            help="Ex.: Corretor N1 (valores conforme lista de atividades no Salesforce).",
         ),
-        z(
+        _z(
             key="escolaridade",
             label="Escolaridade",
             sec="Informações para contato",
-            tipo="text",
+            tipo="select",
             sf="Escolaridade__c",
+            opcoes=ESCOLARIDADE_OPTS,
             req=False,
         ),
-        z(
+        _z(
             key="data_entrevista",
-            label="Data da Entrevista * (dd/mm/aaaa)",
+            label="Data da Entrevista *",
             sec="Informações para contato",
             tipo="date",
             sf="Data_da_Entrevista__c",
             req=True,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="unidade_negocio",
             label="Unidade Negócio",
             sec="Informações para contato",
@@ -279,526 +465,553 @@ def _campos_def() -> List[Campo]:
             opcoes=UNIDADES_NEGOCIO,
             req=False,
         ),
-        z(
+        _z(
             key="data_transferencia_parceiro",
-            label="Data Transferência Corretor Parceiro (dd/mm/aaaa)",
+            label="Data Transferência Corretor Parceiro",
             sec="Informações para contato",
             tipo="date",
             sf="Data_Transferencia_Corretor_Parceiro__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        # Dados pessoais
-        z(
+        # ——— Dados Pessoais ———
+        _z(
             key="birthdate",
-            label="Data de nascimento * (dd/mm/aaaa)",
-            sec="Dados pessoais",
+            label="Data de nascimento *",
+            sec="Dados Pessoais",
             tipo="date",
             sf="Birthdate",
             req=True,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="estado_civil",
             label="Estado Civil *",
-            sec="Dados pessoais",
-            tipo="text",
+            sec="Dados Pessoais",
+            tipo="select",
             sf="EstadoCivil__c",
+            opcoes=ESTADO_CIVIL_OPTS,
             req=True,
         ),
-        z(key="cpf", label="CPF *", sec="Dados pessoais", tipo="text", sf="CPF__c", req=True),
-        z(key="pis", label="PIS", sec="Dados pessoais", tipo="text", sf="PIS__c", req=False),
-        z(
+        _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
+        _z(key="pis", label="PIS", sec="Dados Pessoais", tipo="text", sf="PIS__c", req=False),
+        _z(
             key="nacionalidade",
             label="Nacionalidade *",
-            sec="Dados pessoais",
-            tipo="text",
+            sec="Dados Pessoais",
+            tipo="select",
             sf="Nacionalidade__c",
+            opcoes=NACIONALIDADE_OPTS,
             req=True,
         ),
-        z(
+        _z(
             key="naturalidade",
             label="Naturalidade *",
-            sec="Dados pessoais",
+            sec="Dados Pessoais",
             tipo="text",
             sf="Naturalidade__c",
             req=True,
         ),
-        z(key="rg", label="RG *", sec="Dados pessoais", tipo="text", sf="RG__c", req=True),
-        z(
+        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
+        _z(
             key="uf_naturalidade",
             label="UF Naturalidade *",
-            sec="Dados pessoais",
+            sec="Dados Pessoais",
             tipo="select",
             sf="UF_Naturalidade__c",
             opcoes=ESTADOS_UF,
             req=True,
         ),
-        z(
+        _z(
             key="uf_rg",
             label="UF RG *",
-            sec="Dados pessoais",
+            sec="Dados Pessoais",
             tipo="select",
             sf="UF_RG__c",
             opcoes=ESTADOS_UF,
             req=True,
         ),
-        z(
+        _z(
             key="tipo_pix",
             label="Tipo do PIX *",
-            sec="Dados pessoais",
+            sec="Dados Pessoais",
             tipo="select",
             sf="Tipo_do_PIX__c",
             opcoes=TIPO_PIX,
             req=True,
         ),
-        z(
+        _z(
             key="dados_pix",
             label="Dados para PIX *",
-            sec="Dados pessoais",
+            sec="Dados Pessoais",
             tipo="text",
             sf="Dados_para_PIX__c",
             req=True,
         ),
-        # Dados de usuário (multiplicadores)
-        z(
+        # ——— Dados de Usuário ———
+        _z(
             key="multiplicador_nivel",
             label="Multiplicador de Nível",
-            sec="Dados de usuário",
+            sec="Dados de Usuário",
             tipo="number",
             sf="Multiplicador__c",
             req=False,
         ),
-        z(
+        _z(
             key="usuario_uau",
             label="Usuário UAU",
-            sec="Dados de usuário",
+            sec="Dados de Usuário",
             tipo="text",
             sf="Usu_rio_UAU__c",
             req=False,
         ),
-        z(
+        _z(
             key="multiplicador_regime",
             label="Multiplicador de Regime",
-            sec="Dados de usuário",
+            sec="Dados de Usuário",
             tipo="number",
             sf="Multiplicador_de_Regime__c",
             req=False,
         ),
-        # Dados para contato
-        z(key="phone", label="Telefone", sec="Dados para contato", tipo="text", sf="Phone", req=False),
-        z(
+        # ——— Dados para Contato ———
+        _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
+        _z(
             key="email_direcional",
             label="E-mail Direcional",
-            sec="Dados para contato",
+            sec="Dados para Contato",
             tipo="text",
             sf="E_mail_Direcional__c",
             req=False,
         ),
-        z(key="email", label="E-mail *", sec="Dados para contato", tipo="text", sf="Email", req=True),
-        z(
-            key="mobile",
-            label="Celular",
-            sec="Dados para contato",
-            tipo="text",
-            sf="MobilePhone",
-            req=False,
-        ),
-        z(
+        _z(key="mobile", label="Celular", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=False),
+        _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
+        _z(
             key="celular_2",
             label="Celular 2",
-            sec="Dados para contato",
+            sec="Dados para Contato",
             tipo="text",
             sf="Celular_2__c",
             req=False,
         ),
-        z(
+        _z(
             key="other_phone",
             label="Outro telefone",
-            sec="Dados para contato",
+            sec="Dados para Contato",
             tipo="text",
             sf="OtherPhone",
             req=False,
         ),
-        # Dados familiares
-        z(
+        # ——— Dados Familiares ———
+        _z(
             key="nome_pai",
             label="Nome do Pai *",
-            sec="Dados familiares",
+            sec="Dados Familiares",
             tipo="text",
             sf="Nome_do_Pai__c",
             req=True,
         ),
-        z(
+        _z(
             key="possui_filhos",
             label="Possui Filho(s)?",
-            sec="Dados familiares",
+            sec="Dados Familiares",
             tipo="select",
             sf="Possui_Filho__c",
             opcoes=POSSUI_FILHOS,
             req=False,
         ),
-        z(
+        _z(
             key="nome_mae",
             label="Nome da Mãe *",
-            sec="Dados familiares",
+            sec="Dados Familiares",
             tipo="text",
             sf="Nome_da_Mae__c",
             req=True,
         ),
-        z(
+        _z(
             key="qtd_filhos",
             label="Quantidade de Filhos",
-            sec="Dados familiares",
+            sec="Dados Familiares",
             tipo="number",
             sf="Quantidade_de_Filhos__c",
             req=False,
         ),
-        z(
+        _z(
             key="nome_conjuge",
             label="Nome do Cônjuge",
-            sec="Dados familiares",
+            sec="Dados Familiares",
             tipo="text",
             sf="Nome_do_Conjuge__c",
             req=False,
         ),
-        # Dados bancários
-        z(key="banco", label="Banco *", sec="Dados bancários PF", tipo="text", sf="Banco__c", req=True),
-        z(
+        # ——— Dados Bancários Pessoa Física ———
+        _z(
+            key="banco",
+            label="Banco *",
+            sec="Dados Bancários Pessoa Física",
+            tipo="select",
+            sf="Banco__c",
+            opcoes=BANCO_OPTS,
+            req=True,
+        ),
+        _z(
             key="conta_bancaria",
             label="Conta Bancária *",
-            sec="Dados bancários PF",
+            sec="Dados Bancários Pessoa Física",
             tipo="text",
             sf="Conta_Banc_ria__c",
             req=True,
         ),
-        z(
+        _z(
             key="agencia_bancaria",
             label="Agência Bancária *",
-            sec="Dados bancários PF",
+            sec="Dados Bancários Pessoa Física",
             tipo="text",
             sf="Ag_ncia_Banc_ria__c",
             req=True,
         ),
-        z(
+        _z(
             key="retorno_integracao_bancaria",
             label="Retorno integração conta bancária",
-            sec="Dados bancários PF",
+            sec="Dados Bancários Pessoa Física",
             tipo="textarea",
             sf="RetornoIntegracaoContaBancaria__c",
             req=False,
-            help="Campo somente leitura no Salesforce — preenchido pela integração.",
+            help="Somente leitura no Salesforce — uso informativo na planilha.",
         ),
-        z(
+        _z(
             key="tipo_conta",
             label="Tipo de Conta",
-            sec="Dados bancários PF",
+            sec="Dados Bancários Pessoa Física",
             tipo="select",
             sf="Tipo_de_Conta__c",
             opcoes=TIPO_CONTA_BANCARIA,
             req=False,
         ),
-        # CRECI / TTI
-        z(
+        # ——— CRECI/TTI ———
+        _z(
             key="data_matricula_tti",
-            label="Data Matrícula - TTI (dd/mm/aaaa)",
-            sec="CRECI / TTI",
+            label="Data Matrícula - TTI",
+            sec="CRECI/TTI",
             tipo="date",
             sf="Data_Matricula_TTI__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
-            key="tti",
-            label="TTI",
-            sec="CRECI / TTI",
-            tipo="text",
-            sf="TTI__c",
-            req=False,
-        ),
-        z(
+        _z(key="tti", label="TTI", sec="CRECI/TTI", tipo="text", sf="TTI__c", req=False),
+        _z(
             key="status_creci",
             label="Status CRECI",
-            sec="CRECI / TTI",
-            tipo="text",
+            sec="CRECI/TTI",
+            tipo="select",
             sf="Status_CRECI__c",
+            opcoes=STATUS_CRECI_OPTS,
             req=False,
         ),
-        z(
+        _z(
             key="data_conclusao",
-            label="Data de conclusão (dd/mm/aaaa)",
-            sec="CRECI / TTI",
+            label="Data de conclusão",
+            sec="CRECI/TTI",
             tipo="date",
             sf="Data_de_conclusao__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(key="creci", label="CRECI", sec="CRECI / TTI", tipo="text", sf="CRECI__c", req=False),
-        z(
+        _z(key="creci", label="CRECI", sec="CRECI/TTI", tipo="text", sf="CRECI__c", req=False),
+        _z(
             key="observacoes_creci",
-            label="Observações (CRECI)",
-            sec="CRECI / TTI",
+            label="Observações",
+            sec="CRECI/TTI",
             tipo="textarea",
             sf="Observacoes__c",
             req=False,
         ),
-        z(
+        _z(
             key="validade_creci",
-            label="Validade CRECI (dd/mm/aaaa)",
-            sec="CRECI / TTI",
+            label="Validade CRECI",
+            sec="CRECI/TTI",
             tipo="date",
             sf="Validade_CRECI__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="nome_responsavel",
             label="Nome do Responsável",
-            sec="CRECI / TTI",
+            sec="CRECI/TTI",
             tipo="text",
             sf="Nome_do_Responsavel__c",
             req=False,
         ),
-        z(
+        _z(
             key="creci_responsavel",
             label="CRECI do Responsável",
-            sec="CRECI / TTI",
+            sec="CRECI/TTI",
             tipo="number",
             sf="CRECI_do_Responsavel__c",
             req=False,
         ),
-        z(
+        _z(
             key="tipo_comissionamento",
             label="Tipo de Comissionamento",
-            sec="CRECI / TTI",
+            sec="CRECI/TTI",
             tipo="text",
             sf=None,
             req=False,
-            help="Se o campo customizado existir no org, ajuste em corretor_campos.py",
         ),
-        z(
+        # ——— Contrato e dados PJ (continuação do layout após CRECI) ———
+        _z(
             key="tipo_corretor",
             label="Tipo Corretor *",
-            sec="CRECI / TTI",
-            tipo="text",
+            sec="Contrato e dados PJ",
+            tipo="select",
             sf="Tipo_Corretor__c",
+            opcoes=TIPO_CORRETOR_OPTS,
             req=True,
-            help="Ex.: Direcional Vendas - Autônomos",
         ),
-        z(
+        _z(
             key="faturamento_comissao",
-            label="Faturamento Comissão (ordem)",
-            sec="Contrato / PJ",
+            label="Faturamento Comissão",
+            sec="Contrato e dados PJ",
             tipo="text",
             sf=None,
             req=False,
-            help="Campo dependente no SF — gravado na planilha; pode ir para Observações.",
+            help="Gravado na planilha; no SF pode ser somente leitura.",
         ),
-        z(
-            key="faturamento_comissao_obs",
-            label="Faturamento Comissão (observação / CNPJ contexto)",
-            sec="Contrato / PJ",
+        _z(
+            key="faturamento_comissao_2",
+            label="Faturamento Comissão (2)",
+            sec="Contrato e dados PJ",
             tipo="text",
             sf=None,
             req=False,
         ),
-        z(key="cnpj", label="CNPJ", sec="Contrato / PJ", tipo="text", sf="CNPJ__c", req=False),
-        z(
+        _z(key="cnpj", label="CNPJ", sec="Contrato e dados PJ", tipo="text", sf="CNPJ__c", req=False),
+        _z(
             key="razao_social",
             label="Razão Social",
-            sec="Contrato / PJ",
+            sec="Contrato e dados PJ",
             tipo="text",
             sf="Razao_Social__c",
             req=False,
         ),
-        z(
+        _z(
             key="fornecedor_uau",
             label="Cadastrado como Fornecedor no UAU?",
-            sec="Contrato / PJ",
-            tipo="text",
+            sec="Contrato e dados PJ",
+            tipo="select",
             sf="Cadastrado_como_Fornecedor_no_UAU__c",
+            opcoes=FORNECEDOR_UAU_OPTS,
             req=False,
-            help="Sim/Não ou valor exato do picklist no Salesforce.",
         ),
-        z(
+        _z(
             key="contrato_texto",
-            label="Contrato (texto)",
-            sec="Contrato / PJ",
+            label="Contrato",
+            sec="Contrato e dados PJ",
             tipo="textarea",
             sf="Contrato__c",
             req=False,
         ),
-        z(
+        _z(
             key="data_contrato",
-            label="Data Contrato * (dd/mm/aaaa)",
-            sec="Contrato / PJ",
+            label="Data Contrato *",
+            sec="Contrato e dados PJ",
             tipo="date",
             sf="Data_Contrato__c",
             req=True,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="data_credenciamento",
-            label="Data Credenciamento * (dd/mm/aaaa)",
-            sec="Contrato / PJ",
+            label="Data Credenciamento *",
+            sec="Contrato e dados PJ",
             tipo="date",
             sf="Data_Credenciamento__c",
             req=True,
+            help="Formato: 31/12/2024",
         ),
-        # Histórico / equipe
-        z(
+        _z(
+            key="contrato_observacao",
+            label="Contrato (observação / referência)",
+            sec="Contrato e dados PJ",
+            tipo="textarea",
+            sf=None,
+            req=False,
+            help="Segundo bloco Contrato do layout Salesforce (texto livre).",
+        ),
+        # ——— Histórico Equipe ———
+        _z(
             key="historico_equipe",
             label="Histórico Equipe",
-            sec="Histórico equipe",
+            sec="Histórico Equipe",
             tipo="textarea",
             sf=None,
             req=False,
         ),
-        z(
+        _z(
             key="produto_atuacao_id",
-            label="Produto de Atuação (Id Empreendimento)",
-            sec="Histórico equipe",
+            label="Produto de Atuação",
+            sec="Histórico Equipe",
             tipo="id",
             sf="Produto_de_Atuacao__c",
             req=False,
+            help="Pesquisar Empreendimentos — Id do empreendimento.",
         ),
-        z(
+        _z(
             key="nao_recomendado_motivo",
             label="Não recomendado - Motivo",
-            sec="Histórico equipe",
+            sec="Histórico Equipe",
             tipo="textarea",
             sf=None,
             req=False,
         ),
-        z(
+        _z(
             key="gerente_anterior_id",
-            label="Gerente anterior (Id User)",
-            sec="Histórico equipe",
+            label="Gerente anterior",
+            sec="Histórico Equipe",
             tipo="id",
             sf="GerenteAnterior__c",
             req=False,
+            help="Pesquisar Pessoas — Id User.",
         ),
-        z(
+        _z(
             key="motivo_inatividade",
             label="Motivo Inatividade",
-            sec="Histórico equipe",
-            tipo="text",
+            sec="Histórico Equipe",
+            tipo="select",
             sf="Motivo_Inatividade__c",
+            opcoes=MOTIVO_INATIVIDADE_OPTS,
             req=False,
         ),
-        z(
+        _z(
             key="solicitante_descredenciamento_id",
-            label="Solicitante Descredenciamento (Id User)",
-            sec="Histórico equipe",
+            label="Solicitante Descredenciamento",
+            sec="Histórico Equipe",
             tipo="id",
             sf="Solicitantedescredenciamento__c",
             req=False,
+            help="Pesquisar Pessoas — Id User.",
         ),
-        z(
+        _z(
             key="tipo_desligamento",
             label="Tipo de desligamento",
-            sec="Histórico equipe",
-            tipo="text",
+            sec="Histórico Equipe",
+            tipo="select",
             sf="Tipo_de_desligamento__c",
+            opcoes=TIPO_DESLIGAMENTO_OPTS,
             req=False,
         ),
-        z(
+        _z(
             key="motivo_descredenciamento",
             label="Motivo Descredenciamento",
-            sec="Histórico equipe",
-            tipo="text",
+            sec="Histórico Equipe",
+            tipo="select",
             sf="Motivo_Descredenciamento__c",
+            opcoes=MOTIVO_DESCREDENCIAMENTO_OPTS,
             req=False,
         ),
-        z(
+        _z(
             key="blacklist_flag",
-            label="Blacklist (informação)",
-            sec="Histórico equipe",
+            label="Blacklist",
+            sec="Histórico Equipe",
             tipo="text",
             sf=None,
             req=False,
-            help="Campo Blacklist no SF é controlado pelo sistema — use para notas na planilha.",
+            help="Notas — campo Blacklist no SF é controlado pelo sistema.",
         ),
-        z(
+        _z(
             key="falso_blacklist",
-            label="FalsoBlacklist / observação",
-            sec="Histórico equipe",
+            label="FalsoBlacklist",
+            sec="Histórico Equipe",
             tipo="text",
             sf=None,
             req=False,
         ),
-        # Datas adicionais
-        z(
+        # ——— Datas ———
+        _z(
             key="data_descredenciamento",
-            label="Data Descredenciamento (dd/mm/aaaa)",
+            label="Data Descredenciamento",
             sec="Datas",
             tipo="date",
             sf="Data_Descredenciamento__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="data_saida",
-            label="Data de Saída (dd/mm/aaaa)",
+            label="Data de Saída",
             sec="Datas",
             tipo="date",
             sf="Data_de_Saida__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="data_transferencia",
-            label="Data de Transferência (dd/mm/aaaa)",
+            label="Data de Transferência",
             sec="Datas",
             tipo="date",
             sf="Data_de_Transferencia__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="data_reativacao",
-            label="Data Reativação (dd/mm/aaaa)",
+            label="Data Reativação",
             sec="Datas",
             tipo="date",
             sf="Data_Reativacao__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="data_entrada_recruita",
-            label="Data Entrada Recruta+ (dd/mm/aaaa)",
+            label="Data Entrada Recruta+",
             sec="Datas",
             tipo="date",
             sf="Data_Entrada_Recruta__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        z(
+        _z(
             key="data_saida_recruita",
-            label="Data Saída Recruta+ (dd/mm/aaaa)",
+            label="Data Saída Recruta+",
             sec="Datas",
             tipo="date",
             sf="Data_Sai_da_Recruta__c",
             req=False,
+            help="Formato: 31/12/2024",
         ),
-        # Integração
-        z(
+        # ——— Dados Integração ———
+        _z(
             key="codigo_pessoa_uau",
             label="Código Pessoa UAU",
-            sec="Dados integração",
+            sec="Dados Integração",
             tipo="text",
             sf="C_digo_Pessoa_UAU__c",
             req=False,
         ),
-        z(
+        _z(
             key="erro_integracao_uau",
             label="Erro Integração UAU",
-            sec="Dados integração",
+            sec="Dados Integração",
             tipo="textarea",
             sf="ErroIntegracaoUAU__c",
             req=False,
         ),
-        z(
+        _z(
             key="retorno_integracao_pessoa",
             label="Retorno Integração Pessoa",
-            sec="Dados integração",
+            sec="Dados Integração",
             tipo="textarea",
             sf="RetornoIntegracaoPessoa__c",
             req=False,
         ),
-        z(key="anexos", label="Anexos (notas)", sec="Anexos", tipo="textarea", sf=None, req=False),
-        z(
+        # ——— Anexos ———
+        _z(key="anexos", label="Anexos", sec="Anexos", tipo="textarea", sf=None, req=False),
+        # ——— Preferred Contact Method ———
+        _z(
             key="preferred_contact_method",
-            label="Preferred Contact Method (múltiplos)",
+            label="Preferred Contact Method",
             sec="Preferred Contact Method",
             tipo="multiselect",
             sf="Preferred_Contact_Method__c",
@@ -813,8 +1026,15 @@ CAMPOS: List[Campo] = _campos_def()
 _ID_RE = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
 
 
+def _norm_picklist(val: Any) -> str:
+    """Remove marcador '--Nenhum--' como vazio."""
+    s = (str(val).strip() if val is not None else "") or ""
+    if s in ("--Nenhum--", "Nenhum"):
+        return ""
+    return s
+
+
 def parse_data_br(val: Any) -> Optional[str]:
-    """Converte dd/mm/aaaa ou aaaa-mm-dd para ISO date string (YYYY-MM-DD)."""
     if val is None or (isinstance(val, float) and str(val) == "nan"):
         return None
     if isinstance(val, date) and not isinstance(val, datetime):
@@ -847,7 +1067,7 @@ def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
 
 
 def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
-    erros = []
+    erros: List[str] = []
     for c in CAMPOS:
         if not c.get("req"):
             continue
@@ -857,21 +1077,79 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
             if not v or (isinstance(v, list) and len(v) == 0):
                 erros.append(c["label"])
             continue
+        if c["tipo"] == "select":
+            if not _norm_picklist(v):
+                erros.append(c["label"])
+            continue
         if v is None or (isinstance(v, str) and not str(v).strip()):
             erros.append(c["label"])
-    # Nome da conta: Id OU nome
     aid = (dados.get("account_id") or "").strip()
     aname = (dados.get("account_name") or "").strip()
     if not aid and not aname:
-        erros.append("Nome da conta (Id Salesforce ou texto)")
-    return erros
+        erros.append("Nome da conta *")
+    nc = (dados.get("nome_completo") or "").strip()
+    fn = (dados.get("first_name") or "").strip()
+    ln = (dados.get("last_name") or "").strip()
+    if not nc:
+        if not ln:
+            erros.append("Sobrenome * (ou Nome completo *)")
+        if not fn:
+            erros.append("Primeiro Nome (ou Nome completo *)")
+    return list(dict.fromkeys(erros))
+
+
+def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
+    """
+    Valida apenas campos obrigatórios da seção atual (para bloquear «Avançar» no formulário por etapas).
+    Replica a lógica de `validar_obrigatorios` para `c['sec'] == sec` e, na seção
+    «Informações para contato», as regras de conta + nome/sobrenome.
+    """
+    erros: List[str] = []
+    for c in CAMPOS:
+        if c["sec"] != sec or not c.get("req"):
+            continue
+        k = c["key"]
+        v = dados.get(k)
+        if c["tipo"] == "multiselect":
+            if not v or (isinstance(v, list) and len(v) == 0):
+                erros.append(c["label"])
+            continue
+        if c["tipo"] == "select":
+            if not _norm_picklist(v):
+                erros.append(c["label"])
+            continue
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            erros.append(c["label"])
+    if sec == "Informações para contato":
+        aid = (dados.get("account_id") or "").strip()
+        aname = (dados.get("account_name") or "").strip()
+        if not aid and not aname:
+            erros.append("Nome da conta *")
+        nc = (dados.get("nome_completo") or "").strip()
+        fn = (dados.get("first_name") or "").strip()
+        ln = (dados.get("last_name") or "").strip()
+        if not nc:
+            if not ln:
+                erros.append("Sobrenome * (ou Nome completo *)")
+            if not fn:
+                erros.append("Primeiro Nome (ou Nome completo *)")
+    return list(dict.fromkeys(erros))
+
+
+def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
+    nc = (dados.get("nome_completo") or "").strip()
+    if not nc:
+        return
+    fn = (payload.get("FirstName") or "").strip()
+    ln = (payload.get("LastName") or "").strip()
+    if fn or ln:
+        return
+    partes = nc.split(None, 1)
+    payload["FirstName"] = partes[0]
+    payload["LastName"] = partes[1] if len(partes) > 1 else partes[0]
 
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Monta dict para Contact.create. Acrescenta RecordTypeId.
-    Devolve (payload, avisos) — avisos = campos ignorados ou texto extra para Description.
-    """
     payload: Dict[str, Any] = {"RecordTypeId": RECORD_TYPE_CORRETOR}
     avisos: List[str] = []
     extras_obs: List[str] = []
@@ -880,8 +1158,12 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         key = c["key"]
         sf = c.get("sf")
         raw = dados.get(key)
+
+        if key == "nome_completo":
+            continue
+
         if sf is None:
-            if raw and str(raw).strip():
+            if raw and str(raw).strip() and key not in ("nome_completo",):
                 extras_obs.append(f"{c['label']}: {raw}")
             continue
 
@@ -891,7 +1173,6 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             continue
 
         tipo = c["tipo"]
-        val: Any = raw
 
         if tipo == "date":
             iso = parse_data_br(raw)
@@ -930,13 +1211,19 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                     payload[sf] = s
             continue
 
-        # text / select
+        if tipo == "select":
+            s = _norm_picklist(raw)
+            if s:
+                payload[sf] = s
+            continue
+
         s = (str(raw).strip() if raw is not None else "") or ""
         if not s:
             continue
         payload[sf] = s
 
-    # Nome da conta (texto) se não tiver AccountId
+    _aplicar_nome_completo(payload, dados)
+
     acc = dados.get("account_id")
     acc_txt = dados.get("account_name")
     if (not acc or not str(acc).strip()) and acc_txt and str(acc_txt).strip():
@@ -947,14 +1234,26 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
     if extra_block:
         payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
 
-    # Remove chaves vazias / None
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
 
     return payload, avisos
 
 
-def linha_planilha(dados: Dict[str, Any], timestamp_iso: str) -> List[str]:
-    """Uma linha na ordem das colunas + carimbo de data."""
+def _agora_envio_brasilia() -> tuple[str, str]:
+    """Data/hora legível em Brasília e ISO (mesmo instante)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/Sao_Paulo")
+        now = datetime.now(tz)
+        return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
+    except Exception:
+        now = datetime.now(timezone.utc)
+        return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
+
+
+def linha_planilha(dados: Dict[str, Any]) -> List[str]:
+    data_hora_br, iso = _agora_envio_brasilia()
     row: List[str] = []
     for c in CAMPOS:
         k = c["key"]
@@ -965,21 +1264,27 @@ def linha_planilha(dados: Dict[str, Any], timestamp_iso: str) -> List[str]:
             row.append("")
         else:
             row.append(str(v))
-    row.append(timestamp_iso)
+    row.append(data_hora_br)
+    row.append(iso)
+    row.append("")  # Envio? — preenchido após tentativa Salesforce
+    row.append("")  # Log / erro
+    row.append("")  # Link do contato
     return row
 
 
 def cabecalho_planilha() -> List[str]:
-    return [c["label"] for c in CAMPOS] + ["Carimbo de data/hora"]
+    return [c["label"] for c in CAMPOS] + [
+        "Data e hora do envio",
+        "Carimbo ISO",
+        "Envio?",
+        "Log / erro",
+        "Link do contato",
+    ]
 
 
 def secoes_ordenadas() -> List[str]:
-    seen = []
-    for c in CAMPOS:
-        s = c["sec"]
-        if s not in seen:
-            seen.append(s)
-    return seen
+    presentes = {c["sec"] for c in CAMPOS}
+    return [s for s in SEC_ORDER if s in presentes]
 
 
 def campos_por_secao(sec: str) -> List[Campo]:
