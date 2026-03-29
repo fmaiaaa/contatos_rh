@@ -26,8 +26,10 @@ import ficha_seguranca
 
 from corretor_campos import (
     CAMPOS,
+    NOMES_CONTA_FIXOS,
     cabecalho_planilha,
     campos_por_secao_visiveis,
+    enriquecer_derivados_vendas_rj,
     linha_planilha,
     montar_payload_salesforce,
     secoes_com_campos_visiveis,
@@ -114,11 +116,8 @@ TAB_LABELS: dict[str, str] = {
     "Dados Bancários Pessoa Física": "Bancário PF",
     "CRECI/TTI": "CRECI",
     "Contrato e dados PJ": "Contrato / PJ",
-    "Histórico Equipe": "Histórico",
-    "Datas": "Datas",
     "Dados Integração": "Integração",
-    "Anexos": "Anexos",
-    "Preferred Contact Method": "Preferências",
+    "Preferência de contato": "Preferências",
 }
 
 
@@ -625,6 +624,18 @@ def _cabecalho_pagina(*, com_intro_formulario: bool = False) -> None:
     )
 
 
+def _opcoes_nome_conta() -> list[str]:
+    """Lista fixa de nomes de conta: [ficha_defaults].account_names ou .account_name ou fallback."""
+    fd = _ficha_defaults_de_secrets()
+    raw = fd.get("account_names")
+    if isinstance(raw, list) and raw:
+        return [str(x).strip() for x in raw if str(x).strip()]
+    one = str(fd.get("account_name", "")).strip()
+    if one:
+        return [one]
+    return list(NOMES_CONTA_FIXOS)
+
+
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
     """Se o rótulo termina com ' *', devolve texto sem o asterisco e True."""
     s = (label or "").rstrip()
@@ -671,6 +682,10 @@ def _widget_campo(c: dict):
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "select":
         opts = c.get("opcoes") or [""]
+        if k == "account_name":
+            opts = _opcoes_nome_conta()
+            if not opts:
+                opts = list(NOMES_CONTA_FIXOS)
         cur = st.session_state.get(sk)
         if cur is not None and cur not in opts:
             st.session_state[sk] = opts[0]
@@ -742,8 +757,6 @@ def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> 
 
 def _nome_candidato_ficha(dados: dict[str, Any]) -> str:
     nome = (dados.get("nome_completo") or "").strip()
-    if not nome:
-        nome = f"{dados.get('first_name') or ''} {dados.get('last_name') or ''}".strip()
     return nome or "Candidato"
 
 
@@ -1216,14 +1229,12 @@ def _dados_ficha_demo_design() -> dict[str, Any]:
         else:
             demo[k] = f"[Preview] {c['label'][:48]}"
     demo["nome_completo"] = "Maria Silva Santos (pré-visualização design)"
-    demo["first_name"] = "Maria"
-    demo["last_name"] = "Silva Santos"
-    demo["account_name"] = "Imobiliária Parceira — Demo"
+    opts = _opcoes_nome_conta()
+    demo["account_name"] = opts[0] if opts else (NOMES_CONTA_FIXOS[0] if NOMES_CONTA_FIXOS else "Conta demo")
     demo["cpf"] = "123.456.789-09"
     demo["email"] = "maria.silva.demo@exemplo.com.br"
     demo["mobile"] = "(21) 99999-0000"
-    demo["apelido"] = "Maria"
-    return demo
+    return enriquecer_derivados_vendas_rj(demo)
 
 
 def _ativar_cenario_teste_design() -> None:
@@ -1246,7 +1257,7 @@ def _processar_envio_cadastro() -> None:
     if not ok_sec:
         ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
         return
-    dados = _coletar_dados_formulario()
+    dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario())
     erros = validar_obrigatorios(dados)
     if not ss.get("fld_lgpd_ficha"):
         erros.append("Concordância LGPD *")

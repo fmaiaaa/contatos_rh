@@ -22,11 +22,8 @@ SEC_ORDER: Tuple[str, ...] = (
     "Dados Bancários Pessoa Física",
     "CRECI/TTI",
     "Contrato e dados PJ",
-    "Histórico Equipe",
-    "Datas",
     "Dados Integração",
-    "Anexos",
-    "Preferred Contact Method",
+    "Preferência de contato",
 )
 
 SF_OMIT_INSERT = frozenset(
@@ -276,14 +273,8 @@ TIPO_DESLIGAMENTO_OPTS = ["--Nenhum--"] + _TIPO_DESLIGAMENTO
 FORNECEDOR_UAU_OPTS = ["--Nenhum--"] + _FORNECEDOR_UAU
 BANCO_OPTS = ["--Nenhum--"] + _BANCO
 
+# Valores alinhados ao picklist do Salesforce (somente opções em português).
 PREFERRED_METHOD_OPTS = [
-    "Work phone",
-    "Home phone",
-    "Mobile phone",
-    "Work Email",
-    "Personal Email",
-    "No preference",
-    "***",
     "Telefone de Trabalho",
     "Telefone residencial",
     "Celular",
@@ -291,6 +282,9 @@ PREFERRED_METHOD_OPTS = [
     "Email pessoal",
     "Sem preferência",
 ]
+
+# Fallback se [ficha_defaults] não tiver account_names — substitua ou use Secrets.
+NOMES_CONTA_FIXOS: Tuple[str, ...] = ("Ajuste em ficha_defaults.account_names",)
 
 Campo = Dict[str, Any]
 
@@ -310,10 +304,11 @@ def _campos_def() -> List[Campo]:
             key="account_name",
             label="Nome da conta *",
             sec="Informações para contato",
-            tipo="text",
+            tipo="select",
             sf=None,
-            req=False,
-            help="Pesquisar Contas — nome exibido na planilha; use Id abaixo para vincular na API.",
+            opcoes=list(NOMES_CONTA_FIXOS),
+            req=True,
+            help="Lista fixa: [ficha_defaults] account_names no Streamlit ou NOMES_CONTA_FIXOS no código.",
         ),
         _z(
             key="account_id",
@@ -339,8 +334,8 @@ def _campos_def() -> List[Campo]:
             sec="Informações para contato",
             tipo="text",
             sf=None,
-            req=False,
-            help="Se preencher, pode substituir Primeiro nome + Sobrenome (primeira palavra = nome).",
+            req=True,
+            help="Primeira palavra = nome (Primeiro Nome no Salesforce); o restante = sobrenome. Apelido gerado automaticamente.",
         ),
         _z(
             key="salutation",
@@ -352,28 +347,13 @@ def _campos_def() -> List[Campo]:
             req=False,
         ),
         _z(
-            key="first_name",
-            label="Primeiro Nome",
-            sec="Informações para contato",
-            tipo="text",
-            sf="FirstName",
-            req=False,
-        ),
-        _z(
-            key="last_name",
-            label="Sobrenome *",
-            sec="Informações para contato",
-            tipo="text",
-            sf="LastName",
-            req=False,
-        ),
-        _z(
             key="apelido",
-            label="Apelido *",
+            label="Apelido",
             sec="Informações para contato",
             tipo="text",
             sf="Apelido__c",
-            req=True,
+            req=False,
+            help="Preenchido automaticamente: primeiro nome + _RJ01",
         ),
         _z(
             key="status_corretor",
@@ -449,12 +429,12 @@ def _campos_def() -> List[Campo]:
         ),
         _z(
             key="data_entrevista",
-            label="Data da Entrevista *",
+            label="Data da Entrevista",
             sec="Informações para contato",
             tipo="date",
             sf="Data_da_Entrevista__c",
-            req=True,
-            help="Formato: 31/12/2024",
+            req=False,
+            help="Definida automaticamente na data do envio.",
         ),
         _z(
             key="unidade_negocio",
@@ -575,32 +555,8 @@ def _campos_def() -> List[Campo]:
         ),
         # ——— Dados para Contato ———
         _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
-        _z(
-            key="email_direcional",
-            label="E-mail Direcional",
-            sec="Dados para Contato",
-            tipo="text",
-            sf="E_mail_Direcional__c",
-            req=False,
-        ),
         _z(key="mobile", label="Celular", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=False),
         _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
-        _z(
-            key="celular_2",
-            label="Celular 2",
-            sec="Dados para Contato",
-            tipo="text",
-            sf="Celular_2__c",
-            req=False,
-        ),
-        _z(
-            key="other_phone",
-            label="Outro telefone",
-            sec="Dados para Contato",
-            tipo="text",
-            sf="OtherPhone",
-            req=False,
-        ),
         # ——— Dados Familiares ———
         _z(
             key="nome_pai",
@@ -813,21 +769,21 @@ def _campos_def() -> List[Campo]:
         ),
         _z(
             key="data_contrato",
-            label="Data Contrato *",
+            label="Data Contrato",
             sec="Contrato e dados PJ",
             tipo="date",
             sf="Data_Contrato__c",
-            req=True,
-            help="Formato: 31/12/2024",
+            req=False,
+            help="Definida automaticamente na data do envio.",
         ),
         _z(
             key="data_credenciamento",
-            label="Data Credenciamento *",
+            label="Data Credenciamento",
             sec="Contrato e dados PJ",
             tipo="date",
             sf="Data_Credenciamento__c",
-            req=True,
-            help="Formato: 31/12/2024",
+            req=False,
+            help="Definida automaticamente na data do envio.",
         ),
         _z(
             key="contrato_observacao",
@@ -837,149 +793,6 @@ def _campos_def() -> List[Campo]:
             sf=None,
             req=False,
             help="Segundo bloco Contrato do layout Salesforce (texto livre).",
-        ),
-        # ——— Histórico Equipe ———
-        _z(
-            key="historico_equipe",
-            label="Histórico Equipe",
-            sec="Histórico Equipe",
-            tipo="textarea",
-            sf=None,
-            req=False,
-        ),
-        _z(
-            key="produto_atuacao_id",
-            label="Produto de Atuação",
-            sec="Histórico Equipe",
-            tipo="id",
-            sf="Produto_de_Atuacao__c",
-            req=False,
-            help="Pesquisar Empreendimentos — Id do empreendimento.",
-        ),
-        _z(
-            key="nao_recomendado_motivo",
-            label="Não recomendado - Motivo",
-            sec="Histórico Equipe",
-            tipo="textarea",
-            sf=None,
-            req=False,
-        ),
-        _z(
-            key="gerente_anterior_id",
-            label="Gerente anterior",
-            sec="Histórico Equipe",
-            tipo="id",
-            sf="GerenteAnterior__c",
-            req=False,
-            help="Pesquisar Pessoas — Id User.",
-        ),
-        _z(
-            key="motivo_inatividade",
-            label="Motivo Inatividade",
-            sec="Histórico Equipe",
-            tipo="select",
-            sf="Motivo_Inatividade__c",
-            opcoes=MOTIVO_INATIVIDADE_OPTS,
-            req=False,
-        ),
-        _z(
-            key="solicitante_descredenciamento_id",
-            label="Solicitante Descredenciamento",
-            sec="Histórico Equipe",
-            tipo="id",
-            sf="Solicitantedescredenciamento__c",
-            req=False,
-            help="Pesquisar Pessoas — Id User.",
-        ),
-        _z(
-            key="tipo_desligamento",
-            label="Tipo de desligamento",
-            sec="Histórico Equipe",
-            tipo="select",
-            sf="Tipo_de_desligamento__c",
-            opcoes=TIPO_DESLIGAMENTO_OPTS,
-            req=False,
-        ),
-        _z(
-            key="motivo_descredenciamento",
-            label="Motivo Descredenciamento",
-            sec="Histórico Equipe",
-            tipo="select",
-            sf="Motivo_Descredenciamento__c",
-            opcoes=MOTIVO_DESCREDENCIAMENTO_OPTS,
-            req=False,
-        ),
-        _z(
-            key="blacklist_flag",
-            label="Blacklist",
-            sec="Histórico Equipe",
-            tipo="text",
-            sf=None,
-            req=False,
-            help="Notas — campo Blacklist no SF é controlado pelo sistema.",
-        ),
-        _z(
-            key="falso_blacklist",
-            label="FalsoBlacklist",
-            sec="Histórico Equipe",
-            tipo="text",
-            sf=None,
-            req=False,
-        ),
-        # ——— Datas ———
-        _z(
-            key="data_descredenciamento",
-            label="Data Descredenciamento",
-            sec="Datas",
-            tipo="date",
-            sf="Data_Descredenciamento__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="data_saida",
-            label="Data de Saída",
-            sec="Datas",
-            tipo="date",
-            sf="Data_de_Saida__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="data_transferencia",
-            label="Data de Transferência",
-            sec="Datas",
-            tipo="date",
-            sf="Data_de_Transferencia__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="data_reativacao",
-            label="Data Reativação",
-            sec="Datas",
-            tipo="date",
-            sf="Data_Reativacao__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="data_entrada_recruita",
-            label="Data Entrada Recruta+",
-            sec="Datas",
-            tipo="date",
-            sf="Data_Entrada_Recruta__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="data_saida_recruita",
-            label="Data Saída Recruta+",
-            sec="Datas",
-            tipo="date",
-            sf="Data_Sai_da_Recruta__c",
-            req=False,
-            help="Formato: 31/12/2024",
         ),
         # ——— Dados Integração ———
         _z(
@@ -1006,13 +819,11 @@ def _campos_def() -> List[Campo]:
             sf="RetornoIntegracaoPessoa__c",
             req=False,
         ),
-        # ——— Anexos ———
-        _z(key="anexos", label="Anexos", sec="Anexos", tipo="textarea", sf=None, req=False),
-        # ——— Preferred Contact Method ———
+        # ——— Preferência de contato ———
         _z(
             key="preferred_contact_method",
-            label="Preferred Contact Method",
-            sec="Preferred Contact Method",
+            label="Preferência de contato",
+            sec="Preferência de contato",
             tipo="multiselect",
             sf="Preferred_Contact_Method__c",
             opcoes=PREFERRED_METHOD_OPTS,
@@ -1031,13 +842,17 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
         "erro_integracao_uau",
         "retorno_integracao_pessoa",
         "retorno_integracao_bancaria",
-        "blacklist_flag",
-        "falso_blacklist",
         "status_corretor",
         "regional",
         "origem",
         "account_id",
         "owner_id",
+        "apelido",
+        "data_entrevista",
+        "data_contrato",
+        "data_credenciamento",
+        "multiplicador_nivel",
+        "multiplicador_regime",
     }
 )
 
@@ -1118,15 +933,13 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     aid = (dados.get("account_id") or "").strip()
     aname = (dados.get("account_name") or "").strip()
     if not aid and not aname:
-        erros.append("Nome da conta *")
+        erros.append(
+            "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
+            "(ou selecione Nome da conta)."
+        )
     nc = (dados.get("nome_completo") or "").strip()
-    fn = (dados.get("first_name") or "").strip()
-    ln = (dados.get("last_name") or "").strip()
     if not nc:
-        if not ln:
-            erros.append("Sobrenome * (ou Nome completo *)")
-        if not fn:
-            erros.append("Primeiro Nome (ou Nome completo *)")
+        erros.append("Nome completo *")
     return list(dict.fromkeys(erros))
 
 
@@ -1158,29 +971,24 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         aid = (dados.get("account_id") or "").strip()
         aname = (dados.get("account_name") or "").strip()
         if not aid and not aname:
-            erros.append("Nome da conta *")
+            erros.append(
+                "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
+                "(ou selecione Nome da conta)."
+            )
         nc = (dados.get("nome_completo") or "").strip()
-        fn = (dados.get("first_name") or "").strip()
-        ln = (dados.get("last_name") or "").strip()
         if not nc:
-            if not ln:
-                erros.append("Sobrenome * (ou Nome completo *)")
-            if not fn:
-                erros.append("Primeiro Nome (ou Nome completo *)")
+            erros.append("Nome completo *")
     return list(dict.fromkeys(erros))
 
 
 def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
+    """Primeira palavra → FirstName; restante → LastName (sem campos separados no formulário)."""
     nc = (dados.get("nome_completo") or "").strip()
     if not nc:
         return
-    fn = (payload.get("FirstName") or "").strip()
-    ln = (payload.get("LastName") or "").strip()
-    if fn or ln:
-        return
     partes = nc.split(None, 1)
-    payload["FirstName"] = partes[0]
-    payload["LastName"] = partes[1] if len(partes) > 1 else partes[0]
+    payload["FirstName"] = partes[0][:40]
+    payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
 
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -1271,6 +1079,24 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
 
     return payload, avisos
+
+
+def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Regras Vendas RJ: apelido = primeiro nome + _RJ01; datas de entrevista/contrato/credenciamento = hoje;
+    multiplicadores 0,9 e 1 (ajuste na org se o campo for percentual diferente).
+    """
+    out = dict(dados)
+    nc = (out.get("nome_completo") or "").strip()
+    primeiro = nc.split(None, 1)[0] if nc else ""
+    out["apelido"] = f"{primeiro}_RJ01" if primeiro else ""
+    hoje = date.today().strftime("%d/%m/%Y")
+    out["data_entrevista"] = hoje
+    out["data_contrato"] = hoje
+    out["data_credenciamento"] = hoje
+    out["multiplicador_nivel"] = 0.9
+    out["multiplicador_regime"] = 1.0
+    return out
 
 
 def _agora_envio_brasilia() -> tuple[str, str]:
