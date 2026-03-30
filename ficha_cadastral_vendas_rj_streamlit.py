@@ -1701,10 +1701,10 @@ DEFAULT_COL_NOME_CONTA = "Nome da Conta"
 
 # --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
 # Altere aqui no código; deixe ATIVO = False em produção.
-FICHA_TEST_PLANILHA_ATIVO = False
+FICHA_TEST_PLANILHA_ATIVO = True
 # Se não vazio, o painel de teste lê esta planilha/aba (ignora SPREADSHEET_ID/WORKSHEET_NAME dos Secrets).
-FICHA_TEST_PLANILHA_SPREADSHEET_ID = ""
-FICHA_TEST_PLANILHA_WORKSHEET_NAME = ""
+FICHA_TEST_PLANILHA_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
+FICHA_TEST_PLANILHA_WORKSHEET_NAME = "Corretores"
 
 
 def _ids_planilha_modo_teste(gs: Dict[str, Any]) -> Tuple[str, str]:
