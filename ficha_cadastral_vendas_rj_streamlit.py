@@ -38,7 +38,6 @@ except ImportError:
 
 _SF_SDK_DISPONIVEL = Salesforce is not None
 
-FICHA_TEST_PLANILHA=1
 
 def conectar_salesforce():
     if not _SF_SDK_DISPONIVEL:
@@ -1408,14 +1407,8 @@ def _preview_linha_planilha(headers: List[str], cells: List[str]) -> str:
 
 
 def _teste_planilha_sf_habilitado() -> bool:
-    """Ative com FICHA_TEST_PLANILHA=1 ou ?test_planilha=1 na URL (ferramenta de desenvolvimento)."""
-    if os.environ.get("FICHA_TEST_PLANILHA", "").strip().lower() in ("1", "true", "yes", "on"):
-        return True
-    try:
-        v = st.query_params.get("test_planilha", "")
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        return False
+    """Controlado pela constante `FICHA_TEST_PLANILHA_ATIVO` (bloco «Modo teste» junto aos IDs da planilha)."""
+    return bool(FICHA_TEST_PLANILHA_ATIVO)
 
 
 def _aplicar_dados_teste_ao_session_state(dados: Dict[str, Any]) -> None:
@@ -1454,8 +1447,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
             gs = dict(st.secrets.get("google_sheets", {}))
         except Exception:
             gs = {}
-    sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
-    wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
+    sid, wname = _ids_planilha_modo_teste(gs)
 
     dados = dados_dict_de_linha_planilha(headers, cells)
     dados = enriquecer_derivados_vendas_rj(dados)
@@ -1536,8 +1528,9 @@ def _render_sidebar_teste_planilha_sf() -> None:
     with st.sidebar:
         st.markdown("##### Teste rápido — planilha → Salesforce")
         st.caption(
-            "Lê a aba **Corretores** (mesmo ID/aba dos Secrets). **Não** exige LGPD. "
-            "Desative em produção: remova `FICHA_TEST_PLANILHA` e o parâmetro `test_planilha` da URL."
+            "Lê a planilha definida em **FICHA_TEST_PLANILHA_SPREADSHEET_ID** / "
+            "**FICHA_TEST_PLANILHA_WORKSHEET_NAME** (se vazios, usa Secrets). **Não** exige LGPD. "
+            "Em produção: **FICHA_TEST_PLANILHA_ATIVO = False**."
         )
         if st.button("Carregar linhas da planilha", key="test_pl_carregar"):
             creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
@@ -1550,8 +1543,7 @@ def _render_sidebar_teste_planilha_sf() -> None:
                         gs = dict(st.secrets.get("google_sheets", {}))
                     except Exception:
                         gs = {}
-                sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
-                wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
+                sid, wname = _ids_planilha_modo_teste(gs)
                 try:
                     h, rows = ler_planilha_corretores_bruta(creds, sid, wname)
                     st.session_state["test_pl_headers"] = h
@@ -1563,7 +1555,9 @@ def _render_sidebar_teste_planilha_sf() -> None:
         headers = list(st.session_state.get("test_pl_headers") or [])
         rows = list(st.session_state.get("test_pl_rows") or [])
         if not rows or not headers:
-            st.info("Clique em **Carregar linhas da planilha** e escolha a aba configurada em **WORKSHEET_NAME**.")
+            st.info(
+                "Clique em **Carregar linhas da planilha**. A aba vem das constantes de teste ou de **WORKSHEET_NAME** nos Secrets."
+            )
             return
 
         labels = [
@@ -1704,6 +1698,24 @@ DEFAULT_WORKSHEET_NAME = "Corretores"
 # Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
 DEFAULT_GERENTES_WORKSHEET = "Gerentes"
 DEFAULT_COL_NOME_CONTA = "Nome da Conta"
+
+# --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
+# Altere aqui no código; deixe ATIVO = False em produção.
+FICHA_TEST_PLANILHA_ATIVO = False
+# Se não vazio, o painel de teste lê esta planilha/aba (ignora SPREADSHEET_ID/WORKSHEET_NAME dos Secrets).
+FICHA_TEST_PLANILHA_SPREADSHEET_ID = ""
+FICHA_TEST_PLANILHA_WORKSHEET_NAME = ""
+
+
+def _ids_planilha_modo_teste(gs: Dict[str, Any]) -> Tuple[str, str]:
+    """ID e aba usados pelo teste rápido: constantes acima, senão Secrets / DEFAULT_*."""
+    fix_id = (FICHA_TEST_PLANILHA_SPREADSHEET_ID or "").strip()
+    if fix_id:
+        wn = (FICHA_TEST_PLANILHA_WORKSHEET_NAME or "").strip() or DEFAULT_WORKSHEET_NAME
+        return fix_id, wn
+    return str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)), str(
+        gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME)
+    )
 
 
 def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
@@ -3977,18 +3989,11 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador, **links** �
 
 def main():
     fav = _resolver_png_raiz(FAVICON_ARQUIVO)
-    # Só variável de ambiente aqui: `st.query_params` não pode vir antes de `set_page_config`.
-    _abrir_sidebar_teste = os.environ.get("FICHA_TEST_PLANILHA", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
     st.set_page_config(
         page_title="Credenciamento | Direcional Vendas RJ",
         page_icon=str(fav) if fav else None,
         layout="centered",
-        initial_sidebar_state="expanded" if _abrir_sidebar_teste else "collapsed",
+        initial_sidebar_state="expanded" if FICHA_TEST_PLANILHA_ATIVO else "collapsed",
     )
     _aplicar_secrets_sf()
     aplicar_estilo()
