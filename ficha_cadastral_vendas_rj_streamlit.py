@@ -70,9 +70,41 @@ def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
         return None, str(e)
 
 
+def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
+    """
+    INVALID_CROSS_REFERENCE_KEY em RecordTypeId: o Id 012… costuma estar certo; o usuário da API
+    frequentemente não tem esse tipo de registro no perfil (mensagem em PT: «ID do tipo de registro»).
+    """
+    base = (str(err).strip() if err is not None else "") or "Erro desconhecido"
+    u = base.upper()
+    compact = u.replace(" ", "")
+    if "INVALID_CROSS_REFERENCE_KEY" not in compact:
+        return base
+    if "RECORDTYPE" not in compact and "TIPODEREGISTRO" not in compact.replace("_", ""):
+        if "REGISTRO" not in u:
+            return base
+    return (
+        base
+        + "\n\n▸ O Id na URL (prefixo **012**) em geral está correto. Este erro indica que o **usuário da integração** "
+        "(login em [salesforce] **USER** nos Secrets) **não pode usar esse Record Type** no objeto Contact.\n"
+        "  • Ajuste no org: **Setup → Profiles** (ou **Permission Sets**) do usuário da API → **Object Settings** → "
+        "**Contact** → **Record Types** → inclua o tipo desejado (ex.: o da URL que você copiou).\n"
+        "  • **Enquanto isso:** nos Secrets use **RECORD_TYPE_ID = \"omit\"** ou remova a chave — o insert deixa de enviar "
+        "**RecordTypeId** e o Salesforce usa um tipo que o usuário já tenha como padrão (confira depois no registro)."
+    )
+
+
+def _html_erro_salesforce_multilinha(msg: Any) -> str:
+    """Escape HTML e preserva quebras para _alert_vermelho_html."""
+    return html.escape(str(msg)).replace("\n", "<br/>")
+
+
 # =============================================================================
 # INTEGRADO: corretor_campos
 # =============================================================================
+# Opcional: Id do Record Type Contact (URL Setup → Object Manager → Contact → Record Types → …/012…/view).
+# Só é usado se [salesforce] RECORD_TYPE_ID estiver vazio. Ex. de org: 012f1000000n6nNAAQ.
+# INVALID_CROSS_REFERENCE_KEY em RecordTypeId com Id 012 válido → veja _explicacao_erro_record_type_se_aplicavel (perfil).
 RECORD_TYPE_CORRETOR = ""
 
 _SF_ID_15_18 = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
@@ -151,6 +183,8 @@ SF_OMIT_INSERT = frozenset(
         "ErroIntegracaoUAU__c",
         "RetornoIntegracaoPessoa__c",
         "Data_Descredenciamento__c",
+        # Evita falha de picklist restrita em orgs onde "Indicação" não existe para Origem__c.
+        "Origem__c",
     }
 )
 
@@ -1208,6 +1242,9 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                 if s == "Riva":
                     extras_obs.append("Rede de atuação informada: Riva")
                 continue
+            if key == "origem" and s == "Indicação":
+                # Compatibilidade com orgs que não possuem "Indicação" na picklist restrita.
+                s = "RH"
             if s:
                 payload[sf] = s
             continue
@@ -1329,6 +1366,42 @@ def _norm_cabecalho_planilha(s: str) -> str:
     return " ".join((s or "").strip().split()).casefold()
 
 
+def _strip_valor_celula_planilha(val: Any) -> str:
+    """Remove espaços invisíveis (NBSP etc.) e bordas — comum em cópias do Excel/Sheets."""
+    if val is None:
+        return ""
+    s = str(val).replace("\u00a0", " ").replace("\u2007", " ").replace("\u202f", " ")
+    return s.strip()
+
+
+def _indice_coluna_planilha_para_campo(
+    hmap: Dict[str, int], headers: List[str], label_campo: str
+) -> Optional[int]:
+    """
+    Índice da coluna cujo cabeçalho casa com o rótulo do campo.
+    Aceita cabeçalho com ou sem o sufixo « *» usado nos rótulos obrigatórios do app.
+    """
+    lab = (label_campo or "").strip()
+    candidatos: List[str] = []
+    candidatos.append(_norm_cabecalho_planilha(lab))
+    if lab.endswith(" *"):
+        candidatos.append(_norm_cabecalho_planilha(lab[:-2].strip()))
+    for cand in candidatos:
+        if cand in hmap:
+            return hmap[cand]
+    for i, h in enumerate(headers):
+        hs = (h or "").strip()
+        if not hs:
+            continue
+        if hs == lab:
+            return i
+        if lab.endswith(" *") and hs == lab[:-2].strip():
+            return i
+        if _norm_cabecalho_planilha(hs) in candidatos:
+            return i
+    return None
+
+
 def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[str, Any]:
     """
     Converte uma linha da aba Corretores (valores alinhados aos cabeçalhos) em dict de chaves do formulário.
@@ -1344,37 +1417,34 @@ def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[s
         cells = list(cells) + [""] * (len(headers) - len(cells))
     dados: Dict[str, Any] = {}
     for c in CAMPOS:
-        lab = _norm_cabecalho_planilha(c["label"])
-        idx = hmap.get(lab)
-        if idx is None:
-            for i, h in enumerate(headers):
-                if (h or "").strip() == c["label"]:
-                    idx = i
-                    break
+        idx = _indice_coluna_planilha_para_campo(hmap, headers, c["label"])
         raw = ""
         if idx is not None and idx < len(cells):
-            raw = cells[idx]
+            raw = _strip_valor_celula_planilha(cells[idx])
         tipo = c["tipo"]
         if tipo == "multiselect":
-            if not (raw or "").strip():
+            if not raw:
                 dados[c["key"]] = []
             else:
-                partes = [p.strip() for p in re.split(r"[;\n]", str(raw)) if p.strip()]
+                partes = [
+                    _strip_valor_celula_planilha(p)
+                    for p in re.split(r"[;\n]", raw)
+                    if _strip_valor_celula_planilha(p)
+                ]
                 dados[c["key"]] = partes
         elif tipo == "number":
-            s = (str(raw).strip() if raw is not None else "")
-            if not s:
+            if not raw:
                 dados[c["key"]] = None
             else:
                 try:
-                    dados[c["key"]] = float(s.replace(",", "."))
+                    dados[c["key"]] = float(raw.replace(",", "."))
                 except ValueError:
                     dados[c["key"]] = None
         elif tipo == "checkbox":
-            v = (str(raw).strip().lower() if raw is not None else "")
+            v = raw.lower()
             dados[c["key"]] = v in ("true", "1", "sim", "yes", "verdadeiro", "x")
         else:
-            dados[c["key"]] = (str(raw).strip() if raw is not None else "") or ""
+            dados[c["key"]] = raw or ""
     return dados
 
 
@@ -1497,8 +1567,15 @@ def _executar_teste_criar_sf_de_linha_planilha(
                 atualizar_status_envio_salesforce(sid, wname, creds, row_num_atualizar, "Sucesso", "", link)
             else:
                 atualizar_status_envio_salesforce(
-                    sid, wname, creds, row_num_atualizar, "Erro",
-                    str(err)[:49000] if err else "Erro desconhecido", "",
+                    sid,
+                    wname,
+                    creds,
+                    row_num_atualizar,
+                    "Erro",
+                    (_explicacao_erro_record_type_se_aplicavel(err))[:49000]
+                    if err
+                    else "Erro desconhecido",
+                    "",
                 )
         except Exception as ex:
             avisos.append(f"Planilha (status): {ex}")
@@ -1520,7 +1597,8 @@ def _executar_teste_criar_sf_de_linha_planilha(
             f'<a href="{url_esc}" target="_blank" rel="noopener">Abrir no Salesforce</a>'
             f"{av_txt}"
         )
-    return False, f"<strong>Erro Salesforce:</strong> {html.escape(str(err) if err else 'desconhecido')}{av_txt}"
+    err_txt = _explicacao_erro_record_type_se_aplicavel(err) if err else "desconhecido"
+    return False, f"<strong>Erro Salesforce:</strong> {_html_erro_salesforce_multilinha(err_txt)}{av_txt}"
 
 
 def _render_sidebar_teste_planilha_sf() -> None:
@@ -1701,10 +1779,10 @@ DEFAULT_COL_NOME_CONTA = "Nome da Conta"
 
 # --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
 # Altere aqui no código; deixe ATIVO = False em produção.
-FICHA_TEST_PLANILHA_ATIVO = True
+FICHA_TEST_PLANILHA_ATIVO = False
 # Se não vazio, o painel de teste lê esta planilha/aba (ignora SPREADSHEET_ID/WORKSHEET_NAME dos Secrets).
-FICHA_TEST_PLANILHA_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
-FICHA_TEST_PLANILHA_WORKSHEET_NAME = "Corretores"
+FICHA_TEST_PLANILHA_SPREADSHEET_ID = ""
+FICHA_TEST_PLANILHA_WORKSHEET_NAME = ""
 
 
 def _ids_planilha_modo_teste(gs: Dict[str, Any]) -> Tuple[str, str]:
@@ -2848,6 +2926,24 @@ def _coletar_dados_formulario_completo() -> dict[str, Any]:
     return out
 
 
+def _snapshot_mesclar_todos_fld_do_session_state() -> None:
+    """
+    Copia todo `fld_*` ainda presente no session_state para `ficha_snap_campos`.
+    Necessário no «Enviar»: a última etapa acabou de dar submit no form; outras chaves
+    podem já ter sido removidas pelo Streamlit quando o widget desmontou — essas ficam só no snapshot
+    das etapas anteriores (já mesclado antes de apagar).
+    """
+    ss = st.session_state
+    snap = dict(ss.get("ficha_snap_campos") or {})
+    for c in CAMPOS:
+        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            continue
+        sk = f"fld_{c['key']}"
+        if sk in ss:
+            snap[c["key"]] = ss[sk]
+    ss["ficha_snap_campos"] = snap
+
+
 def _snapshot_persistir_secao_atual(sec: str) -> None:
     """Grava no snapshot os campos visíveis da etapa atual (chamar após validar «Avançar»)."""
     ss = st.session_state
@@ -2858,6 +2954,11 @@ def _snapshot_persistir_secao_atual(sec: str) -> None:
         sk = f"fld_{k}"
         if sk in ss:
             snap[k] = ss[sk]
+    # Renderizados fora do st.form: garantir cópia explícita no «Avançar» (mesmo critério do loop).
+    if sec == "Informações para contato" and "fld_unidade_negocio" in ss:
+        snap["unidade_negocio"] = ss["fld_unidade_negocio"]
+    if sec == "CRECI/TTI" and "fld_possui_creci" in ss:
+        snap["possui_creci"] = ss["fld_possui_creci"]
     ss["ficha_snap_campos"] = snap
 
 
@@ -2892,7 +2993,7 @@ def _init_defaults():
             str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
         )
     if "fld_origem" not in st.session_state:
-        st.session_state["fld_origem"] = str(fd.get("origem", "Indicação")).strip() or "Indicação"
+        st.session_state["fld_origem"] = str(fd.get("origem", "RH")).strip() or "RH"
     if "fld_account_id" not in st.session_state:
         st.session_state["fld_account_id"] = str(fd.get("account_id", "")).strip()
     if "fld_owner_id" not in st.session_state:
@@ -3650,6 +3751,7 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                     ss["ficha_erros_secao_idx"] = idx
                     st.rerun()
                 _snapshot_persistir_secao_atual(sec)
+                _snapshot_mesclar_todos_fld_do_session_state()
                 ss.pop("ficha_erros_secao", None)
                 ss.pop("ficha_erros_secao_idx", None)
                 ss["ficha_secao_idx"] = idx + 1
@@ -3771,6 +3873,8 @@ def _processar_envio_cadastro() -> None:
     idx_env = max(0, min(int(ss.get("ficha_secao_idx", 0)), len(secoes_env) - 1))
     if secoes_env:
         _snapshot_persistir_secao_atual(secoes_env[idx_env])
+    # Última etapa: valores do form acabam de entrar no session_state; etapas antigas já no snap.
+    _snapshot_mesclar_todos_fld_do_session_state()
     dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario_completo())
     erros = validar_obrigatorios(dados)
     if not ss.get("fld_lgpd_ficha"):
@@ -3864,8 +3968,9 @@ def _processar_envio_cadastro() -> None:
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
     else:
-        atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Erro", str(err)[:49000], "")
-        ss["sf_erro"] = str(err) if err else "Erro desconhecido ao criar contato."
+        err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Erro", err_full[:49000], "")
+        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
     ss["sf_avisos"] = avisos
     _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
@@ -3875,23 +3980,15 @@ def _processar_envio_cadastro() -> None:
 
 @st.dialog("Obrigado — você faz parte da nossa operação", width="medium")
 def _dialog_recursos_pos_cadastro() -> None:
-    """Popup ao concluir o cadastro: PDF, e-mail, mapa, vídeo e links úteis."""
+    """Popup ao concluir o cadastro: mapa, vídeo e links úteis."""
     ss = st.session_state
-    dados_sf = dict(ss.get("ficha_dados_enviados") or {})
-    pdf_bytes: bytes | None = None
-    try:
-        pdf_bytes = gerar_pdf_ficha(dados_sf)
-    except ImportError as e:
-        st.caption(str(e))
-    except Exception as e:
-        st.caption(f"Não foi possível gerar o PDF: {e}")
 
     st.markdown(
         """
 **Recebemos o seu cadastro com sucesso.** Você deve ter recebido **automaticamente** no seu e-mail do cadastro
 uma mensagem com **apresentação da Direcional**, **links de materiais de vendas** e, quando possível, o **PDF da ficha** em anexo.
 
-Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador, **links** úteis, **download do PDF** e opção de **reenviar** o PDF para outro e-mail.
+Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador e **links** úteis.
         """.strip()
     )
     st.markdown("##### Empreendimentos no mapa")
@@ -3945,41 +4042,6 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador, **links** �
         URL_WHATSAPP_EQUIPE,
         use_container_width=True,
     )
-
-    st.markdown("##### Sua cópia em PDF")
-    if pdf_bytes is not None:
-        st.download_button(
-            label="Baixar PDF",
-            data=pdf_bytes,
-            file_name=f"ficha_cadastral_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-            mime="application/pdf",
-            type="primary",
-            use_container_width=True,
-            key="ficha_popup_dl_pdf",
-        )
-    else:
-        st.caption("Instale **reportlab** para gerar o PDF.")
-
-    st.markdown("##### Reenviar PDF por e-mail (opcional)")
-    st.caption(
-        "O PDF com resumo da ficha já foi enviado ao **e-mail do cadastro** (se o servidor de e-mail estiver configurado). "
-        "Use abaixo para encaminhar uma cópia a outro endereço."
-    )
-    mail_extra = st.text_input(
-        "Outro e-mail (opcional)",
-        placeholder="seu@email.com",
-        key="fc_mail_extra_popup",
-        label_visibility="visible",
-    )
-    if st.button("Reenviar PDF por e-mail", use_container_width=True, key="ficha_popup_enviar_email"):
-        if pdf_bytes is None:
-            _alert_vermelho("PDF indisponível.")
-        else:
-            ok, msg = enviar_email_pdf(pdf_bytes, dados_sf, mail_extra)
-            if ok:
-                _alert_azul(msg)
-            else:
-                _alert_vermelho(msg)
 
     st.markdown("")
     if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_dialog_recursos_fechar"):
@@ -4038,7 +4100,7 @@ def main():
             )
         elif err_sf:
             _alert_vermelho_html(
-                f"<strong>Detalhe:</strong> {html.escape(str(err_sf))}"
+                f"<strong>Detalhe:</strong> {_html_erro_salesforce_multilinha(err_sf)}"
             )
 
         avisos = ss.get("sf_avisos") or []
@@ -4061,7 +4123,7 @@ def main():
             )
 
         st.caption(
-            "No popup: mapa, vídeo e **reenvio opcional** do PDF. O **e-mail principal** (com apresentação, links e PDF) "
+            "No popup: mapa, vídeo e links úteis. O **e-mail principal** (com apresentação, links e PDF) "
             "já foi disparado para o e-mail do formulário ao concluir o envio."
         )
 
