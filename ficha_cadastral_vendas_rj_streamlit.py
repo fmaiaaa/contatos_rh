@@ -25,6 +25,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 import streamlit as st
 
 _DIR_APP = Path(__file__).resolve().parent
@@ -185,8 +186,6 @@ SF_OMIT_INSERT = frozenset(
         "Data_Descredenciamento__c",
         # Evita falha de picklist restrita em orgs onde "Indicação" não existe para Origem__c.
         "Origem__c",
-        # Evita DUPLICATE_VALUE em orgs com restrição de unicidade no apelido.
-        "Apelido__c",
     }
 )
 
@@ -468,7 +467,17 @@ def _campos_def() -> List[Campo]:
             sf=None,
             opcoes=list(NOMES_CONTA_FIXOS),
             req=True,
-            help="Opções: coluna «Nome da Conta» na aba «Gerentes» da planilha Google ([google_sheets]); senão [ficha_defaults].",
+            help="Opções: coluna «Nome da Conta» na aba «Gerentes» da planilha Google ([google_sheets]); senão [ficha_defaults]. Se não souber, marque abaixo e selecione qualquer opção.",
+        ),
+        _z(
+            key="account_name_nao_sei",
+            label="Não sei o nome da conta?",
+            sec="Informações para contato",
+            tipo="select",
+            sf=None,
+            opcoes=["--Nenhum--", "Não", "Sim"],
+            req=False,
+            help="Quando não souber, marque Sim e selecione qualquer conta no campo acima.",
         ),
         _z(
             key="account_id",
@@ -618,7 +627,6 @@ def _campos_def() -> List[Campo]:
             req=True,
         ),
         _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
-        _z(key="pis", label="PIS", sec="Dados Pessoais", tipo="text", sf="PIS__c", req=False),
         _z(
             key="nacionalidade",
             label="Nacionalidade *",
@@ -629,15 +637,6 @@ def _campos_def() -> List[Campo]:
             req=True,
         ),
         _z(
-            key="naturalidade",
-            label="Naturalidade *",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf="Naturalidade__c",
-            req=True,
-        ),
-        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
-        _z(
             key="uf_naturalidade",
             label="UF Naturalidade *",
             sec="Dados Pessoais",
@@ -646,6 +645,17 @@ def _campos_def() -> List[Campo]:
             opcoes=ESTADOS_UF,
             req=True,
         ),
+        _z(
+            key="naturalidade",
+            label="Naturalidade *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="Naturalidade__c",
+            opcoes=["--Nenhum--"],
+            req=True,
+            help="Municípios oficiais do IBGE para a UF selecionada acima (nome exato para integração).",
+        ),
+        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
         _z(
             key="uf_rg",
             label="UF RG *",
@@ -682,14 +692,6 @@ def _campos_def() -> List[Campo]:
             req=False,
         ),
         _z(
-            key="usuario_uau",
-            label="Usuário UAU",
-            sec="Dados de Usuário",
-            tipo="text",
-            sf="Usu_rio_UAU__c",
-            req=False,
-        ),
-        _z(
             key="multiplicador_regime",
             label="Multiplicador de Regime",
             sec="Dados de Usuário",
@@ -700,7 +702,15 @@ def _campos_def() -> List[Campo]:
         # ——— Dados para Contato ———
         _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
         _z(key="mobile", label="Celular *", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=True),
-        _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
+        _z(
+            key="email",
+            label="E-mail *",
+            sec="Dados para Contato",
+            tipo="text",
+            sf="Email",
+            req=True,
+            help='Use e-mail corporativo no formato: "nomesobrenome.direcionalvendas@gmail.com".',
+        ),
         # ——— Dados Familiares ———
         _z(
             key="nome_pai",
@@ -807,7 +817,6 @@ def _campos_def() -> List[Campo]:
             req=False,
             help="Formato: 31/12/2024",
         ),
-        _z(key="tti", label="TTI", sec="CRECI/TTI", tipo="text", sf="TTI__c", req=False),
         _z(
             key="status_creci",
             label="Status CRECI",
@@ -1046,6 +1055,15 @@ def _erros_preenchimento_creci_se_sim(dados: Dict[str, Any]) -> List[str]:
     return er
 
 
+def _erros_conjuge_se_casado(dados: Dict[str, Any]) -> List[str]:
+    """Se estado civil for Casado, exige nome do cônjuge."""
+    if _norm_picklist(dados.get("estado_civil")) != "Casado":
+        return []
+    if not (str(dados.get("nome_conjuge") or "").strip()):
+        return ["Nome do Cônjuge *"]
+    return []
+
+
 def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
     if val is None:
         return None
@@ -1097,6 +1115,7 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     if em and not email_contato_formato_valido(em):
         erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
     erros.extend(_erros_preenchimento_creci_se_sim(dados))
+    erros.extend(_erros_conjuge_se_casado(dados))
     return list(dict.fromkeys(erros))
 
 
@@ -1146,6 +1165,8 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         em = (dados.get("email") or "").strip()
         if em and not email_contato_formato_valido(em):
             erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+    if sec == "Dados Pessoais":
+        erros.extend(_erros_conjuge_se_casado(dados))
     if sec == "CRECI/TTI":
         erros.extend(_erros_preenchimento_creci_se_sim(dados))
     return list(dict.fromkeys(erros))
@@ -1159,6 +1180,98 @@ def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> No
     partes = nc.split(None, 1)
     payload["FirstName"] = partes[0][:40]
     payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
+
+
+def _soql_escape(s: str) -> str:
+    """Escape mínimo para string literal em SOQL."""
+    return (s or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _resolver_account_id_por_nome(sf: Any, nome_conta: str) -> Optional[str]:
+    """
+    Resolve AccountId a partir do nome exato da conta.
+    Retorna None quando não encontra ou em erro.
+    """
+    nome = (nome_conta or "").strip()
+    if not nome:
+        return None
+    try:
+        q = (
+            "SELECT Id FROM Account "
+            f"WHERE Name = '{_soql_escape(nome)}' "
+            "ORDER BY LastModifiedDate DESC LIMIT 1"
+        )
+        res = sf.query(q)
+        recs = (res or {}).get("records") or []
+        if recs:
+            rid = (recs[0].get("Id") or "").strip()
+            return rid or None
+    except Exception:
+        return None
+    return None
+
+
+def _proximo_apelido_disponivel(sf: Any, primeiro_nome: str) -> Optional[str]:
+    """
+    Gera apelido incremental: <primeiro>_RJ01, _RJ02, ... com base nos contatos existentes.
+    """
+    base = (primeiro_nome or "").strip()
+    if not base:
+        return None
+    base_sf = _soql_escape(base)
+    try:
+        q = (
+            "SELECT Apelido__c FROM Contact "
+            f"WHERE Apelido__c LIKE '{base_sf}_RJ%' "
+            "ORDER BY LastModifiedDate DESC LIMIT 200"
+        )
+        res = sf.query(q)
+        recs = (res or {}).get("records") or []
+    except Exception:
+        # Fallback seguro se a consulta falhar por qualquer motivo.
+        return f"{base}_RJ01"
+
+    max_n = 0
+    pat = re.compile(rf"^{re.escape(base)}_RJ(\d+)$", re.IGNORECASE)
+    for r in recs:
+        a = str((r or {}).get("Apelido__c") or "").strip()
+        m = pat.match(a)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n > max_n:
+            max_n = n
+    prox = max_n + 1
+    return f"{base}_RJ{prox:02d}"
+
+
+def _aplicar_enriquecimentos_payload_sf(
+    payload: Dict[str, Any], dados: Dict[str, Any], sf: Any, avisos: List[str]
+) -> None:
+    """
+    Ajustes finais dependentes do org:
+    - Origem sempre RH
+    - resolve AccountId por Nome da conta quando não veio ID
+    - gera Apelido__c incremental
+    """
+    payload["Origem__c"] = "RH"
+
+    if not (payload.get("AccountId") or "").strip():
+        aid = _resolver_account_id_por_nome(sf, str(dados.get("account_name") or ""))
+        if aid:
+            payload["AccountId"] = aid
+        else:
+            nconta = (str(dados.get("account_name") or "").strip())
+            if nconta:
+                avisos.append(f"Nome da conta não localizado no Salesforce: {nconta}")
+
+    primeiro = (payload.get("FirstName") or "").strip()
+    apel = _proximo_apelido_disponivel(sf, primeiro)
+    if apel:
+        payload["Apelido__c"] = apel
 
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -1231,22 +1344,20 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         if tipo == "select":
             s = _norm_picklist(raw)
             if key == "unidade_negocio":
-                smap = {
-                    "Direcional": "Direcional",
-                    "Riva": "Direcional",
-                    UNIDADE_REDE_OUTRA_IMOBILIARIA: "Parceiros (Externo)",
-                }
-                s2 = smap.get(s)
-                if s2:
-                    payload[sf] = s2
-                elif s:
+                if s:
                     payload[sf] = s
                 if s == "Riva":
                     extras_obs.append("Rede de atuação informada: Riva")
                 continue
-            if key == "origem" and s == "Indicação":
-                # Compatibilidade com orgs que não possuem "Indicação" na picklist restrita.
+            if key == "origem":
+                # Regra de negócio: origem sempre RH.
                 s = "RH"
+            if key == "tipo_conta":
+                s_norm = s.lower()
+                if s_norm in ("poupanca", "poupança"):
+                    s = "Poupança"
+                elif s_norm == "corrente":
+                    s = "Corrente"
             if s:
                 payload[sf] = s
             continue
@@ -1280,14 +1391,15 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     apelido e datas automáticos.
     """
     out = dict(dados)
+
     rede = _norm_picklist(out.get("unidade_negocio"))
 
     if rede == UNIDADE_REDE_OUTRA_IMOBILIARIA:
         out["atividade"] = "Corretor Parceiro"
-        out["origem"] = "RH"
     else:
         act = _norm_picklist(out.get("atividade"))
         out["atividade"] = act if act else "Corretor"
+    out["origem"] = "RH"
 
     if rede in ("Direcional", "Riva"):
         out["tipo_corretor"] = "Direcional Vendas – Autônomos"
@@ -1560,6 +1672,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
                 pass
         return False, "Falha ao conectar ao Salesforce (credenciais ou rede)."
 
+    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
     cid, err = criar_contato_payload(sf, payload)
     link = _url_contact(cid) if cid else ""
 
@@ -2825,6 +2938,30 @@ def _opcoes_nome_conta() -> list[str]:
     return list(NOMES_CONTA_FIXOS)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _municipios_ibge_por_uf(uf: str) -> Tuple[str, ...]:
+    """
+    Nomes oficiais dos municípios (IBGE) para a sigla da UF.
+    Cache de 24h para não sobrecarregar a API.
+    """
+    u = (uf or "").strip().upper()
+    if not u or u == "--NENHUM--" or len(u) != 2:
+        return tuple()
+    try:
+        r = requests.get(
+            f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{u}/municipios",
+            timeout=45,
+        )
+        r.raise_for_status()
+        data = r.json()
+        nomes = sorted(
+            {str(m.get("nome", "")).strip() for m in data if isinstance(m, dict) and m.get("nome")}
+        )
+        return tuple(nomes)
+    except Exception:
+        return tuple()
+
+
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
     """Se o rótulo termina com ' *', devolve texto sem o asterisco e True."""
     s = (label or "").rstrip()
@@ -2877,6 +3014,23 @@ def _widget_campo(c: dict):
                 opts = list(NOMES_CONTA_FIXOS)
         elif k == "atividade":
             opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
+        elif k == "naturalidade":
+            uf_sel = _norm_picklist(st.session_state.get("fld_uf_naturalidade"))
+            if uf_sel:
+                mun = _municipios_ibge_por_uf(uf_sel)
+                if mun:
+                    opts = ["--Nenhum--"] + list(mun)
+                else:
+                    opts = ["--Nenhum--"]
+                    help_txt = (
+                        (help_txt or "")
+                        + " Não foi possível carregar municípios do IBGE; verifique a conexão."
+                    ).strip()
+            else:
+                opts = ["--Nenhum--"]
+                help_txt = (
+                    (help_txt or "") + " Selecione primeiro **UF Naturalidade**."
+                ).strip()
         if k == "possui_creci":
             opts = ["Sim", "Não"]
             return st.selectbox(
@@ -3957,6 +4111,7 @@ def _processar_envio_cadastro() -> None:
         st.rerun()
         return
 
+    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
     cid, err = criar_contato_payload(sf, payload)
     link = _url_contact(cid) if cid else ""
 
@@ -4088,14 +4243,7 @@ def main():
             )
         else:
             _alert_azul("**Recebemos o seu cadastro.** Confira os detalhes abaixo.")
-        if cid:
-            url_reg = html.escape(_url_contact(cid))
-            st.markdown(
-                f'<div class="ficha-alert ficha-alert--azul"><strong>Seu registro:</strong> '
-                f'<a href="{url_reg}" target="_blank" rel="noopener">Abrir cadastro</a></div>',
-                unsafe_allow_html=True,
-            )
-        elif err_sf:
+        if err_sf:
             _alert_vermelho_html(
                 f"<strong>Detalhe:</strong> {_html_erro_salesforce_multilinha(err_sf)}"
             )
