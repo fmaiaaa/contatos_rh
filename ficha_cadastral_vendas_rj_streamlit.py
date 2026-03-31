@@ -160,17 +160,17 @@ def record_type_id_contato_payload() -> str:
     rid, _ = record_type_id_contato_payload_e_aviso()
     return rid
 
-# Ordem das seções no Salesforce (não alterar sem checar o layout no org)
+# Ordem de navegação no Streamlit (não altera mapeamento de campos para Salesforce)
 SEC_ORDER: Tuple[str, ...] = (
-    "Informações para contato",
     "Dados Pessoais",
-    "Dados de Usuário",
     "Dados para Contato",
     "Dados Familiares",
     "Dados Bancários Pessoa Física",
+    "Informações para contato",
     "CRECI/TTI",
-    "Dados Integração",
     "Preferência de contato",
+    "Dados de Usuário",
+    "Dados Integração",
 )
 
 SF_OMIT_INSERT = frozenset(
@@ -4150,10 +4150,7 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador e **links** 
     try:
         from empreendimentos_mapa import render_mapa_empreendimentos_streamlit
 
-        render_mapa_empreendimentos_streamlit(
-            altura_px=POPUP_MAPA_ALTURA_PX,
-            streamlit_key="mapa_empreendimentos_folium_popup_v3",
-        )
+        render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
     except Exception as e:
         st.caption(f"Mapa indisponível: {e}")
     st.markdown("##### Como usar o simulador")
