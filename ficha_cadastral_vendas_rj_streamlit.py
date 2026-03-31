@@ -185,6 +185,8 @@ SF_OMIT_INSERT = frozenset(
         "Data_Descredenciamento__c",
         # Evita falha de picklist restrita em orgs onde "Indicação" não existe para Origem__c.
         "Origem__c",
+        # Evita DUPLICATE_VALUE em orgs com restrição de unicidade no apelido.
+        "Apelido__c",
     }
 )
 
@@ -697,7 +699,7 @@ def _campos_def() -> List[Campo]:
         ),
         # ——— Dados para Contato ———
         _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
-        _z(key="mobile", label="Celular", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=False),
+        _z(key="mobile", label="Celular *", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=True),
         _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
         # ——— Dados Familiares ———
         _z(
@@ -3015,11 +3017,6 @@ def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> 
         if len(mt) >= 10:
             payload["MobilePhone"] = mt[:11]
             return avisos
-    payload["MobilePhone"] = "21999999999"
-    avisos.append(
-        "Sugerimos informar seu **celular com DDD** ou uma chave PIX em **Telefone** "
-        "para facilitarmos o seu contato."
-    )
     return avisos
 
 
@@ -4141,7 +4138,7 @@ def main():
             st.rerun()
 
         st.markdown(
-            '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro</div>',
+            '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
             unsafe_allow_html=True,
         )
         return
