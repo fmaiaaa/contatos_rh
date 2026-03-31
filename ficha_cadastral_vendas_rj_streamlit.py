@@ -3837,19 +3837,22 @@ def _render_secao_formulario(secoes: list[str]) -> None:
         else:
             cols = campos_por_secao_visiveis(sec, dados_sec)
 
-        mid = (len(cols) + 1) // 2
         # st.form: ao usar «Avançar» / «Enviar», todos os valores da etapa são gravados de uma vez
         # (evita depender de Enter ou blur em text_input/select).
         form_key = f"ficha_etapa_{idx}"
         with st.form(form_key, clear_on_submit=False, border=False):
-            if len(cols) <= 3:
-                for c in cols:
-                    _widget_campo(c)
-            else:
+            # Grid 2 colunas: pares lado a lado; quando ímpar, o último ocupa largura total.
+            for i in range(0, len(cols), 2):
+                c1 = cols[i]
+                c2 = cols[i + 1] if i + 1 < len(cols) else None
+                if c2 is None:
+                    _widget_campo(c1)
+                    continue
                 left, right = st.columns(2)
-                for i, c in enumerate(cols):
-                    with left if i < mid else right:
-                        _widget_campo(c)
+                with left:
+                    _widget_campo(c1)
+                with right:
+                    _widget_campo(c2)
 
             st.markdown("<br/>", unsafe_allow_html=True)
             if idx < n - 1:
