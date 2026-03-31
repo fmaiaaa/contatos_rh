@@ -500,7 +500,7 @@ def _campos_def() -> List[Campo]:
         _z(
             key="nome_completo",
             label="Nome completo *",
-            sec="Informações para contato",
+            sec="Dados Pessoais",
             tipo="text",
             sf=None,
             req=True,
@@ -1123,7 +1123,7 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     """
     Valida apenas campos obrigatórios da seção atual (para bloquear «Avançar» no formulário por etapas).
     Replica a lógica de `validar_obrigatorios` para `c['sec'] == sec` e, na seção
-    «Informações para contato», as regras de conta + nome/sobrenome.
+    «Informações para contato», as regras de conta.
     """
     erros: List[str] = []
     for c in CAMPOS:
@@ -1158,9 +1158,6 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
                 "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
                 "(ou selecione Nome da conta)."
             )
-        nc = (dados.get("nome_completo") or "").strip()
-        if not nc:
-            erros.append("Nome completo *")
     if sec == "Dados para Contato":
         em = (dados.get("email") or "").strip()
         if em and not email_contato_formato_valido(em):
@@ -2970,6 +2967,23 @@ def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
     return label, False
 
 
+def _coerce_date_widget_value(val: Any) -> Optional[date]:
+    """Converte valor do session_state para `date` compatível com st.date_input."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    iso = parse_data_br(val)
+    if not iso:
+        return None
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
 def _widget_campo(c: dict):
     k = c["key"]
     sk = f"fld_{k}"
@@ -2994,9 +3008,10 @@ def _widget_campo(c: dict):
     if tipo == "textarea":
         return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
     if tipo == "date":
-        return st.text_input(
-            widget_label, key=sk, placeholder="31/12/2024", help=help_txt, label_visibility=lv
-        )
+        atual = _coerce_date_widget_value(st.session_state.get(sk))
+        if sk in st.session_state:
+            st.session_state[sk] = atual
+        return st.date_input(widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv)
     if tipo == "number":
         return st.text_input(
             widget_label,
