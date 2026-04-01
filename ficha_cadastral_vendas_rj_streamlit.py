@@ -757,7 +757,10 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Email",
             req=True,
-            help='Use e-mail corporativo no formato: "nomesobrenome.direcionalvendas@gmail.com".',
+            help=(
+                "E-mail corporativo Direcional Vendas RJ: nomesobrenome.direcionalvendas@gmail.com "
+                "(não é o mesmo campo dos dados do PIX)."
+            ),
         ),
         # ——— Dados Familiares ———
         _z(
@@ -1252,7 +1255,9 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
         erros.append("Nome completo *")
     em = (dados.get("email") or "").strip()
     if em and not email_contato_formato_valido(em):
-        erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+        erros.append(
+            "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
+        )
     erros.extend(_erros_preenchimento_creci_se_sim(dados))
     erros.extend(_erros_conjuge_se_casado(dados))
     cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
@@ -1310,7 +1315,9 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     if sec == "Dados para Contato":
         em = (dados.get("email") or "").strip()
         if em and not email_contato_formato_valido(em):
-            erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
+            erros.append(
+                "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
+            )
     if sec == "Dados Pessoais":
         erros.extend(_erros_conjuge_se_casado(dados))
         cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
@@ -3810,6 +3817,16 @@ def _widget_campo(c: dict):
                 or "Definida pela UF Naturalidade (capital do estado).",
                 label_visibility=lv,
                 disabled=bool(cap),
+            )
+        if k == "email":
+            st.markdown(
+                '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:13px;'
+                'color:#64748b;line-height:1.5;">'
+                "Use o <strong>e-mail corporativo</strong> Direcional Vendas RJ: "
+                '<code style="background:#f1f5f9;padding:2px 7px;border-radius:6px;font-size:12px;">'
+                "nomesobrenome.direcionalvendas@gmail.com</code>"
+                " — não confunda com o campo <strong>Dados para PIX</strong> (quando o PIX for e-mail).</p>",
+                unsafe_allow_html=True,
             )
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "textarea":
