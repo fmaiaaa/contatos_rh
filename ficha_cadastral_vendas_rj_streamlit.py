@@ -280,6 +280,7 @@ ESTADOS_UF = [
     "MS",
     "MT",
     "PA",
+    "PB",
     "PE",
     "PI",
     "PR",
@@ -293,6 +294,45 @@ ESTADOS_UF = [
     "SP",
     "TO",
 ]
+
+# Capitais dos estados (IBGE) — naturalidade segue automaticamente a UF Naturalidade.
+CAPITAL_POR_UF_BR: Dict[str, str] = {
+    "AC": "Rio Branco",
+    "AL": "Maceió",
+    "AM": "Manaus",
+    "AP": "Macapá",
+    "BA": "Salvador",
+    "CE": "Fortaleza",
+    "DF": "Brasília",
+    "ES": "Vitória",
+    "GO": "Goiânia",
+    "MA": "São Luís",
+    "MG": "Belo Horizonte",
+    "MS": "Campo Grande",
+    "MT": "Cuiabá",
+    "PA": "Belém",
+    "PB": "João Pessoa",
+    "PE": "Recife",
+    "PI": "Teresina",
+    "PR": "Curitiba",
+    "RJ": "Rio de Janeiro",
+    "RN": "Natal",
+    "RO": "Porto Velho",
+    "RR": "Boa Vista",
+    "RS": "Porto Alegre",
+    "SC": "Florianópolis",
+    "SE": "Aracaju",
+    "SP": "São Paulo",
+    "TO": "Palmas",
+}
+
+
+def _naturalidade_capital_por_uf(uf: Any) -> str:
+    s = (str(uf).strip() if uf is not None else "") or ""
+    if s in ("", "--Nenhum--", "Nenhum"):
+        return ""
+    return CAPITAL_POR_UF_BR.get(s, "")
+
 
 POSSUI_FILHOS = ["--Nenhum--", "Sim", "Não"]
 
@@ -661,7 +701,7 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Naturalidade__c",
             req=True,
-            help="Cidade de nascimento (livre). Use o nome completo do município, alinhado à UF acima.",
+            help="Preenchida automaticamente com a capital do estado escolhido em UF Naturalidade.",
         ),
         _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
         _z(
@@ -1645,6 +1685,11 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
         for k in CAMPOS_CRECI_DETALHES:
             if k in out:
                 del out[k]
+
+    ufn = _norm_picklist(out.get("uf_naturalidade"))
+    cap = _naturalidade_capital_por_uf(ufn)
+    if cap:
+        out["naturalidade"] = cap
     return out
 
 
@@ -2182,6 +2227,55 @@ def _drive_parent_id_identidade(st_secrets: Any) -> str:
     return DRIVE_IDENTIDADE_PASTA_RAIZ_ID
 
 
+def _drive_email_dono_apos_upload(st_secrets: Any) -> str:
+    """
+    E-mail para o qual a API tenta transferir a propriedade do arquivo após o upload
+    (conta de serviço não tem cota; dono passa a ser você / Workspace).
+    Secrets [google_drive]: TRANSFER_OWNERSHIP_TO_EMAIL ou FILE_OWNER_EMAIL ou OWNER_EMAIL.
+    """
+    try:
+        if st_secrets and hasattr(st_secrets, "get"):
+            gd = st_secrets.get("google_drive")
+            if isinstance(gd, dict):
+                for key in (
+                    "TRANSFER_OWNERSHIP_TO_EMAIL",
+                    "transfer_ownership_to_email",
+                    "FILE_OWNER_EMAIL",
+                    "file_owner_email",
+                    "OWNER_EMAIL",
+                    "owner_email",
+                ):
+                    v = str(gd.get(key) or "").strip()
+                    if v:
+                        return v
+    except Exception:
+        pass
+    return ""
+
+
+def _drive_transferir_propriedade_arquivo(
+    service: Any, file_id: str, email: str
+) -> Optional[str]:
+    """
+    Tenta `permissions.create` com transferOwnership (Drive v3).
+    Retorna None se OK; senão mensagem de erro para exibir ao usuário.
+    """
+    em = (email or "").strip()
+    if not em or not file_id:
+        return None
+    try:
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "user", "role": "owner", "emailAddress": em},
+            transferOwnership=True,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        return None
+    except Exception as e:
+        return str(e)
+
+
 def _drive_escapar_nome_query(nome: str) -> str:
     return (nome or "").replace("\\", "\\\\").replace("'", "\\'")
 
@@ -2244,10 +2338,14 @@ def upload_identidade_google_drive(
     parent_folder_id: str,
     uploaded: Any,
     dados: Dict[str, Any],
+    *,
+    transferir_propriedade_para_email: str = "",
 ) -> Tuple[Optional[str], str]:
     """
     Envia o arquivo para subpasta do dia (AAAA-MM-DD em Brasília) dentro de `parent_folder_id`.
-    Retorna (link_webViewLink ou None, mensagem_erro ou "").
+    Use pasta no **Meu Drive** de um usuário (compartilhada com a service account) ou **Shared Drive**;
+    opcionalmente `transferir_propriedade_para_email` repassa a propriedade após o create (API Drive).
+    Retorna (link_webViewLink ou None, mensagem_erro ou aviso — ex.: upload OK mas transferência falhou).
     """
     try:
         from google.oauth2.service_account import Credentials
@@ -2291,7 +2389,17 @@ def upload_identidade_google_drive(
         link = (created.get("webViewLink") or "").strip()
         if not link and fid:
             link = f"https://drive.google.com/file/d/{fid}/view"
-        return (link or None), ""
+
+        aviso = ""
+        te = (transferir_propriedade_para_email or "").strip()
+        if te and fid:
+            terr = _drive_transferir_propriedade_arquivo(service, fid, te)
+            if terr:
+                aviso = (
+                    f"Arquivo enviado, mas a transferência de propriedade para {te} falhou: {terr} "
+                    "(em Shared Drive a propriedade é do drive; em Gmail pessoal a API pode bloquear transferência a partir de conta de serviço)."
+                )
+        return (link or None), aviso
     except Exception as e:
         msg = str(e)
         low = msg.lower()
@@ -2300,6 +2408,11 @@ def upload_identidade_google_drive(
                 " — Confirme o ID da pasta pai nos Secrets [google_drive] PARENT_FOLDER_ID. "
                 "A pasta precisa existir e estar compartilhada com o e-mail «client_email» da conta de serviço (JSON), "
                 "como Editor (o link no navegador pode abrir para você mesmo sem a API enxergar a pasta)."
+            )
+        if "storagequota" in low or "storage quota" in low or "do not have storage quota" in low:
+            msg += (
+                " — Prefira pasta dentro de um **Shared Drive** ou **Meu Drive** seu compartilhado com a service account; "
+                "opcionalmente defina [google_drive] TRANSFER_OWNERSHIP_TO_EMAIL com seu e-mail após o upload."
             )
         return None, msg
 
@@ -3490,6 +3603,23 @@ def _widget_campo(c: dict):
         widget_label = label
 
     if tipo == "text":
+        if k == "naturalidade":
+            uf_sel = _norm_picklist(st.session_state.get("fld_uf_naturalidade"))
+            cap = _naturalidade_capital_por_uf(uf_sel) if uf_sel else ""
+            if cap:
+                st.session_state[sk] = cap
+            elif sk in st.session_state:
+                cur = str(st.session_state.get(sk) or "").strip()
+                if cur in CAPITAL_POR_UF_BR.values():
+                    st.session_state[sk] = ""
+            return st.text_input(
+                widget_label,
+                key=sk,
+                help=help_txt
+                or "Definida pela UF Naturalidade (capital do estado).",
+                label_visibility=lv,
+                disabled=bool(cap),
+            )
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "textarea":
         return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
@@ -4619,8 +4749,16 @@ def _processar_envio_cadastro() -> None:
 
     up_doc = ss.get("ficha_identidade_upload")
     if up_doc:
-        parent_drive = _drive_parent_id_identidade(st.secrets if hasattr(st, "secrets") else None)
-        dlink, derr = upload_identidade_google_drive(creds, parent_drive, up_doc, dados)
+        sec = st.secrets if hasattr(st, "secrets") else None
+        parent_drive = _drive_parent_id_identidade(sec)
+        dono_email = _drive_email_dono_apos_upload(sec)
+        dlink, derr = upload_identidade_google_drive(
+            creds,
+            parent_drive,
+            up_doc,
+            dados,
+            transferir_propriedade_para_email=dono_email,
+        )
         if dlink:
             ss["ficha_identidade_drive_link"] = dlink
         if derr:
