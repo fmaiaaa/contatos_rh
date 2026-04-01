@@ -615,7 +615,7 @@ def _campos_def() -> List[Campo]:
             tipo="date",
             sf="Birthdate",
             req=True,
-            help="Digite dia, mês e ano com barras (DD/MM/AAAA), ex.: 08/12/2004.",
+            help="Toque no ícone do calendário para escolher a data, ou digite (dia-mês-ano).",
         ),
         _z(
             key="estado_civil",
@@ -1062,29 +1062,6 @@ def parse_data_br(val: Any) -> Optional[str]:
     return None
 
 
-def _valor_nascimento_exibicao_texto(val: Any) -> Any:
-    """
-    Campo de nascimento como texto DD/MM/AAAA: normaliza date/datetime ou ISO vindo
-    de snapshot/demo para string legível (evita depender do date_input do Streamlit).
-    """
-    if val is None:
-        return None
-    if isinstance(val, (date, datetime)):
-        d = val.date() if isinstance(val, datetime) else val
-        return d.strftime("%d/%m/%Y")
-    s = str(val).strip()
-    if not s:
-        return val
-    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
-        iso = parse_data_br(s[:10])
-        if iso:
-            try:
-                return datetime.strptime(iso, "%Y-%m-%d").date().strftime("%d/%m/%Y")
-            except ValueError:
-                pass
-    return s
-
-
 def _erro_validacao_nascimento(v: Any) -> Optional[str]:
     """None = OK no formato e na faixa; vazio não gera erro aqui (obrigatoriedade é outra regra)."""
     if v is None:
@@ -1097,7 +1074,10 @@ def _erro_validacao_nascimento(v: Any) -> Optional[str]:
             return None
         iso = parse_data_br(s)
         if not iso:
-            return "Data de nascimento * (use DD/MM/AAAA, ex.: 08/12/2004)"
+            return (
+                "Data de nascimento * (use o calendário ou digite em dia-mês-ano, "
+                "ex.: 08-12-2004 ou 08/12/2004)"
+            )
         try:
             d = datetime.strptime(iso, "%Y-%m-%d").date()
         except ValueError:
@@ -1747,7 +1727,8 @@ def _aplicar_dados_teste_ao_session_state(dados: Dict[str, Any]) -> None:
             continue
         val = dados[k]
         if k == "birthdate":
-            val = _valor_nascimento_exibicao_texto(val)
+            d = _coerce_date_widget_value(val)
+            val = d if d is not None else val
         ss[f"fld_{k}"] = val
         snap[k] = val
     ss["ficha_snap_campos"] = snap
@@ -3408,23 +3389,23 @@ def _widget_campo(c: dict):
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "textarea":
         return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
-    if tipo == "date" and k == "birthdate":
-        cur = st.session_state.get(sk)
-        novo = _valor_nascimento_exibicao_texto(cur)
-        if novo != cur:
-            st.session_state[sk] = novo
-        return st.text_input(
-            widget_label,
-            key=sk,
-            placeholder="DD/MM/AAAA",
-            max_chars=10,
-            help=help_txt or "Digite dia, mês e ano com barras (ex.: 08/12/2004).",
-            label_visibility=lv,
-        )
     if tipo == "date":
         atual = _coerce_date_widget_value(st.session_state.get(sk))
         if sk in st.session_state:
             st.session_state[sk] = atual
+        if k == "birthdate":
+            # DD-MM-YYYY: ordem dia/mês/ano (BR) sem o bug visual do formato com barras (DD/MM/YYYY).
+            return st.date_input(
+                widget_label,
+                key=sk,
+                value=atual,
+                help=help_txt
+                or "Use o calendário (ícone à direita) ou digite a data em dia-mês-ano.",
+                label_visibility=lv,
+                min_value=date(1920, 1, 1),
+                max_value=date.today(),
+                format="DD-MM-YYYY",
+            )
         return st.date_input(
             widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv
         )
@@ -3543,11 +3524,11 @@ def _garantir_campos_secao_de_snapshot(sec: str) -> None:
         k = c["key"]
         sk = f"fld_{k}"
         if sk not in ss and k in snap:
-            ss[sk] = (
-                _valor_nascimento_exibicao_texto(snap[k])
-                if k == "birthdate"
-                else snap[k]
-            )
+            if k == "birthdate":
+                d = _coerce_date_widget_value(snap[k])
+                ss[sk] = d if d is not None else snap[k]
+            else:
+                ss[sk] = snap[k]
     if sec == "Informações para contato":
         if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
             ss["fld_unidade_negocio"] = snap["unidade_negocio"]
