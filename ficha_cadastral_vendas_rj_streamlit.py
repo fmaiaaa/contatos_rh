@@ -1289,19 +1289,6 @@ def _aplicar_enriquecimentos_payload_sf(
         payload["Apelido__c"] = apel
 
 
-def _completar_validacao_org_salesforce(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
-    """
-    Regras de validação no org que exigem CRECI e validade mesmo quando «Possui CRECI?» = Não.
-    Valores sentinela evitam FIELD_CUSTOM_VALIDATION_EXCEPTION no insert.
-    """
-    possui = (str(dados.get("possui_creci") or "").strip())
-    if possui != "Sim":
-        if not str(payload.get("CRECI__c") or "").strip():
-            payload["CRECI__c"] = "Não possui"
-        if not payload.get("Validade_CRECI__c"):
-            payload["Validade_CRECI__c"] = "2099-12-31"
-
-
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     payload: Dict[str, Any] = {}
     rt, rt_aviso = record_type_id_contato_payload_e_aviso()
@@ -1311,11 +1298,15 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
     if rt_aviso:
         avisos.append(rt_aviso)
     extras_obs: List[str] = []
+    possui_creci_sf = (str(dados.get("possui_creci") or "").strip())
 
     for c in CAMPOS:
         key = c["key"]
         sf = c.get("sf")
         raw = dados.get(key)
+
+        if possui_creci_sf != "Sim" and key in CAMPOS_CRECI_DETALHES:
+            continue
 
         if key == "nome_completo":
             continue
@@ -1414,7 +1405,6 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
 
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
-    _completar_validacao_org_salesforce(payload, dados)
 
     return payload, avisos
 
@@ -1944,6 +1934,9 @@ DEFAULT_WORKSHEET_NAME = "Corretores"
 # Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
 DEFAULT_GERENTES_WORKSHEET = "Gerentes"
 DEFAULT_COL_NOME_CONTA = "Nome da Conta"
+# Pasta raiz no Google Drive para documentos de identidade (compartilhar com a conta de serviço).
+# Opcional: sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
+DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1jN9hyy9nWjj19WuHmQ_pxqvvA3U_5e3M"
 
 # --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
 # Altere aqui no código; deixe ATIVO = False em produção.
@@ -1991,6 +1984,133 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
         return None
     except Exception:
         return None
+
+
+def _drive_parent_id_identidade(st_secrets: Any) -> str:
+    try:
+        if st_secrets and hasattr(st_secrets, "get"):
+            gd = st_secrets.get("google_drive")
+            if isinstance(gd, dict):
+                pid = (
+                    gd.get("PARENT_FOLDER_ID")
+                    or gd.get("identidade_parent_folder_id")
+                    or ""
+                ).strip()
+                if pid:
+                    return pid
+    except Exception:
+        pass
+    return DRIVE_IDENTIDADE_PASTA_RAIZ_ID
+
+
+def _drive_escapar_nome_query(nome: str) -> str:
+    return (nome or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _drive_obter_ou_criar_subpasta(service: Any, parent_id: str, nome_pasta: str) -> str:
+    """Retorna o ID da subpasta `nome_pasta` dentro de `parent_id` (cria se não existir)."""
+    q = (
+        f"name='{_drive_escapar_nome_query(nome_pasta)}' and "
+        f"'{parent_id}' in parents and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    res = (
+        service.files()
+        .list(
+            q=q,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    files = res.get("files") or []
+    if files:
+        return str(files[0]["id"])
+    body = {
+        "name": nome_pasta,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    created = service.files().create(
+        body=body, fields="id", supportsAllDrives=True
+    ).execute()
+    return str(created["id"])
+
+
+def _safe_filename_part(s: str) -> str:
+    t = re.sub(r"[^\w\-]+", "_", (s or "").strip(), flags=re.UNICODE)[:48]
+    return t or "arquivo"
+
+
+def _drive_nome_arquivo_identidade(dados: Dict[str, Any], nome_original: str) -> str:
+    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
+    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
+    suf = Path(nome_original or "doc").suffix.lower()
+    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
+        suf = ".pdf"
+    try:
+        from zoneinfo import ZoneInfo
+
+        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"identidade_{cpf_l}_{nc}_{agora}{suf}"
+
+
+def upload_identidade_google_drive(
+    creds_dict: Dict[str, Any],
+    parent_folder_id: str,
+    uploaded: Any,
+    dados: Dict[str, Any],
+) -> Tuple[Optional[str], str]:
+    """
+    Envia o arquivo para subpasta do dia (AAAA-MM-DD em Brasília) dentro de `parent_folder_id`.
+    Retorna (link_webViewLink ou None, mensagem_erro ou "").
+    """
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+    except ImportError:
+        return None, "Pacote google-api-python-client não instalado (requirements.txt)."
+
+    try:
+        try:
+            from zoneinfo import ZoneInfo
+
+            dia = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d")
+        except Exception:
+            dia = datetime.now().strftime("%Y-%m-%d")
+
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        folder_dia_id = _drive_obter_ou_criar_subpasta(service, parent_folder_id, dia)
+
+        raw = uploaded.getvalue()
+        if not raw:
+            return None, "Arquivo vazio."
+
+        mime = getattr(uploaded, "type", None) or "application/octet-stream"
+        nome_out = _drive_nome_arquivo_identidade(dados, getattr(uploaded, "name", "") or "")
+
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=True)
+        body = {"name": nome_out, "parents": [folder_dia_id]}
+        created = (
+            service.files()
+            .create(body=body, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
+            .execute()
+        )
+        fid = (created.get("id") or "").strip()
+        link = (created.get("webViewLink") or "").strip()
+        if not link and fid:
+            link = f"https://drive.google.com/file/d/{fid}/view"
+        return (link or None), ""
+    except Exception as e:
+        return None, str(e)
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
@@ -2773,6 +2893,60 @@ def aplicar_estilo():
             color: {COR_AZUL_ESC} !important;
             font-weight: 600;
         }}
+        .ficha-final-status-row {{
+            display: flex;
+            align-items: flex-start;
+            gap: 1.1rem;
+            margin: 0 0 1.1rem 0;
+        }}
+        .ficha-final-badge {{
+            flex-shrink: 0;
+            width: 52px;
+            height: 52px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            font-weight: 800;
+            color: #ffffff;
+            line-height: 1;
+            font-family: 'Montserrat', sans-serif;
+        }}
+        .ficha-final-badge--ok {{
+            background: #16a34a;
+            box-shadow: 0 4px 16px rgba(22, 163, 74, 0.35);
+        }}
+        .ficha-final-badge--erro {{
+            background: {COR_VERMELHO};
+            box-shadow: 0 4px 16px rgba({RGB_VERMELHO_CSS}, 0.35);
+        }}
+        .ficha-final-text {{
+            flex: 1;
+            min-width: 0;
+            padding-top: 0.15rem;
+        }}
+        .ficha-final-title {{
+            font-family: 'Montserrat', sans-serif;
+            font-size: 1.35rem;
+            font-weight: 800;
+            color: #0f172a;
+            margin: 0;
+            line-height: 1.25;
+        }}
+        .ficha-final-msg {{
+            margin: 0.55rem 0 0 0;
+            font-size: 0.98rem;
+            line-height: 1.55;
+            color: #334155;
+        }}
+        .ficha-final-detalhe {{
+            margin: 0.75rem 0 0 0;
+            font-size: 0.88rem;
+            line-height: 1.45;
+            color: #64748b;
+            word-break: break-word;
+        }}
         .footer {{
             text-align: center;
             padding: 0.85rem 0 0.35rem 0;
@@ -2846,6 +3020,30 @@ def _alert_vermelho_html(inner_html: str) -> None:
     """Como _alert_vermelho, com HTML já montado (trechos dinâmicos escapados pelo chamador)."""
     st.markdown(
         f'<div class="ficha-alert ficha-alert--vermelho">{inner_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_status_final_tela(*, sucesso: bool, mensagem: str, detalhe_html: str = "") -> None:
+    """Bolinha verde ✓ + «Sucesso» ou bolinha vermelha ✕ + «Erro», com texto abaixo."""
+    if sucesso:
+        badge = (
+            '<span class="ficha-final-badge ficha-final-badge--ok" title="Sucesso" aria-hidden="true">✓</span>'
+        )
+        titulo = "Sucesso"
+    else:
+        badge = (
+            '<span class="ficha-final-badge ficha-final-badge--erro" title="Erro" aria-hidden="true">✕</span>'
+        )
+        titulo = "Erro"
+    msg_esc = html.escape(mensagem)
+    extra = f'<div class="ficha-final-detalhe">{detalhe_html}</div>' if detalhe_html else ""
+    st.markdown(
+        f'<div class="ficha-final-status-row">{badge}'
+        f'<div class="ficha-final-text">'
+        f'<p class="ficha-final-title">{html.escape(titulo)}</p>'
+        f'<p class="ficha-final-msg">{msg_esc}</p>{extra}'
+        f"</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -3906,6 +4104,18 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                     )
             else:
                 st.markdown(
+                    '<div class="ficha-input-label">Documento de identidade '
+                    '<span class="ficha-star-req" aria-hidden="true">*</span><br/>'
+                    "<span style=\"font-weight:400;color:#64748b\">RG ou CNH — PDF, JPG ou PNG.</span></div>",
+                    unsafe_allow_html=True,
+                )
+                st.file_uploader(
+                    "Documento de identidade (obrigatório)",
+                    type=["pdf", "png", "jpg", "jpeg"],
+                    key="ficha_identidade_upload",
+                    label_visibility="collapsed",
+                )
+                st.markdown(
                     '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
                     unsafe_allow_html=True,
                 )
@@ -3997,6 +4207,12 @@ def _limpar_session_formulario():
         "ficha_hp_website",
         "ficha_popup_recursos_ok",
         "ficha_modo_teste_design",
+        "ficha_sf_retry_row",
+        "ficha_sf_retry_sid",
+        "ficha_sf_retry_wname",
+        "ficha_identidade_upload",
+        "ficha_identidade_drive_link",
+        "ficha_identidade_drive_erro",
     ):
         if k in st.session_state:
             del st.session_state[k]
@@ -4084,6 +4300,8 @@ def _processar_envio_cadastro() -> None:
     _snapshot_mesclar_todos_fld_do_session_state()
     dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario_completo())
     erros = validar_obrigatorios(dados)
+    if not ss.get("ficha_identidade_upload"):
+        erros.append("Documento de identidade * (envie PDF, JPG ou PNG)")
     if not ss.get("fld_lgpd_ficha"):
         erros.append("Concordância LGPD *")
     if erros:
@@ -4128,6 +4346,20 @@ def _processar_envio_cadastro() -> None:
     ss["sf_contact_id"] = None
     ss["sf_erro"] = None
     ss["sf_avisos"] = []
+    ss["ficha_sf_retry_row"] = row_num
+    ss["ficha_sf_retry_sid"] = sid
+    ss["ficha_sf_retry_wname"] = wname
+    ss["ficha_identidade_drive_link"] = None
+    ss["ficha_identidade_drive_erro"] = None
+
+    up_doc = ss.get("ficha_identidade_upload")
+    if up_doc:
+        parent_drive = _drive_parent_id_identidade(st.secrets if hasattr(st, "secrets") else None)
+        dlink, derr = upload_identidade_google_drive(creds, parent_drive, up_doc, dados)
+        if dlink:
+            ss["ficha_identidade_drive_link"] = dlink
+        if derr:
+            ss["ficha_identidade_drive_erro"] = derr
 
     _aplicar_secrets_sf()
     if not _credenciais_salesforce_ok():
@@ -4175,6 +4407,9 @@ def _processar_envio_cadastro() -> None:
         atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Sucesso", "", link)
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
+        ss.pop("ficha_sf_retry_row", None)
+        ss.pop("ficha_sf_retry_sid", None)
+        ss.pop("ficha_sf_retry_wname", None)
     else:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
         atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Erro", err_full[:49000], "")
@@ -4184,6 +4419,104 @@ def _processar_envio_cadastro() -> None:
     _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
     ss["ficha_sucesso"] = True
     st.rerun()
+
+
+def _retentar_salesforce_ultimo_envio() -> None:
+    """
+    Repete apenas a criação do contato no Salesforce com os mesmos dados já gravados na planilha.
+    Atualiza a mesma linha (status / log / link); não insere nova linha.
+    """
+    ss = st.session_state
+    dados = ss.get("ficha_dados_enviados")
+    row_num = ss.get("ficha_sf_retry_row")
+    sid = ss.get("ficha_sf_retry_sid")
+    wname = ss.get("ficha_sf_retry_wname")
+    if not isinstance(dados, dict) or row_num is None:
+        ss["sf_erro"] = "Não há dados salvos para retentativa. Use «Começar um novo cadastro»."
+        return
+    if not sid or not wname:
+        ss["sf_erro"] = "Contexto da planilha perdido; não é possível retentar o envio ao Salesforce."
+        return
+
+    ok_sec, msg_sec = verificar_antes_envio()
+    if not ok_sec:
+        ss["sf_erro"] = f"Retentativa bloqueada: {msg_sec}"
+        return
+
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if not creds:
+        ss["sf_erro"] = "Credenciais Google Sheets ausentes — necessárias para atualizar o status na planilha."
+        return
+
+    _aplicar_secrets_sf()
+    if not _credenciais_salesforce_ok():
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
+            "",
+        )
+        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        return
+
+    if not _SF_SDK_DISPONIVEL:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "simple_salesforce não instalado.",
+            "",
+        )
+        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        return
+
+    dados_c = dict(dados)
+    payload, avisos = montar_payload_salesforce(dados_c)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados_c))
+
+    with st.spinner("Tentando novamente no Salesforce..."):
+        sf = conectar_salesforce()
+    if not sf:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "Falha ao conectar ao Salesforce (credenciais ou rede).",
+            "",
+        )
+        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
+        ss["sf_avisos"] = avisos
+        return
+
+    _aplicar_enriquecimentos_payload_sf(payload, dados_c, sf, avisos)
+    cid, err = criar_contato_payload(sf, payload)
+    link = _url_contact(cid) if cid else ""
+
+    if cid:
+        atualizar_status_envio_salesforce(str(sid), str(wname), creds, int(row_num), "Sucesso", "", link)
+        ss["sf_contact_id"] = cid
+        ss["sf_erro"] = None
+        ss["ficha_popup_recursos_ok"] = False
+        ss.pop("ficha_sf_retry_row", None)
+        ss.pop("ficha_sf_retry_sid", None)
+        ss.pop("ficha_sf_retry_wname", None)
+    else:
+        err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        atualizar_status_envio_salesforce(
+            str(sid), str(wname), creds, int(row_num), "Erro", err_full[:49000], ""
+        )
+        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+
+    ss["sf_avisos"] = avisos
+    _tentar_enviar_email_boas_vindas(dados_c, cid if cid else None)
 
 
 @st.dialog("Obrigado — você faz parte da nossa operação", width="medium")
@@ -4288,44 +4621,81 @@ def main():
         _cabecalho_pagina()
         cid = ss.get("sf_contact_id")
         err_sf = ss.get("sf_erro")
-        if cid:
-            _alert_azul(
-                "**Recebemos o seu cadastro.** Tudo certo por aqui — guarde o link abaixo se quiser consultar depois."
+        ok_sf = not bool(err_sf)
+
+        if ss.get("ficha_modo_teste_design"):
+            _render_status_final_tela(
+                sucesso=True,
+                mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
             )
-        elif err_sf:
-            _alert_azul(
-                "**Recebemos o seu cadastro.** Se aparecer um aviso técnico abaixo, nossa equipe pode te ajudar."
+        elif ok_sf:
+            _render_status_final_tela(
+                sucesso=True,
+                mensagem=(
+                    "Sucesso, formulário enviado. Iremos verificar o seu perfil e retornar com mais informações. "
+                    "O envio não significa admissão automática pela equipe."
+                ),
             )
         else:
-            _alert_azul("**Recebemos o seu cadastro.** Confira os detalhes abaixo.")
-        if err_sf:
-            _alert_vermelho_html(
-                f"<strong>Detalhe:</strong> {_html_erro_salesforce_multilinha(err_sf)}"
+            _render_status_final_tela(
+                sucesso=False,
+                mensagem=(
+                    "O cadastro foi registrado na planilha, mas houve um problema técnico ao criar o contato no Salesforce."
+                ),
+                detalhe_html=f"<strong>Detalhe:</strong> {_html_erro_salesforce_multilinha(err_sf)}"
+                if err_sf
+                else "",
             )
+
+        if cid:
+            u_sf = _url_contact(str(cid))
+            st.markdown(
+                f"**Contato Salesforce:** [`{html.escape(str(cid))}`]({u_sf})"
+            )
+
+        id_link = ss.get("ficha_identidade_drive_link")
+        id_err = ss.get("ficha_identidade_drive_erro")
+        if id_link:
+            st.markdown(f"**Documento de identidade:** [abrir no Google Drive]({id_link})")
+        elif id_err:
+            st.caption(f"Documento de identidade não foi enviado ao Drive: {id_err}")
+
+        pode_retry_sf = bool(
+            err_sf
+            and ss.get("ficha_sf_retry_row") is not None
+            and not ss.get("ficha_modo_teste_design")
+        )
+        if pode_retry_sf:
+            st.caption(
+                "Os dados já foram salvos na **planilha**. Você pode tentar criar o contato no Salesforce "
+                "de novo **sem duplicar** a linha."
+            )
+            if st.button(
+                "Tentar novamente — enviar ao Salesforce",
+                type="primary",
+                use_container_width=True,
+                key="ficha_retry_salesforce",
+            ):
+                _retentar_salesforce_ultimo_envio()
+                st.rerun()
 
         avisos = ss.get("sf_avisos") or []
         if avisos:
             lista = "<br>".join(f"• {html.escape(a)}" for a in avisos)
-            _alert_vermelho_html(f"<strong>Avisos:</strong><br>{lista}")
+            st.caption("Avisos técnicos:")
+            _alert_vermelho_html(lista)
 
         ok_mail = ss.get("ficha_email_boas_vindas_ok")
         msg_mail = ss.get("ficha_email_boas_vindas_msg") or ""
         if ok_mail is True:
-            _alert_azul(
-                "**Enviamos um e-mail automático** para o endereço do cadastro com **apresentação da Direcional**, "
-                "**materiais e links de vendas**, **PDF da ficha em anexo** (quando a geração funcionar) e link do "
-                "Salesforce, se o contato tiver sido criado."
-            )
+            st.caption("Um e-mail automático foi enviado para o endereço informado no cadastro (quando configurado).")
         elif ok_mail is False and msg_mail:
-            _alert_vermelho_html(
-                f"<strong>E-mail automático:</strong> {html.escape(msg_mail)} "
-                "(confira [ficha_email] nos Secrets e o campo <strong>E-mail</strong> no formulário.)"
-            )
+            st.caption(f"E-mail automático: {msg_mail}")
 
-        st.caption(
-            "Quando o contato é criado no Salesforce, o **popup** traz mapa, vídeo e links úteis. "
-            "O **e-mail principal** (apresentação, links e PDF) foi disparado para o e-mail do cadastro ao enviar."
-        )
+        if cid and not ss.get("ficha_modo_teste_design"):
+            st.caption(
+                "Abra o **popup** (se ainda estiver visível) para mapa, vídeo do simulador e links úteis."
+            )
 
         if st.button("Começar um novo cadastro", use_container_width=True):
             _limpar_session_formulario()
@@ -4338,6 +4708,9 @@ def main():
             ss.pop("ficha_popup_recursos_ok", None)
             ss.pop("ficha_email_boas_vindas_ok", None)
             ss.pop("ficha_email_boas_vindas_msg", None)
+            ss.pop("ficha_identidade_upload", None)
+            ss.pop("ficha_identidade_drive_link", None)
+            ss.pop("ficha_identidade_drive_erro", None)
             st.rerun()
 
         st.markdown(
