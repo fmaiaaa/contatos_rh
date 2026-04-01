@@ -615,7 +615,7 @@ def _campos_def() -> List[Campo]:
             tipo="date",
             sf="Birthdate",
             req=True,
-            help="Exibição em dia/mês/ano (calendário brasileiro).",
+            help="Digite dia, mês e ano com barras (DD/MM/AAAA), ex.: 08/12/2004.",
         ),
         _z(
             key="estado_civil",
@@ -1054,11 +1054,56 @@ def parse_data_br(val: Any) -> Optional[str]:
     s = str(val).strip()
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt).date().isoformat()
         except ValueError:
             continue
+    return None
+
+
+def _valor_nascimento_exibicao_texto(val: Any) -> Any:
+    """
+    Campo de nascimento como texto DD/MM/AAAA: normaliza date/datetime ou ISO vindo
+    de snapshot/demo para string legível (evita depender do date_input do Streamlit).
+    """
+    if val is None:
+        return None
+    if isinstance(val, (date, datetime)):
+        d = val.date() if isinstance(val, datetime) else val
+        return d.strftime("%d/%m/%Y")
+    s = str(val).strip()
+    if not s:
+        return val
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        iso = parse_data_br(s[:10])
+        if iso:
+            try:
+                return datetime.strptime(iso, "%Y-%m-%d").date().strftime("%d/%m/%Y")
+            except ValueError:
+                pass
+    return s
+
+
+def _erro_validacao_nascimento(v: Any) -> Optional[str]:
+    """None = OK no formato e na faixa; vazio não gera erro aqui (obrigatoriedade é outra regra)."""
+    if v is None:
+        return None
+    if isinstance(v, (date, datetime)):
+        d = v.date() if isinstance(v, datetime) else v
+    else:
+        s = str(v).strip()
+        if not s:
+            return None
+        iso = parse_data_br(s)
+        if not iso:
+            return "Data de nascimento * (use DD/MM/AAAA, ex.: 08/12/2004)"
+        try:
+            d = datetime.strptime(iso, "%Y-%m-%d").date()
+        except ValueError:
+            return "Data de nascimento * (data inválida)"
+    if d < date(1920, 1, 1) or d > date.today():
+        return "Data de nascimento * (informe uma data entre 1920 e hoje)"
     return None
 
 
@@ -1141,6 +1186,9 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
     if cpf_d and len(cpf_d) != 11:
         erros.append("CPF * (informe 11 dígitos)")
+    eb = _erro_validacao_nascimento(dados.get("birthdate"))
+    if eb:
+        erros.append(eb)
     return list(dict.fromkeys(erros))
 
 
@@ -1196,6 +1244,9 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
         if cpf_d and len(cpf_d) != 11:
             erros.append("CPF * (informe 11 dígitos)")
+        eb = _erro_validacao_nascimento(dados.get("birthdate"))
+        if eb:
+            erros.append(eb)
     if sec == "CRECI/TTI":
         erros.extend(_erros_preenchimento_creci_se_sim(dados))
     return list(dict.fromkeys(erros))
@@ -1694,8 +1745,11 @@ def _aplicar_dados_teste_ao_session_state(dados: Dict[str, Any]) -> None:
         k = c["key"]
         if k not in dados:
             continue
-        ss[f"fld_{k}"] = dados[k]
-        snap[k] = dados[k]
+        val = dados[k]
+        if k == "birthdate":
+            val = _valor_nascimento_exibicao_texto(val)
+        ss[f"fld_{k}"] = val
+        snap[k] = val
     ss["ficha_snap_campos"] = snap
 
 
@@ -2648,28 +2702,54 @@ def aplicar_estilo():
             0% {{ background-position: 0% 50%; }}
             100% {{ background-position: 200% 50%; }}
         }}
-        html, body {{ font-family: 'Inter', sans-serif; color: {COR_TEXTO_LABEL}; }}
-        [data-testid="stAppViewContainer"] {{
+        html, body {{
+            font-family: 'Inter', sans-serif;
+            color: {COR_TEXTO_LABEL};
+            background: transparent !important;
+            background-color: transparent !important;
+        }}
+        /* Degradê + imagem no app inteiro: o header fica acima do stAppViewContainer; se só o container
+           tiver fundo, o topo fica branco. Com fundo no stApp, o header 100% transparente mostra o mesmo visual. */
+        .stApp,
+        [data-testid="stApp"] {{
             background:
                 linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
                 url("{bg_url}") center / cover no-repeat !important;
             background-attachment: scroll !important;
+            background-color: transparent !important;
         }}
-        /* Cabeçalho + barra (share, GitHub, estrela, lápis): mesmo degradê e foto do fundo — sem “tarja” diferente */
+        [data-testid="stAppViewContainer"] {{
+            background: transparent !important;
+            background-color: transparent !important;
+        }}
+        /* Cabeçalho e barra (share, GitHub, estrela, lápis): totalmente transparentes — sem tarja branca do tema */
         header[data-testid="stHeader"],
         [data-testid="stHeader"] {{
-            background:
-                linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
-                url("{bg_url}") center / cover no-repeat !important;
-            background-attachment: scroll !important;
+            background: transparent !important;
+            background-color: transparent !important;
+            background-image: none !important;
+            border: none !important;
+            box-shadow: none !important;
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
+        }}
+        [data-testid="stHeader"] > div,
+        [data-testid="stHeader"] header {{
+            background: transparent !important;
+            background-color: transparent !important;
+            background-image: none !important;
+            box-shadow: none !important;
         }}
         [data-testid="stDecoration"] {{
             background: transparent !important;
+            background-color: transparent !important;
         }}
         [data-testid="stSidebar"] {{ display: none !important; }}
         [data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
         [data-testid="stToolbar"] {{
             background: transparent !important;
+            background-color: transparent !important;
+            background-image: none !important;
             border: none !important;
             border-radius: 0 !important;
             box-shadow: none !important;
@@ -2678,6 +2758,12 @@ def aplicar_estilo():
         [data-testid="stToolbar"] button,
         [data-testid="stToolbar"] a {{
             color: rgba(255, 255, 255, 0.92) !important;
+            background: transparent !important;
+            background-color: transparent !important;
+        }}
+        [data-testid="stHeader"] button {{
+            background: transparent !important;
+            background-color: transparent !important;
         }}
         [data-testid="stToolbar"] svg {{
             fill: currentColor !important;
@@ -2687,7 +2773,8 @@ def aplicar_estilo():
             stroke: currentColor !important;
         }}
         [data-testid="stToolbar"] button:hover,
-        [data-testid="stToolbar"] a:hover {{
+        [data-testid="stToolbar"] a:hover,
+        [data-testid="stHeader"] button:hover {{
             background: rgba(255, 255, 255, 0.12) !important;
         }}
         /* Área principal: topo/base mais compactos para a box não “flutuar” com margem excessiva */
@@ -3321,17 +3408,25 @@ def _widget_campo(c: dict):
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
     if tipo == "textarea":
         return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
+    if tipo == "date" and k == "birthdate":
+        cur = st.session_state.get(sk)
+        novo = _valor_nascimento_exibicao_texto(cur)
+        if novo != cur:
+            st.session_state[sk] = novo
+        return st.text_input(
+            widget_label,
+            key=sk,
+            placeholder="DD/MM/AAAA",
+            max_chars=10,
+            help=help_txt or "Digite dia, mês e ano com barras (ex.: 08/12/2004).",
+            label_visibility=lv,
+        )
     if tipo == "date":
         atual = _coerce_date_widget_value(st.session_state.get(sk))
         if sk in st.session_state:
             st.session_state[sk] = atual
-        kw: Dict[str, Any] = {}
-        if k == "birthdate":
-            kw["min_value"] = date(1920, 1, 1)
-            kw["max_value"] = date.today()
-            kw["format"] = "DD/MM/YYYY"
         return st.date_input(
-            widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv, **kw
+            widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv
         )
     if tipo == "number":
         return st.text_input(
@@ -3448,7 +3543,11 @@ def _garantir_campos_secao_de_snapshot(sec: str) -> None:
         k = c["key"]
         sk = f"fld_{k}"
         if sk not in ss and k in snap:
-            ss[sk] = snap[k]
+            ss[sk] = (
+                _valor_nascimento_exibicao_texto(snap[k])
+                if k == "birthdate"
+                else snap[k]
+            )
     if sec == "Informações para contato":
         if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
             ss["fld_unidade_negocio"] = snap["unidade_negocio"]
