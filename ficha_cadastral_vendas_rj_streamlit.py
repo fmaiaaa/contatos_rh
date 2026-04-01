@@ -3818,9 +3818,9 @@ def _widget_campo(c: dict):
         if k == "email":
             st.markdown(
                 '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:15px;'
-                'font-weight:400;color:#334155;line-height:1.55;font-family:Inter,Segoe UI,sans-serif;">'
-                'Use o e-mail corporativo: <span style="font-style:italic;font-family:Georgia,Cambria,'
-                '"Times New Roman",serif;letter-spacing:0.01em;">nomesobrenome.direcionalvendas@gmail.com</span></p>',
+                'font-weight:400;color:#334155;line-height:1.55;">'
+                'Use o e-mail corporativo: <span style="font-style:italic;color:#04428f;">'
+                "nomesobrenome.direcionalvendas@gmail.com</span></p>",
                 unsafe_allow_html=True,
             )
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
