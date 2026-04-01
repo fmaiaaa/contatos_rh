@@ -1020,6 +1020,26 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
     }
 )
 
+
+def campos_planilha_corretor() -> List[Campo]:
+    """
+    Colunas da aba principal: só o que o corretor vê/preenche no fluxo (sem campos ocultos de sistema).
+    Ordem = SEC_ORDER, depois a ordem de definição em CAMPOS dentro de cada seção.
+    """
+    out: List[Campo] = []
+    seen: set[str] = set()
+    for sec in SEC_ORDER:
+        for c in CAMPOS:
+            if c["sec"] != sec or c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+                continue
+            k = c["key"]
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(c)
+    return out
+
+
 # Campos da seção CRECI/TTI exibidos só quando «Possui CRECI?» = Sim.
 CAMPOS_CRECI_DETALHES: frozenset[str] = frozenset(
     {
@@ -1709,11 +1729,11 @@ def _agora_envio_brasilia() -> tuple[str, str]:
 def linha_planilha(dados: Dict[str, Any]) -> List[str]:
     data_hora_br, iso = _agora_envio_brasilia()
     row: List[str] = []
-    for c in CAMPOS:
+    for c in campos_planilha_corretor():
         k = c["key"]
         v = dados.get(k)
         if c["tipo"] == "multiselect" and isinstance(v, list):
-            row.append("; ".join(v))
+            row.append("; ".join(str(x) for x in v))
         elif v is None:
             row.append("")
         else:
@@ -1727,7 +1747,7 @@ def linha_planilha(dados: Dict[str, Any]) -> List[str]:
 
 
 def cabecalho_planilha() -> List[str]:
-    return [c["label"] for c in CAMPOS] + [
+    return [c["label"] for c in campos_planilha_corretor()] + [
         "Data e hora do envio",
         "Carimbo ISO",
         "Envio?",
@@ -1780,7 +1800,8 @@ def _indice_coluna_planilha_para_campo(
 def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[str, Any]:
     """
     Converte uma linha da aba Corretores (valores alinhados aos cabeçalhos) em dict de chaves do formulário.
-    Cabeçalhos devem corresponder aos rótulos em CAMPOS (como em `cabecalho_planilha`).
+    Cabeçalhos da parte de dados = rótulos de `campos_planilha_corretor()` + colunas de sistema no final.
+    Campos ocultos ficam vazios até `_merge_defaults_ficha_em_dict` / `enriquecer_derivados_vendas_rj`.
     """
     hmap: Dict[str, int] = {}
     for i, h in enumerate(headers):
@@ -1901,6 +1922,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
     sid, wname = _ids_planilha_modo_teste(gs)
 
     dados = dados_dict_de_linha_planilha(headers, cells)
+    dados = _merge_defaults_ficha_em_dict(dados)
     dados = enriquecer_derivados_vendas_rj(dados)
     erros = validar_obrigatorios(dados)
     if erros:
@@ -1923,7 +1945,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
         try:
             linha = linha_planilha(dados)
             cab = cabecalho_planilha()
-            row_num_atualizar = anexar_linha(linha, cab, sid, wname, creds)
+            row_num_atualizar = anexar_linha(linha, cab, sid, wname, creds, gs)
         except Exception as e:
             return False, f"Erro ao anexar linha na planilha: {html.escape(str(e))}"
 
@@ -2155,12 +2177,26 @@ def _parse_json_conta_servico_google(s: str) -> Optional[Dict[str, Any]]:
 # ID padrão da planilha informada pelo usuário
 DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
 DEFAULT_WORKSHEET_NAME = "Corretores"
+# Segunda aba: documentação de valores preenchidos automaticamente (não digitados pelo corretor).
+DEFAULT_VALORES_FIXOS_WORKSHEET = "Valores fixos (automáticos)"
 # Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
 DEFAULT_GERENTES_WORKSHEET = "Gerentes"
 DEFAULT_COL_NOME_CONTA = "Nome da Conta"
-# Pasta raiz no Google Drive para documentos de identidade (compartilhar com a conta de serviço).
-# Opcional: sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
-DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1jN9hyy9nWjj19WuHmQ_pxqvvA3U_5e3M"
+# Pasta raiz no Google Drive para documento de identidade (compartilhar com o e-mail da service account do JSON).
+# Padrão: pasta na conta pessoal indicada pelo time; sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
+DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1x2vGhf3Fnt_rtykdrU3nqJD7kh_pnrSv"
+
+# Documento de identidade: e-mail só se o upload ao Drive falhar (fallback; [ficha_email] SMTP).
+IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO = "ynara.silva@direcional.com.br"
+
+# Mensagens ao corretor: sem citar planilha, Salesforce ou outros sistemas internos.
+FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO = (
+    "Não foi possível concluir o envio no momento. Tente novamente em alguns minutos."
+)
+FICHA_MSG_SUCESSO_PERFIL = (
+    "Sucesso, formulário enviado. Iremos verificar o seu perfil e retornar com mais informações. "
+    "O envio não significa admissão automática pela equipe."
+)
 
 # --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
 # Altere aqui no código; deixe ATIVO = False em produção.
@@ -2438,31 +2474,186 @@ def _col_letter(n: int) -> str:
     return s
 
 
+def _cabecalho_planilha_desalinhado(linha1: List[str], esperado: List[str]) -> bool:
+    """True se quantidade ou textos de cabeçalho não batem com o layout atual do app."""
+    if len(linha1) != len(esperado):
+        return True
+    for a, b in zip(linha1, esperado):
+        if _norm_cabecalho_planilha(a) != _norm_cabecalho_planilha(b):
+            return True
+    return False
+
+
+def _nome_aba_valores_fixos_planilha(gs: Dict[str, Any]) -> str:
+    return (
+        str(
+            gs.get("VALORES_FIXOS_WORKSHEET")
+            or gs.get("valores_fixos_worksheet")
+            or DEFAULT_VALORES_FIXOS_WORKSHEET
+        ).strip()
+        or DEFAULT_VALORES_FIXOS_WORKSHEET
+    )
+
+
+def _linhas_conteudo_aba_valores_fixos() -> List[List[str]]:
+    """Referência estática: o que o sistema preenche sem o corretor digitar (ou via Secrets)."""
+    return [
+        ["Campo / regra", "Origem", "Descrição"],
+        [
+            "Regional *",
+            "[ficha_defaults] · Secrets",
+            "Padrão típico: RJ (chave `regional`). Não aparece no formulário.",
+        ],
+        [
+            "Origem *",
+            "Fluxo Vendas RJ + [ficha_defaults]",
+            "No envio, o fluxo força RH; default em Secrets se vazio.",
+        ],
+        [
+            "Status Corretor *",
+            "[ficha_defaults] · Secrets",
+            "Padrão típico: Pré credenciado (`status_corretor`).",
+        ],
+        [
+            "Tratamento",
+            "Automático",
+            "Derivado de Sexo *: Masculino → Sr.; Feminino → Sra.; caso contrário vazio.",
+        ],
+        [
+            "Apelido",
+            "Automático",
+            "Primeiro nome do Nome completo * + sufixo _RJ01.",
+        ],
+        [
+            "Data da Entrevista",
+            "Automático",
+            "Data do envio (dd/mm/aaaa).",
+        ],
+        [
+            "Data Contrato",
+            "Automático",
+            "Data do envio.",
+        ],
+        [
+            "Data Credenciamento",
+            "Automático",
+            "Data do envio.",
+        ],
+        [
+            "Tipo Corretor *",
+            "Automático",
+            "Rede Direcional ou Riva → «Direcional Vendas – Autônomos»; Outra imobiliária (parceira) → «Parceiros (Externo)».",
+        ],
+        [
+            "Função na operação *",
+            "Automático (parceira)",
+            "Se «Fará parte de qual rede?» = Outra imobiliária (parceira), gravado como Corretor Parceiro.",
+        ],
+        [
+            "Multiplicador de Nível / Multiplicador de Regime",
+            "Automático",
+            "Captador → 0,9 e 1,0; Corretor ou Corretor Parceiro → 1,0 e 1,0.",
+        ],
+        [
+            "Naturalidade *",
+            "Automático",
+            "Capital do estado em UF Naturalidade * (ex.: DF → Brasília).",
+        ],
+        [
+            "Nome do gerente (conta) *",
+            "Automático",
+            "Se «Sabe o nome do gerente…» = Não, usa a primeira conta da lista (aba Gerentes ou [ficha_defaults]).",
+        ],
+        [
+            "AccountId / OwnerId",
+            "[ficha_defaults] · Secrets",
+            "Opcional: `account_id` e `owner_id` quando não resolvidos pelo nome da conta.",
+        ],
+        [
+            "Campos CRECI (número, validade, etc.)",
+            "Automático se «Possui CRECI?» = Não",
+            f"Valores mínimos para validações do org (ex.: CRECI {DEFAULT_CRECI_NUMERO_FALLBACK}, "
+            f"responsável {DEFAULT_NOME_RESPONSAVEL_CRECI_FALLBACK!r}, datas) — ver código.",
+        ],
+        [
+            "Código Pessoa UAU / retornos de integração",
+            "Sistema / Salesforce",
+            "Preenchidos por processos posteriores; não vêm do formulário do corretor.",
+        ],
+    ]
+
+
+def _garantir_aba_valores_fixos(sh: Any, gs: Dict[str, Any]) -> None:
+    """Cria ou atualiza a aba de referência «Valores fixos (automáticos)»."""
+    nome = _nome_aba_valores_fixos_planilha(gs)[:99]
+    body = _linhas_conteudo_aba_valores_fixos()
+    try:
+        ws = sh.worksheet(nome)
+    except Exception:
+        ws = sh.add_worksheet(
+            title=nome,
+            rows=max(len(body) + 5, 80),
+            cols=max(len(body[0]) if body else 3, 6),
+        )
+    try:
+        cur = ws.get_all_values()
+        precisa = not cur or len(cur) < len(body)
+        if not precisa and cur:
+            for i, row in enumerate(body):
+                if i >= len(cur):
+                    precisa = True
+                    break
+                exp = row[:3]
+                got = (cur[i] + ["", "", ""])[:3]
+                if [_norm_cabecalho_planilha(x) for x in got] != [
+                    _norm_cabecalho_planilha(x) for x in exp
+                ]:
+                    precisa = True
+                    break
+        if precisa:
+            ws.clear()
+            ws.update(f"A1:{_col_letter(len(body[0]))}{len(body)}", body, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
+
+
 def anexar_linha(
     linha: List[str],
     cabecalho: List[str],
     spreadsheet_id: str,
     worksheet_name: str,
     creds_dict: Dict[str, Any],
+    google_sheets_extras: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
-    Garante que a aba existe, cabeçalho na linha 1 (se vazia) e anexa a linha.
+    Garante que a aba existe, cabeçalho na linha 1 alinhado ao layout atual e anexa a linha.
+    Atualiza também a aba «Valores fixos (automáticos)» (nome configurável nos Secrets).
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
+    gs = dict(google_sheets_extras or {})
+    try:
+        _garantir_aba_valores_fixos(sh, gs)
+    except Exception:
+        pass
     try:
         ws = sh.worksheet(worksheet_name)
     except Exception:
-        ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=max(len(cabecalho), 30))
+        ws = sh.add_worksheet(
+            title=worksheet_name,
+            rows=1000,
+            cols=max(len(cabecalho), 30),
+        )
 
     existing = ws.get_all_values()
-    if not existing or not any(cell.strip() for cell in existing[0]):
+    if not existing or not any(str(cell).strip() for cell in existing[0]):
+        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
+    elif _cabecalho_planilha_desalinhado(list(existing[0]), cabecalho):
         ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
     elif len(existing[0]) < len(cabecalho):
-        # Cabeçalho existente mais curto — preenche células faltantes (linha 1)
-        pad = existing[0] + [""] * (len(cabecalho) - len(existing[0]))
+        pad = list(existing[0]) + [""] * (len(cabecalho) - len(existing[0]))
         for i, h in enumerate(cabecalho):
-            if i >= len(pad) or not (pad[i] or "").strip():
+            if i >= len(pad) or not str(pad[i] or "").strip():
                 pad[i] = h
         ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
 
@@ -3779,6 +3970,25 @@ def _ficha_defaults_de_secrets() -> dict[str, Any]:
         return {}
 
 
+def _merge_defaults_ficha_em_dict(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """Preenche campos ocultos (não exportados na aba do corretor) a partir de [ficha_defaults]."""
+    out = dict(dados)
+    fd = _ficha_defaults_de_secrets()
+    if not str(out.get("regional") or "").strip():
+        out["regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
+    if not str(out.get("status_corretor") or "").strip():
+        out["status_corretor"] = (
+            str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
+        )
+    if not str(out.get("origem") or "").strip():
+        out["origem"] = str(fd.get("origem", "RH")).strip() or "RH"
+    if not str(out.get("account_id") or "").strip():
+        out["account_id"] = str(fd.get("account_id", "")).strip()
+    if not str(out.get("owner_id") or "").strip():
+        out["owner_id"] = str(fd.get("owner_id", "")).strip()
+    return out
+
+
 def _init_defaults():
     """Padrões Vendas RJ; regional/origem/status/ids vêm de [ficha_defaults] nos Secrets."""
     fd = _ficha_defaults_de_secrets()
@@ -4342,6 +4552,85 @@ def _get_smtp_from_secrets():
         return None
 
 
+def _email_destino_documento_identidade(st_secrets: Any) -> str:
+    """Sobrescreva em [ficha_email] IDENTIDADE_DEST_EMAIL (ou identidade_dest_email)."""
+    try:
+        if st_secrets and hasattr(st_secrets, "get"):
+            fe = st_secrets.get("ficha_email", {})
+            if isinstance(fe, dict):
+                for key in (
+                    "IDENTIDADE_DEST_EMAIL",
+                    "identidade_dest_email",
+                    "DOCUMENTO_IDENTIDADE_DESTINO",
+                    "documento_identidade_destino",
+                ):
+                    v = str(fe.get(key) or "").strip()
+                    if v and email_contato_formato_valido(v):
+                        return v
+    except Exception:
+        pass
+    return IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO
+
+
+def enviar_documento_identidade_por_email(
+    uploaded: Any, dados: Dict[str, Any], destinatario: str
+) -> Tuple[bool, str]:
+    """
+    Fallback: envia o documento de identidade por e-mail ([ficha_email] SMTP) quando o upload ao Drive falha.
+    """
+    cfg = _get_smtp_from_secrets()
+    if not cfg or not cfg["host"] or not cfg["user"]:
+        return False, (
+            "SMTP não configurado — adicione [ficha_email] com smtp_server, sender_email e sender_password nos Secrets."
+        )
+    to = (destinatario or "").strip()
+    if not email_contato_formato_valido(to):
+        return False, f"E-mail de destino inválido ({to!r})."
+
+    raw = uploaded.getvalue()
+    if not raw:
+        return False, "Arquivo vazio."
+
+    nome_arq = _drive_nome_arquivo_identidade(dados, getattr(uploaded, "name", "") or "")
+    mime = (getattr(uploaded, "type", None) or "").strip().lower() or "application/octet-stream"
+    if mime == "application/pdf" or nome_arq.lower().endswith(".pdf"):
+        sub = "pdf"
+    elif mime in ("image/jpeg", "image/jpg") or nome_arq.lower().endswith((".jpg", ".jpeg")):
+        sub = "jpeg"
+    elif mime == "image/png" or nome_arq.lower().endswith(".png"):
+        sub = "png"
+    else:
+        sub = "octet-stream"
+
+    nome_cand = _nome_candidato_ficha(dados)
+    msg = MIMEMultipart()
+    msg["Subject"] = f"[Vendas RJ] Documento de identidade — {nome_cand}"
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = to
+
+    corpo = (
+        "Documento de identidade enviado pelo formulário de credenciamento (Direcional Vendas RJ).\n\n"
+        f"Nome: {nome_cand}\n"
+        f"CPF: {dados.get('cpf', '')}\n"
+        f"E-mail no cadastro: {dados.get('email', '')}\n"
+        f"Celular: {dados.get('mobile', '')}\n"
+    )
+    msg.attach(MIMEText(corpo, "plain", "utf-8"))
+
+    part = MIMEApplication(raw, _subtype=sub)
+    part.add_header("Content-Disposition", "attachment", filename=nome_arq)
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["user"], cfg["password"])
+            server.sendmail(cfg["from_addr"], [to], msg.as_string())
+        return True, ""
+    except Exception as e:
+        return False, _smtp_erro_amigavel(e)
+
+
 def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra: str | None) -> tuple[bool, str]:
     cfg = _get_smtp_from_secrets()
     if not cfg or not cfg["host"] or not cfg["user"]:
@@ -4501,7 +4790,8 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                 st.markdown(
                     '<div class="ficha-input-label">Documento de identidade '
                     '<span class="ficha-star-req" aria-hidden="true">*</span><br/>'
-                    "<span style=\"font-weight:400;color:#64748b\">RG ou CNH — PDF, JPG ou PNG.</span></div>",
+                    "<span style=\"font-weight:400;color:#64748b\">RG ou CNH — PDF, JPG ou PNG. "
+                    "Após o envio, tentamos gravar no Google Drive; se não for possível, o arquivo é enviado por e-mail à equipe.</span></div>",
                     unsafe_allow_html=True,
                 )
                 st.file_uploader(
@@ -4600,7 +4890,6 @@ def _limpar_session_formulario():
         "ficha_seg_t0",
         "ficha_rl_envios_ts",
         "ficha_hp_website",
-        "ficha_popup_recursos_ok",
         "ficha_modo_teste_design",
         "ficha_sf_retry_row",
         "ficha_sf_retry_sid",
@@ -4608,9 +4897,18 @@ def _limpar_session_formulario():
         "ficha_identidade_upload",
         "ficha_identidade_drive_link",
         "ficha_identidade_drive_erro",
+        "ficha_identidade_email_para",
     ):
         if k in st.session_state:
             del st.session_state[k]
+
+
+def _finalizar_popup_e_novo_cadastro() -> None:
+    """Após «Finalizar» no popup: limpa tudo e volta ao formulário (sem tela final)."""
+    _limpar_session_formulario()
+    ss = st.session_state
+    for k in ("ficha_dados_enviados", "sf_contact_id", "sf_erro", "sf_avisos"):
+        ss.pop(k, None)
 
 
 def _design_teste_habilitado() -> bool:
@@ -4671,7 +4969,6 @@ def _ativar_cenario_teste_design() -> None:
     """Simula sucesso + popup sem planilha/Salesforce; preenche dados demo para ver PDF/e-mail."""
     ss = st.session_state
     ss["ficha_sucesso"] = True
-    ss["ficha_popup_recursos_ok"] = False
     ss["ficha_modo_teste_design"] = True
     ss["ficha_dados_enviados"] = _dados_ficha_demo_design()
     ss["sf_contact_id"] = None
@@ -4707,13 +5004,7 @@ def _processar_envio_cadastro() -> None:
 
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
-        ss["ficha_erros_envio"] = {
-            "kind": "text",
-            "text": (
-                "Configure **[google_sheets]** nos Secrets com `SERVICE_ACCOUNT_JSON` "
-                "(JSON da conta de serviço com acesso à planilha)."
-            ),
-        }
+        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
         return
 
     gs = {}
@@ -4729,12 +5020,9 @@ def _processar_envio_cadastro() -> None:
     cab = cabecalho_planilha()
 
     try:
-        row_num = anexar_linha(linha, cab, sid, wname, creds)
-    except Exception as e:
-        ss["ficha_erros_envio"] = {
-            "kind": "html",
-            "html": f"<strong>Erro ao gravar na planilha:</strong> {html.escape(str(e))}",
-        }
+        row_num = anexar_linha(linha, cab, sid, wname, creds, gs)
+    except Exception:
+        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
         return
 
     ss["ficha_dados_enviados"] = dados
@@ -4746,6 +5034,7 @@ def _processar_envio_cadastro() -> None:
     ss["ficha_sf_retry_wname"] = wname
     ss["ficha_identidade_drive_link"] = None
     ss["ficha_identidade_drive_erro"] = None
+    ss["ficha_identidade_email_para"] = None
 
     up_doc = ss.get("ficha_identidade_upload")
     if up_doc:
@@ -4761,8 +5050,18 @@ def _processar_envio_cadastro() -> None:
         )
         if dlink:
             ss["ficha_identidade_drive_link"] = dlink
-        if derr:
-            ss["ficha_identidade_drive_erro"] = derr
+        else:
+            dest_doc = _email_destino_documento_identidade(sec)
+            ok_mail, err_mail = enviar_documento_identidade_por_email(
+                up_doc, dados, dest_doc
+            )
+            if ok_mail:
+                ss["ficha_identidade_email_para"] = dest_doc
+            else:
+                partes = [x for x in (derr, err_mail) if x]
+                ss["ficha_identidade_drive_erro"] = " | ".join(partes) if partes else (
+                    "Falha no Drive e no envio por e-mail."
+                )
 
     _aplicar_secrets_sf()
     if not _credenciais_salesforce_ok():
@@ -4907,7 +5206,6 @@ def _retentar_salesforce_ultimo_envio() -> None:
         atualizar_status_envio_salesforce(str(sid), str(wname), creds, int(row_num), "Sucesso", "", link)
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
-        ss["ficha_popup_recursos_ok"] = False
         ss.pop("ficha_sf_retry_row", None)
         ss.pop("ficha_sf_retry_sid", None)
         ss.pop("ficha_sf_retry_wname", None)
@@ -4924,17 +5222,32 @@ def _retentar_salesforce_ultimo_envio() -> None:
 
 @st.dialog("Obrigado — você faz parte da nossa operação", width="medium")
 def _dialog_recursos_pos_cadastro() -> None:
-    """Popup ao concluir o cadastro: mapa, vídeo e links úteis."""
+    """Popup ao concluir o cadastro: confirmação (bolinha ✓), mapa, vídeo e links úteis."""
     ss = st.session_state
+    modo_design = bool(ss.get("ficha_modo_teste_design"))
 
-    st.markdown(
-        """
+    if modo_design:
+        _render_status_final_tela(
+            sucesso=True,
+            mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
+        )
+        st.info(
+            "Modo teste de design: o PDF/e-mail usam **dados fictícios**. Use **Finalizar** para voltar ao formulário."
+        )
+        st.markdown(
+            "Abaixo: pré-visualização do **mapa**, **vídeo** do simulador e **links** úteis (como no fluxo real)."
+        )
+    else:
+        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
+        st.markdown(
+            """
 **Recebemos o seu cadastro com sucesso.** Você deve ter recebido **automaticamente** no seu e-mail do cadastro
 uma mensagem com **apresentação da Direcional**, **links de materiais de vendas** e, quando possível, o **PDF da ficha** em anexo.
 
-Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador e **links** úteis.
-        """.strip()
-    )
+Aqui neste painel: **mapa** de empreendimentos, **vídeo** do simulador e **links** úteis.
+            """.strip()
+        )
+
     st.markdown("##### Empreendimentos no mapa")
     st.caption(
         "Minimapa: **+** / **−** para zoom, arraste para mover e **tela cheia** no canto superior direito."
@@ -4943,8 +5256,8 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador e **links** 
         from empreendimentos_mapa import render_mapa_empreendimentos_streamlit
 
         render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
-    except Exception as e:
-        st.caption(f"Mapa indisponível: {e}")
+    except Exception:
+        st.caption("Mapa indisponível no momento.")
     st.markdown("##### Como usar o simulador")
     st.markdown(
         f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
@@ -4986,7 +5299,7 @@ Aqui no popup: **mapa** de empreendimentos, **vídeo** do simulador e **links** 
 
     st.markdown("")
     if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_dialog_recursos_fechar"):
-        ss["ficha_popup_recursos_ok"] = True
+        _finalizar_popup_e_novo_cadastro()
         st.rerun()
 
 
@@ -5009,113 +5322,8 @@ def main():
         _render_sidebar_teste_planilha_sf()
 
     if ss.get("ficha_sucesso"):
-        cid_sf = ss.get("sf_contact_id")
-        modo_design = bool(ss.get("ficha_modo_teste_design"))
-        if cid_sf and not modo_design and not ss.get("ficha_popup_recursos_ok"):
-            _dialog_recursos_pos_cadastro()
-
-        if ss.get("ficha_modo_teste_design"):
-            _alert_azul(
-                "**Modo teste de design:** nenhum dado foi enviado para planilha ou Salesforce. "
-                "Os campos do PDF/e-mail estão preenchidos com **dados fictícios** para pré-visualização. "
-                "Use **Finalizar** no popup para fechá-lo e conferir o restante da tela."
-            )
-
+        _dialog_recursos_pos_cadastro()
         _cabecalho_pagina()
-        cid = ss.get("sf_contact_id")
-        err_sf = ss.get("sf_erro")
-        ok_sf = not bool(err_sf)
-
-        if ss.get("ficha_modo_teste_design"):
-            _render_status_final_tela(
-                sucesso=True,
-                mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
-            )
-        elif ok_sf:
-            _render_status_final_tela(
-                sucesso=True,
-                mensagem=(
-                    "Sucesso, formulário enviado. Iremos verificar o seu perfil e retornar com mais informações. "
-                    "O envio não significa admissão automática pela equipe."
-                ),
-            )
-        else:
-            _render_status_final_tela(
-                sucesso=False,
-                mensagem=(
-                    "O cadastro foi registrado na planilha, mas houve um problema técnico ao criar o contato no Salesforce."
-                ),
-                detalhe_html=f"<strong>Detalhe:</strong> {_html_erro_salesforce_multilinha(err_sf)}"
-                if err_sf
-                else "",
-            )
-
-        if cid:
-            u_sf = _url_contact(str(cid))
-            st.markdown(
-                f"**Contato Salesforce:** [`{html.escape(str(cid))}`]({u_sf})"
-            )
-
-        id_link = ss.get("ficha_identidade_drive_link")
-        id_err = ss.get("ficha_identidade_drive_erro")
-        if id_link:
-            st.markdown(f"**Documento de identidade:** [abrir no Google Drive]({id_link})")
-        elif id_err:
-            st.caption(f"Documento de identidade não foi enviado ao Drive: {id_err}")
-
-        pode_retry_sf = bool(
-            err_sf
-            and ss.get("ficha_sf_retry_row") is not None
-            and not ss.get("ficha_modo_teste_design")
-        )
-        if pode_retry_sf:
-            st.caption(
-                "Os dados já foram salvos na **planilha**. Você pode tentar criar o contato no Salesforce "
-                "de novo **sem duplicar** a linha."
-            )
-            if st.button(
-                "Tentar novamente — enviar ao Salesforce",
-                type="primary",
-                use_container_width=True,
-                key="ficha_retry_salesforce",
-            ):
-                _retentar_salesforce_ultimo_envio()
-                st.rerun()
-
-        avisos = ss.get("sf_avisos") or []
-        if avisos:
-            lista = "<br>".join(f"• {html.escape(a)}" for a in avisos)
-            st.caption("Avisos técnicos:")
-            _alert_vermelho_html(lista)
-
-        ok_mail = ss.get("ficha_email_boas_vindas_ok")
-        msg_mail = ss.get("ficha_email_boas_vindas_msg") or ""
-        if ok_mail is True:
-            st.caption("Um e-mail automático foi enviado para o endereço informado no cadastro (quando configurado).")
-        elif ok_mail is False and msg_mail:
-            st.caption(f"E-mail automático: {msg_mail}")
-
-        if cid and not ss.get("ficha_modo_teste_design"):
-            st.caption(
-                "Abra o **popup** (se ainda estiver visível) para mapa, vídeo do simulador e links úteis."
-            )
-
-        if st.button("Começar um novo cadastro", use_container_width=True):
-            _limpar_session_formulario()
-            ss["ficha_sucesso"] = False
-            ss.pop("ficha_dados_enviados", None)
-            ss.pop("sf_contact_id", None)
-            ss.pop("sf_erro", None)
-            ss.pop("sf_avisos", None)
-            ss.pop("ficha_secao_idx", None)
-            ss.pop("ficha_popup_recursos_ok", None)
-            ss.pop("ficha_email_boas_vindas_ok", None)
-            ss.pop("ficha_email_boas_vindas_msg", None)
-            ss.pop("ficha_identidade_upload", None)
-            ss.pop("ficha_identidade_drive_link", None)
-            ss.pop("ficha_identidade_drive_erro", None)
-            st.rerun()
-
         st.markdown(
             '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
             unsafe_allow_html=True,
@@ -5126,12 +5334,12 @@ def main():
 
     if _design_teste_habilitado():
         with st.expander(
-            "Modo teste de design — popup e tela de sucesso (sem enviar dados)",
+            "Modo teste de design — popup de conclusão (sem enviar dados)",
             expanded=_design_teste_expander_aberto(),
         ):
             st.markdown(
-                "Simula o **cadastro concluído**: abre o **popup** (mapa, vídeo, links, PDF e e-mail) e a **tela de sucesso**, "
-                "sem gravar na planilha Google nem no Salesforce. O PDF e o e-mail usam **dados fictícios** para você ver o layout."
+                "Simula o **cadastro concluído**: abre só o **popup** (confirmação, mapa, vídeo e links), "
+                "sem gravar na planilha nem no Salesforce. O PDF e o e-mail usam **dados fictícios** para você ver o layout."
             )
             st.caption(
                 "Ative este bloco com a variável de ambiente **FICHA_DESIGN_TEST=1** "
@@ -5159,7 +5367,7 @@ def main():
                 f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
             )
         elif kind == "html":
-            _alert_vermelho_html(fe.get("html") or "")
+            _alert_vermelho(FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO)
         elif kind == "text":
             _alert_vermelho(fe.get("text") or "")
 
