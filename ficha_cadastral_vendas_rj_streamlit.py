@@ -757,10 +757,7 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Email",
             req=True,
-            help=(
-                "E-mail corporativo Direcional Vendas RJ: nomesobrenome.direcionalvendas@gmail.com "
-                "(não é o mesmo campo dos dados do PIX)."
-            ),
+            help="Use o e-mail corporativo: nomesobrenome.direcionalvendas@gmail.com",
         ),
         # ——— Dados Familiares ———
         _z(
@@ -3820,12 +3817,9 @@ def _widget_campo(c: dict):
             )
         if k == "email":
             st.markdown(
-                '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:13px;'
-                'color:#64748b;line-height:1.5;">'
-                "Use o <strong>e-mail corporativo</strong> Direcional Vendas RJ: "
-                '<code style="background:#f1f5f9;padding:2px 7px;border-radius:6px;font-size:12px;">'
-                "nomesobrenome.direcionalvendas@gmail.com</code>"
-                " — não confunda com o campo <strong>Dados para PIX</strong> (quando o PIX for e-mail).</p>",
+                '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:15px;'
+                'font-weight:400;color:#334155;line-height:1.55;">'
+                "Use o e-mail corporativo: nomesobrenome.direcionalvendas@gmail.com</p>",
                 unsafe_allow_html=True,
             )
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
