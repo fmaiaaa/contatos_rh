@@ -5016,11 +5016,16 @@ def _processar_envio_cadastro() -> None:
     sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
     wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
 
+    st.caption("**Carregando…** Aguarde — gravando seu cadastro. Não feche a página.")
+    bar_envio = st.progress(0.0)
+
     linha = linha_planilha(dados)
     cab = cabecalho_planilha()
 
     try:
+        bar_envio.progress(0.15)
         row_num = anexar_linha(linha, cab, sid, wname, creds, gs)
+        bar_envio.progress(0.38)
     except Exception:
         ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
         return
@@ -5062,14 +5067,18 @@ def _processar_envio_cadastro() -> None:
                 ss["ficha_identidade_drive_erro"] = " | ".join(partes) if partes else (
                     "Falha no Drive e no envio por e-mail."
                 )
+    bar_envio.progress(0.52)
 
     _aplicar_secrets_sf()
+    bar_envio.progress(0.58)
     if not _credenciais_salesforce_ok():
         atualizar_status_envio_salesforce(
             sid, wname, creds, row_num, "Erro", "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).", ""
         )
         ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        bar_envio.progress(0.88)
         _tentar_enviar_email_boas_vindas(dados, None)
+        bar_envio.progress(1.0)
         ss["ficha_sucesso"] = True
         st.rerun()
         return
@@ -5079,7 +5088,9 @@ def _processar_envio_cadastro() -> None:
             sid, wname, creds, row_num, "Erro", "simple_salesforce não instalado.", ""
         )
         ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        bar_envio.progress(0.88)
         _tentar_enviar_email_boas_vindas(dados, None)
+        bar_envio.progress(1.0)
         ss["ficha_sucesso"] = True
         st.rerun()
         return
@@ -5087,22 +5098,27 @@ def _processar_envio_cadastro() -> None:
     payload, avisos = montar_payload_salesforce(dados)
     avisos = list(avisos)
     avisos.extend(_enriquecer_mobile_phone(payload, dados))
+    bar_envio.progress(0.68)
 
-    with st.spinner("Conectando ao Salesforce e criando contato..."):
-        sf = conectar_salesforce()
+    sf = conectar_salesforce()
+    bar_envio.progress(0.78)
     if not sf:
         atualizar_status_envio_salesforce(
             sid, wname, creds, row_num, "Erro", "Falha ao conectar ao Salesforce (credenciais ou rede).", ""
         )
         ss["sf_erro"] = "Falha ao conectar ao Salesforce."
         ss["sf_avisos"] = avisos
+        bar_envio.progress(0.88)
         _tentar_enviar_email_boas_vindas(dados, None)
+        bar_envio.progress(1.0)
         ss["ficha_sucesso"] = True
         st.rerun()
         return
 
     _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
+    bar_envio.progress(0.85)
     cid, err = criar_contato_payload(sf, payload)
+    bar_envio.progress(0.93)
     link = _url_contact(cid) if cid else ""
 
     if cid:
@@ -5118,7 +5134,9 @@ def _processar_envio_cadastro() -> None:
         ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
     ss["sf_avisos"] = avisos
+    bar_envio.progress(0.96)
     _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
+    bar_envio.progress(1.0)
     ss["ficha_sucesso"] = True
     st.rerun()
 
