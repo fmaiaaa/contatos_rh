@@ -985,6 +985,20 @@ CAMPOS_CRECI_DETALHES: frozenset[str] = frozenset(
     }
 )
 
+# Campos Salesforce de CRECI/TTI: removidos do JSON de insert quando «Possui CRECI?» ≠ Sim.
+# Observations__c não entra aqui — pode reunir outras observações além do bloco CRECI.
+SF_CAMPOS_CRECI_OMITIR_SEM_POSSE: frozenset[str] = frozenset(
+    {
+        "CRECI__c",
+        "Validade_CRECI__c",
+        "Status_CRECI__c",
+        "Data_Matricula_TTI__c",
+        "Data_de_conclusao__c",
+        "Nome_do_Responsavel__c",
+        "CRECI_do_Responsavel__c",
+    }
+)
+
 
 def campos_por_secao_visiveis(
     sec: str, dados: Optional[Dict[str, Any]] = None
@@ -1263,6 +1277,38 @@ def _proximo_apelido_disponivel(sf: Any, primeiro_nome: str) -> Optional[str]:
     return f"{base}_RJ{prox:02d}"
 
 
+def _salesforce_possui_creci_field_name() -> str:
+    """
+    Opcional: API name de um checkbox no Contact (ex.: Possui_CRECI__c).
+    Configure em [salesforce] POSSUI_CRECI_FIELD nos Secrets ou env SF_POSSUI_CRECI_FIELD.
+    Permite que a regra de validação do org exija CRECI só quando o corretor declara que possui.
+    """
+    try:
+        if hasattr(st, "secrets"):
+            s = st.secrets.get("salesforce")
+            if isinstance(s, dict):
+                v = (s.get("POSSUI_CRECI_FIELD") or s.get("possui_creci_field") or "").strip()
+                if v:
+                    return v
+    except Exception:
+        pass
+    return (os.environ.get("SF_POSSUI_CRECI_FIELD") or "").strip()
+
+
+def _ajustar_payload_creci_conforme_possui(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
+    """Garante que nenhum campo de CRECI vá no insert quando o usuário respondeu «Não»."""
+    possui = (str(dados.get("possui_creci") or "").strip())
+    chk = _salesforce_possui_creci_field_name()
+    if possui == "Sim":
+        if chk:
+            payload[chk] = True
+        return
+    for k in SF_CAMPOS_CRECI_OMITIR_SEM_POSSE:
+        payload.pop(k, None)
+    if chk:
+        payload[chk] = False
+
+
 def _aplicar_enriquecimentos_payload_sf(
     payload: Dict[str, Any], dados: Dict[str, Any], sf: Any, avisos: List[str]
 ) -> None:
@@ -1405,6 +1451,7 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
 
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
+    _ajustar_payload_creci_conforme_possui(payload, dados)
 
     return payload, avisos
 
@@ -1469,7 +1516,8 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     out["data_credenciamento"] = hoje
     if (str(out.get("possui_creci") or "").strip()) != "Sim":
         for k in CAMPOS_CRECI_DETALHES:
-            out[k] = ""
+            if k in out:
+                del out[k]
     return out
 
 
@@ -2075,7 +2123,11 @@ def upload_identidade_google_drive(
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseUpload
     except ImportError:
-        return None, "Pacote google-api-python-client não instalado (requirements.txt)."
+        return (
+            None,
+            "Dependência ausente: instale com «pip install google-api-python-client google-auth-httplib2» "
+            "e faça **redeploy** no Streamlit Cloud (o requirements.txt na pasta do app deve listar esses pacotes).",
+        )
 
     try:
         try:
