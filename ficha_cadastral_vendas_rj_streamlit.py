@@ -615,7 +615,7 @@ def _campos_def() -> List[Campo]:
             tipo="date",
             sf="Birthdate",
             req=True,
-            help="Formato: 31/12/2024",
+            help="Exibição em dia/mês/ano (calendário brasileiro).",
         ),
         _z(
             key="estado_civil",
@@ -2655,12 +2655,40 @@ def aplicar_estilo():
                 url("{bg_url}") center / cover no-repeat !important;
             background-attachment: scroll !important;
         }}
-        [data-testid="stHeader"] {{ background: transparent !important; }}
+        /* Cabeçalho + barra (share, GitHub, estrela, lápis): mesmo degradê e foto do fundo — sem “tarja” diferente */
+        header[data-testid="stHeader"],
+        [data-testid="stHeader"] {{
+            background:
+                linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
+                url("{bg_url}") center / cover no-repeat !important;
+            background-attachment: scroll !important;
+        }}
+        [data-testid="stDecoration"] {{
+            background: transparent !important;
+        }}
         [data-testid="stSidebar"] {{ display: none !important; }}
         [data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
         [data-testid="stToolbar"] {{
-            background: rgba(255,255,255,0.15) !important;
-            border-radius: 12px;
+            background: transparent !important;
+            border: none !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+            color: rgba(255, 255, 255, 0.92) !important;
+        }}
+        [data-testid="stToolbar"] button,
+        [data-testid="stToolbar"] a {{
+            color: rgba(255, 255, 255, 0.92) !important;
+        }}
+        [data-testid="stToolbar"] svg {{
+            fill: currentColor !important;
+            color: inherit !important;
+        }}
+        [data-testid="stToolbar"] svg path[stroke] {{
+            stroke: currentColor !important;
+        }}
+        [data-testid="stToolbar"] button:hover,
+        [data-testid="stToolbar"] a:hover {{
+            background: rgba(255, 255, 255, 0.12) !important;
         }}
         /* Área principal: topo/base mais compactos para a box não “flutuar” com margem excessiva */
         [data-testid="stMain"] {{
@@ -3301,6 +3329,7 @@ def _widget_campo(c: dict):
         if k == "birthdate":
             kw["min_value"] = date(1920, 1, 1)
             kw["max_value"] = date.today()
+            kw["format"] = "DD/MM/YYYY"
         return st.date_input(
             widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv, **kw
         )
