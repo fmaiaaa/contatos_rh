@@ -460,24 +460,24 @@ def _campos_def() -> List[Campo]:
     return [
         # ——— Informações para contato ———
         _z(
+            key="account_name_nao_sei",
+            label="Sabe o nome do gerente na planilha? *",
+            sec="Informações para contato",
+            tipo="select",
+            sf=None,
+            opcoes=["--Nenhum--", "Sim", "Não"],
+            req=True,
+            help="**Sim:** escolha o nome na lista abaixo. **Não:** o cadastro segue com uma conta interna automática (o campo de escolha fica oculto).",
+        ),
+        _z(
             key="account_name",
-            label="Nome da conta *",
+            label="Nome do gerente (conta) *",
             sec="Informações para contato",
             tipo="select",
             sf=None,
             opcoes=list(NOMES_CONTA_FIXOS),
-            req=True,
-            help="Opções: coluna «Nome da Conta» na aba «Gerentes» da planilha Google ([google_sheets]); senão [ficha_defaults]. Se não souber, marque abaixo e selecione qualquer opção.",
-        ),
-        _z(
-            key="account_name_nao_sei",
-            label="Não sei o nome da conta?",
-            sec="Informações para contato",
-            tipo="select",
-            sf=None,
-            opcoes=["--Nenhum--", "Não", "Sim"],
             req=False,
-            help="Quando não souber, marque Sim e selecione qualquer conta no campo acima.",
+            help="Coluna «Nome da Conta» na aba «Gerentes» da planilha ([google_sheets]); senão [ficha_defaults].",
         ),
         _z(
             key="account_id",
@@ -649,11 +649,10 @@ def _campos_def() -> List[Campo]:
             key="naturalidade",
             label="Naturalidade *",
             sec="Dados Pessoais",
-            tipo="select",
+            tipo="text",
             sf="Naturalidade__c",
-            opcoes=["--Nenhum--"],
             req=True,
-            help="Municípios oficiais do IBGE para a UF selecionada acima (nome exato para integração).",
+            help="Cidade de nascimento (livre). Use o nome completo do município, alinhado à UF acima.",
         ),
         _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
         _z(
@@ -966,6 +965,7 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
         "data_credenciamento",
         "multiplicador_nivel",
         "multiplicador_regime",
+        "salutation",
     }
 )
 
@@ -1002,6 +1002,13 @@ def campos_por_secao_visiveis(
         d = dados or {}
         if _norm_picklist(d.get("unidade_negocio")) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
             cols = [c for c in cols if c["key"] != "atividade"]
+        if _norm_picklist(d.get("account_name_nao_sei")) != "Sim":
+            cols = [c for c in cols if c["key"] != "account_name"]
+    if sec == "Dados Familiares":
+        d = dados or {}
+        ec = _norm_picklist(d.get("estado_civil"))
+        if ec == "Solteiro" or not ec:
+            cols = [c for c in cols if c["key"] != "nome_conjuge"]
     return cols
 
 
@@ -1101,12 +1108,13 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
             continue
         if v is None or (isinstance(v, str) and not str(v).strip()):
             erros.append(c["label"])
+    sabe_ger = _norm_picklist(dados.get("account_name_nao_sei"))
     aid = (dados.get("account_id") or "").strip()
     aname = (dados.get("account_name") or "").strip()
-    if not aid and not aname:
+    if sabe_ger == "Sim" and not aid and not aname:
         erros.append(
             "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
-            "(ou selecione Nome da conta)."
+            "(ou selecione o nome do gerente / conta)."
         )
     nc = (dados.get("nome_completo") or "").strip()
     if not nc:
@@ -1116,6 +1124,9 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
         erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
     erros.extend(_erros_preenchimento_creci_se_sim(dados))
     erros.extend(_erros_conjuge_se_casado(dados))
+    cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
+    if cpf_d and len(cpf_d) != 11:
+        erros.append("CPF * (informe 11 dígitos)")
     return list(dict.fromkeys(erros))
 
 
@@ -1151,19 +1162,26 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         if v is None or (isinstance(v, str) and not str(v).strip()):
             erros.append(c["label"])
     if sec == "Informações para contato":
-        aid = (dados.get("account_id") or "").strip()
-        aname = (dados.get("account_name") or "").strip()
-        if not aid and not aname:
-            erros.append(
-                "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
-                "(ou selecione Nome da conta)."
-            )
+        sabe_ger = _norm_picklist(dados.get("account_name_nao_sei"))
+        if not sabe_ger:
+            erros.append("Sabe o nome do gerente na planilha? *")
+        if sabe_ger == "Sim":
+            aid = (dados.get("account_id") or "").strip()
+            aname = (dados.get("account_name") or "").strip()
+            if not aid and not aname:
+                erros.append(
+                    "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
+                    "(ou selecione o nome do gerente / conta)."
+                )
     if sec == "Dados para Contato":
         em = (dados.get("email") or "").strip()
         if em and not email_contato_formato_valido(em):
             erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
     if sec == "Dados Pessoais":
         erros.extend(_erros_conjuge_se_casado(dados))
+        cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
+        if cpf_d and len(cpf_d) != 11:
+            erros.append("CPF * (informe 11 dígitos)")
     if sec == "CRECI/TTI":
         erros.extend(_erros_preenchimento_creci_se_sim(dados))
     return list(dict.fromkeys(erros))
@@ -1271,6 +1289,19 @@ def _aplicar_enriquecimentos_payload_sf(
         payload["Apelido__c"] = apel
 
 
+def _completar_validacao_org_salesforce(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
+    """
+    Regras de validação no org que exigem CRECI e validade mesmo quando «Possui CRECI?» = Não.
+    Valores sentinela evitam FIELD_CUSTOM_VALIDATION_EXCEPTION no insert.
+    """
+    possui = (str(dados.get("possui_creci") or "").strip())
+    if possui != "Sim":
+        if not str(payload.get("CRECI__c") or "").strip():
+            payload["CRECI__c"] = "Não possui"
+        if not payload.get("Validade_CRECI__c"):
+            payload["Validade_CRECI__c"] = "2099-12-31"
+
+
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     payload: Dict[str, Any] = {}
     rt, rt_aviso = record_type_id_contato_payload_e_aviso()
@@ -1359,6 +1390,12 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                 payload[sf] = s
             continue
 
+        if key == "cpf" and sf == "CPF__c":
+            digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
+            if digits:
+                payload[sf] = digits
+            continue
+
         s = (str(raw).strip() if raw is not None else "") or ""
         if not s:
             continue
@@ -1377,6 +1414,7 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
 
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
+    _completar_validacao_org_salesforce(payload, dados)
 
     return payload, avisos
 
@@ -1388,6 +1426,22 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     apelido e datas automáticos.
     """
     out = dict(dados)
+
+    sx = _norm_picklist(out.get("sexo"))
+    if sx == "Masculino":
+        out["salutation"] = "Sr."
+    elif sx == "Feminino":
+        out["salutation"] = "Sra."
+    else:
+        out["salutation"] = ""
+
+    sabe_ger = _norm_picklist(out.get("account_name_nao_sei"))
+    if sabe_ger == "Não":
+        opts = _opcoes_nome_conta()
+        if opts:
+            out["account_name"] = opts[0]
+        elif NOMES_CONTA_FIXOS:
+            out["account_name"] = str(NOMES_CONTA_FIXOS[0])
 
     rede = _norm_picklist(out.get("unidade_negocio"))
 
@@ -1589,6 +1643,8 @@ def _preview_linha_planilha(headers: List[str], cells: List[str]) -> str:
 
 def _teste_planilha_sf_habilitado() -> bool:
     """Controlado pela constante `FICHA_TEST_PLANILHA_ATIVO` (bloco «Modo teste» junto aos IDs da planilha)."""
+    if FICHA_MODO_PRODUCAO:
+        return False
     return bool(FICHA_TEST_PLANILHA_ATIVO)
 
 
@@ -1892,6 +1948,8 @@ DEFAULT_COL_NOME_CONTA = "Nome da Conta"
 # --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
 # Altere aqui no código; deixe ATIVO = False em produção.
 FICHA_TEST_PLANILHA_ATIVO = False
+# Produção: esconde sidebar e desativa blocos de teste/debug de interface.
+FICHA_MODO_PRODUCAO = True
 # Se não vazio, o painel de teste lê esta planilha/aba (ignora SPREADSHEET_ID/WORKSHEET_NAME dos Secrets).
 FICHA_TEST_PLANILHA_SPREADSHEET_ID = ""
 FICHA_TEST_PLANILHA_WORKSHEET_NAME = ""
@@ -2403,7 +2461,7 @@ def _credenciais_salesforce_ok() -> bool:
 
 def aplicar_estilo():
     bg_url = (
-        "https://images.unsplash.com/photo-1497366216548-37526070297c"
+        "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab"
         "?auto=format&fit=crop&w=1920&q=80"
     )
     st.markdown(
@@ -2421,11 +2479,13 @@ def aplicar_estilo():
         html, body {{ font-family: 'Inter', sans-serif; color: {COR_TEXTO_LABEL}; }}
         [data-testid="stAppViewContainer"] {{
             background:
-                linear-gradient(160deg, rgba({RGB_AZUL_CSS}, 0.88) 0%, rgba({RGB_AZUL_CSS}, 0.72) 45%, rgba({RGB_VERMELHO_CSS}, 0.15) 100%),
+                linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
                 url("{bg_url}") center / cover no-repeat !important;
             background-attachment: scroll !important;
         }}
         [data-testid="stHeader"] {{ background: transparent !important; }}
+        [data-testid="stSidebar"] {{ display: none !important; }}
+        [data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
         [data-testid="stToolbar"] {{
             background: rgba(255,255,255,0.15) !important;
             border-radius: 12px;
@@ -2935,30 +2995,6 @@ def _opcoes_nome_conta() -> list[str]:
     return list(NOMES_CONTA_FIXOS)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def _municipios_ibge_por_uf(uf: str) -> Tuple[str, ...]:
-    """
-    Nomes oficiais dos municípios (IBGE) para a sigla da UF.
-    Cache de 24h para não sobrecarregar a API.
-    """
-    u = (uf or "").strip().upper()
-    if not u or u == "--NENHUM--" or len(u) != 2:
-        return tuple()
-    try:
-        r = requests.get(
-            f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{u}/municipios",
-            timeout=45,
-        )
-        r.raise_for_status()
-        data = r.json()
-        nomes = sorted(
-            {str(m.get("nome", "")).strip() for m in data if isinstance(m, dict) and m.get("nome")}
-        )
-        return tuple(nomes)
-    except Exception:
-        return tuple()
-
-
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
     """Se o rótulo termina com ' *', devolve texto sem o asterisco e True."""
     s = (label or "").rstrip()
@@ -3011,7 +3047,13 @@ def _widget_campo(c: dict):
         atual = _coerce_date_widget_value(st.session_state.get(sk))
         if sk in st.session_state:
             st.session_state[sk] = atual
-        return st.date_input(widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv)
+        kw: Dict[str, Any] = {}
+        if k == "birthdate":
+            kw["min_value"] = date(1920, 1, 1)
+            kw["max_value"] = date.today()
+        return st.date_input(
+            widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv, **kw
+        )
     if tipo == "number":
         return st.text_input(
             widget_label,
@@ -3029,23 +3071,6 @@ def _widget_campo(c: dict):
                 opts = list(NOMES_CONTA_FIXOS)
         elif k == "atividade":
             opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
-        elif k == "naturalidade":
-            uf_sel = _norm_picklist(st.session_state.get("fld_uf_naturalidade"))
-            if uf_sel:
-                mun = _municipios_ibge_por_uf(uf_sel)
-                if mun:
-                    opts = ["--Nenhum--"] + list(mun)
-                else:
-                    opts = ["--Nenhum--"]
-                    help_txt = (
-                        (help_txt or "")
-                        + " Não foi possível carregar municípios do IBGE; verifique a conexão."
-                    ).strip()
-            else:
-                opts = ["--Nenhum--"]
-                help_txt = (
-                    (help_txt or "") + " Selecione primeiro **UF Naturalidade**."
-                ).strip()
         if k == "possui_creci":
             opts = ["Sim", "Não"]
             return st.selectbox(
@@ -3128,6 +3153,8 @@ def _snapshot_persistir_secao_atual(sec: str) -> None:
     # Renderizados fora do st.form: garantir cópia explícita no «Avançar» (mesmo critério do loop).
     if sec == "Informações para contato" and "fld_unidade_negocio" in ss:
         snap["unidade_negocio"] = ss["fld_unidade_negocio"]
+    if sec == "Informações para contato" and "fld_account_name_nao_sei" in ss:
+        snap["account_name_nao_sei"] = ss["fld_account_name_nao_sei"]
     if sec == "CRECI/TTI" and "fld_possui_creci" in ss:
         snap["possui_creci"] = ss["fld_possui_creci"]
     ss["ficha_snap_campos"] = snap
@@ -3143,6 +3170,11 @@ def _garantir_campos_secao_de_snapshot(sec: str) -> None:
         sk = f"fld_{k}"
         if sk not in ss and k in snap:
             ss[sk] = snap[k]
+    if sec == "Informações para contato":
+        if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
+            ss["fld_unidade_negocio"] = snap["unidade_negocio"]
+        if "fld_account_name_nao_sei" not in ss and "account_name_nao_sei" in snap:
+            ss["fld_account_name_nao_sei"] = snap["account_name_nao_sei"]
 
 
 def _ficha_defaults_de_secrets() -> dict[str, Any]:
@@ -3828,11 +3860,14 @@ def _render_secao_formulario(secoes: list[str]) -> None:
             c_un = next((c for c in CAMPOS if c["key"] == "unidade_negocio"), None)
             if c_un:
                 _widget_campo(c_un)
+            c_sg = next((c for c in CAMPOS if c["key"] == "account_name_nao_sei"), None)
+            if c_sg:
+                _widget_campo(c_sg)
             dados_sec = _coletar_dados_formulario_completo()
             cols = [
                 c
                 for c in campos_por_secao_visiveis(sec, dados_sec)
-                if c["key"] != "unidade_negocio"
+                if c["key"] not in ("unidade_negocio", "account_name_nao_sei")
             ]
         else:
             cols = campos_por_secao_visiveis(sec, dados_sec)
@@ -3856,18 +3891,18 @@ def _render_secao_formulario(secoes: list[str]) -> None:
 
             st.markdown("<br/>", unsafe_allow_html=True)
             if idx < n - 1:
-                col_voltar, col_avancar = st.columns(2)
-                with col_voltar:
-                    clicou_voltar = st.form_submit_button(
-                        "Voltar",
-                        use_container_width=True,
-                        disabled=(idx <= 0),
-                    )
+                col_avancar, col_voltar = st.columns(2)
                 with col_avancar:
                     clicou_avancar = st.form_submit_button(
                         "Avançar",
                         type="primary",
                         use_container_width=True,
+                    )
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(idx <= 0),
                     )
             else:
                 st.markdown(
@@ -3892,18 +3927,18 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                     key="fld_lgpd_ficha",
                     label_visibility="collapsed",
                 )
-                col_voltar, col_enviar = st.columns(2)
-                with col_voltar:
-                    clicou_voltar = st.form_submit_button(
-                        "Voltar",
-                        use_container_width=True,
-                        disabled=(len(secoes) <= 1),
-                    )
+                col_enviar, col_voltar = st.columns(2)
                 with col_enviar:
                     clicou_enviar = st.form_submit_button(
                         "Enviar meu cadastro",
                         type="primary",
                         use_container_width=True,
+                    )
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(len(secoes) <= 1),
                     )
 
         if idx < n - 1:
@@ -3969,6 +4004,8 @@ def _limpar_session_formulario():
 
 def _design_teste_habilitado() -> bool:
     """Modo teste de layout: env `FICHA_DESIGN_TEST=1` ou URL `?design_test=1`."""
+    if FICHA_MODO_PRODUCAO:
+        return False
     if (os.environ.get("FICHA_DESIGN_TEST") or "").strip().lower() in ("1", "true", "yes", "on"):
         return True
     try:
@@ -4010,6 +4047,7 @@ def _dados_ficha_demo_design() -> dict[str, Any]:
         else:
             demo[k] = f"[Preview] {c['label'][:48]}"
     demo["nome_completo"] = "Maria Silva Santos (pré-visualização design)"
+    demo["account_name_nao_sei"] = "Sim"
     opts = _opcoes_nome_conta()
     demo["account_name"] = opts[0] if opts else (NOMES_CONTA_FIXOS[0] if NOMES_CONTA_FIXOS else "Conta demo")
     demo["cpf"] = "123.456.789-09"
@@ -4222,7 +4260,7 @@ def main():
         page_title="Credenciamento | Direcional Vendas RJ",
         page_icon=str(fav) if fav else None,
         layout="centered",
-        initial_sidebar_state="expanded" if FICHA_TEST_PLANILHA_ATIVO else "collapsed",
+        initial_sidebar_state="collapsed",
     )
     _aplicar_secrets_sf()
     aplicar_estilo()
@@ -4235,7 +4273,9 @@ def main():
         _render_sidebar_teste_planilha_sf()
 
     if ss.get("ficha_sucesso"):
-        if not ss.get("ficha_popup_recursos_ok"):
+        cid_sf = ss.get("sf_contact_id")
+        modo_design = bool(ss.get("ficha_modo_teste_design"))
+        if cid_sf and not modo_design and not ss.get("ficha_popup_recursos_ok"):
             _dialog_recursos_pos_cadastro()
 
         if ss.get("ficha_modo_teste_design"):
@@ -4283,8 +4323,8 @@ def main():
             )
 
         st.caption(
-            "No popup: mapa, vídeo e links úteis. O **e-mail principal** (com apresentação, links e PDF) "
-            "já foi disparado para o e-mail do formulário ao concluir o envio."
+            "Quando o contato é criado no Salesforce, o **popup** traz mapa, vídeo e links úteis. "
+            "O **e-mail principal** (apresentação, links e PDF) foi disparado para o e-mail do cadastro ao enviar."
         )
 
         if st.button("Começar um novo cadastro", use_container_width=True):
