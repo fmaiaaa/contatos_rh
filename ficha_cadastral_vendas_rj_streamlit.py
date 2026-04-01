@@ -253,6 +253,11 @@ UNIDADES_NEGOCIO = [
 # Atividade restrita ao fluxo Vendas RJ (picklist SF: Corretor Parceiro, Corretor, Captador).
 ATIVIDADE_VENDAS_RJ_OPTS = ["--Nenhum--", "Corretor Parceiro", "Corretor", "Captador"]
 
+# Alinhamento às validation rules do Contact (CRECICoretor, Validade_CRECI, MatriculaTTI_Estagiario…).
+_SF_ATIVIDADE_EXIGE_CRECI_NUMERO = frozenset({"Corretor"})
+_SF_ATIVIDADE_EXIGE_VALIDADE_CRECI = frozenset({"Corretor", "Estagiário"})
+_SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO = frozenset({"Estagiário"})
+
 TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Telefone", "Chave aleatória"]
 
 ESTADOS_UF = [
@@ -805,7 +810,8 @@ def _campos_def() -> List[Campo]:
             sf=None,
             opcoes=["Sim", "Não"],
             req=True,
-            help="Se sim, os campos de CRECI aparecem abaixo. Se não, avance para a próxima etapa.",
+            help="Para atividade «Corretor», o Salesforce exige CRECI e validade (regras CRECICoretor e Validade_CRECI) — "
+            "os campos aparecem abaixo mesmo com «Não». Para «Corretor Parceiro» ou «Captador», detalhes só se marcar «Sim».",
         ),
         _z(
             key="data_matricula_tti",
@@ -1010,7 +1016,7 @@ def campos_por_secao_visiveis(
     ]
     if sec == "CRECI/TTI":
         d = dados or {}
-        if (str(d.get("possui_creci") or "").strip()) != "Sim":
+        if not _formulario_exibe_creci_detalhado(d):
             cols = [c for c in cols if c["key"] == "possui_creci"]
     if sec == "Informações para contato":
         d = dados or {}
@@ -1042,6 +1048,63 @@ def _norm_picklist(val: Any) -> str:
     if s in ("--Nenhum--", "Nenhum"):
         return ""
     return s
+
+
+def _atividade_sf_norm(dados: Optional[Dict[str, Any]]) -> str:
+    if not dados:
+        return ""
+    return _norm_picklist(dados.get("atividade"))
+
+
+def _status_creci_em_estagio(dados: Optional[Dict[str, Any]]) -> bool:
+    if not dados:
+        return False
+    return _norm_picklist(dados.get("status_creci")) == "Estágio"
+
+
+def _formulario_exibe_creci_detalhado(dados: Optional[Dict[str, Any]]) -> bool:
+    """
+    Exibe campos de CRECI/TTI além de «Possui CRECI?» quando:
+    - usuário marcou «Sim», ou
+    - validation rules do org exigem dados pela Atividade__c / Status_CRECI__c.
+    """
+    if not dados:
+        return False
+    if (str(dados.get("possui_creci") or "").strip()) == "Sim":
+        return True
+    act = _atividade_sf_norm(dados)
+    if act in _SF_ATIVIDADE_EXIGE_CRECI_NUMERO or act in _SF_ATIVIDADE_EXIGE_VALIDADE_CRECI:
+        return True
+    if act in _SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO:
+        return True
+    if _status_creci_em_estagio(dados):
+        return True
+    return False
+
+
+def _incluir_campo_creci_detalhe_no_payload(dados: Dict[str, Any], key: str) -> bool:
+    if key not in CAMPOS_CRECI_DETALHES:
+        return True
+    return _formulario_exibe_creci_detalhado(dados)
+
+
+def _sf_api_names_creci_preservar_se_possui_nao(dados: Dict[str, Any]) -> frozenset[str]:
+    """Campos de API a não retirar do JSON quando «Possui CRECI» = Não mas o org ainda exige."""
+    keep: set[str] = set()
+    act = _atividade_sf_norm(dados)
+    if act in _SF_ATIVIDADE_EXIGE_CRECI_NUMERO:
+        keep.add("CRECI__c")
+    if act in _SF_ATIVIDADE_EXIGE_VALIDADE_CRECI:
+        keep.add("Validade_CRECI__c")
+    if act in _SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO or _status_creci_em_estagio(dados):
+        keep.update(
+            {
+                "Validade_CRECI__c",
+                "Data_Matricula_TTI__c",
+                "Nome_do_Responsavel__c",
+            }
+        )
+    return frozenset(keep)
 
 
 def parse_data_br(val: Any) -> Optional[str]:
@@ -1088,16 +1151,45 @@ def _erro_validacao_nascimento(v: Any) -> Optional[str]:
 
 
 def _erros_preenchimento_creci_se_sim(dados: Dict[str, Any]) -> List[str]:
-    """Se «Possui CRECI?» = Sim, exige status, número e validade."""
+    """Se «Possui CRECI?» = Sim, exige status, número (com dígitos) e validade."""
     if (str(dados.get("possui_creci") or "").strip()) != "Sim":
         return []
     er: List[str] = []
     if not _norm_picklist(dados.get("status_creci")):
         er.append("Status CRECI *")
-    if not (str(dados.get("creci") or "").strip()):
+    if not re.sub(r"\D", "", str(dados.get("creci") or "")):
         er.append("CRECI *")
-    if not (str(dados.get("validade_creci") or "").strip()):
+    if not parse_data_br(dados.get("validade_creci")):
         er.append("Validade CRECI *")
+    return er
+
+
+def _erros_creci_regras_salesforce_atividade(dados: Dict[str, Any]) -> List[str]:
+    """
+    Validation rules do org que não dependem só de «Possui CRECI?»:
+    CRECICoretor, Validade_CRECI, MatriculaTTI_Estagiario, Responsavel_obrigatorio_estagiario.
+    """
+    er: List[str] = []
+    act = _atividade_sf_norm(dados)
+    est = act in _SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO or _status_creci_em_estagio(dados)
+
+    def _dig_creci() -> str:
+        return re.sub(r"\D", "", str(dados.get("creci") or ""))
+
+    if act == "Corretor":
+        if not _dig_creci():
+            er.append("CRECI * (obrigatório no Salesforce para atividade «Corretor»)")
+        if not parse_data_br(dados.get("validade_creci")):
+            er.append("Validade CRECI * (obrigatória no Salesforce para atividade «Corretor»)")
+
+    if est:
+        if not parse_data_br(dados.get("validade_creci")):
+            er.append("Validade CRECI * (obrigatória para estagiário / CRECI em estágio no Salesforce)")
+        if not parse_data_br(dados.get("data_matricula_tti")):
+            er.append("Data Matrícula - TTI * (obrigatória no Salesforce para estagiário / CRECI em estágio)")
+        if not str(dados.get("nome_responsavel") or "").strip():
+            er.append("Nome do Responsável * (obrigatório no Salesforce para estagiário / CRECI em estágio)")
+
     return er
 
 
@@ -1162,6 +1254,7 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     if em and not email_contato_formato_valido(em):
         erros.append("E-mail * (use um endereço válido, ex.: nome@empresa.com.br)")
     erros.extend(_erros_preenchimento_creci_se_sim(dados))
+    erros.extend(_erros_creci_regras_salesforce_atividade(dados))
     erros.extend(_erros_conjuge_se_casado(dados))
     cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
     if cpf_d and len(cpf_d) != 11:
@@ -1229,6 +1322,7 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
             erros.append(eb)
     if sec == "CRECI/TTI":
         erros.extend(_erros_preenchimento_creci_se_sim(dados))
+        erros.extend(_erros_creci_regras_salesforce_atividade(dados))
     return list(dict.fromkeys(erros))
 
 
@@ -1327,14 +1421,20 @@ def _salesforce_possui_creci_field_name() -> str:
 
 
 def _ajustar_payload_creci_conforme_possui(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
-    """Garante que nenhum campo de CRECI vá no insert quando o usuário respondeu «Não»."""
+    """
+    Remove campos de CRECI do insert quando «Possui CRECI» = Não, exceto os que o Salesforce
+    ainda exige pela Atividade__c / Status_CRECI__c (preservados em _sf_api_names_creci_preservar_se_possui_nao).
+    """
     possui = (str(dados.get("possui_creci") or "").strip())
     chk = _salesforce_possui_creci_field_name()
     if possui == "Sim":
         if chk:
             payload[chk] = True
         return
+    manter = _sf_api_names_creci_preservar_se_possui_nao(dados)
     for k in SF_CAMPOS_CRECI_OMITIR_SEM_POSSE:
+        if k in manter:
+            continue
         payload.pop(k, None)
     if chk:
         payload[chk] = False
@@ -1382,7 +1482,7 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         sf = c.get("sf")
         raw = dados.get(key)
 
-        if possui_creci_sf != "Sim" and key in CAMPOS_CRECI_DETALHES:
+        if not _incluir_campo_creci_detalhe_no_payload(dados, key):
             continue
 
         if key == "nome_completo":
@@ -1462,6 +1562,15 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
             if digits:
                 payload[sf] = digits
+            continue
+
+        if key == "creci" and sf == "CRECI__c":
+            digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
+            if digits:
+                try:
+                    payload[sf] = int(digits)
+                except ValueError:
+                    payload[sf] = digits
             continue
 
         s = (str(raw).strip() if raw is not None else "") or ""
@@ -2197,7 +2306,15 @@ def upload_identidade_google_drive(
             link = f"https://drive.google.com/file/d/{fid}/view"
         return (link or None), ""
     except Exception as e:
-        return None, str(e)
+        msg = str(e)
+        low = msg.lower()
+        if "404" in msg and ("not found" in low or "filenotfound" in low or "file not found" in low):
+            msg += (
+                " — Confirme o ID da pasta pai nos Secrets [google_drive] PARENT_FOLDER_ID. "
+                "A pasta precisa existir e estar compartilhada com o e-mail «client_email» da conta de serviço (JSON), "
+                "como Editor (o link no navegador pode abrir para você mesmo sem a API enxergar a pasta)."
+            )
+        return None, msg
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
