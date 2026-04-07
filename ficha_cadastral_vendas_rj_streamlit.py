@@ -3323,15 +3323,15 @@ def aplicar_estilo():
             margin-top: clamp(4px, 1vh, 14px) !important;
             margin-bottom: clamp(4px, 1vh, 14px) !important;
             padding: 1.45rem 2.25rem 1.55rem 2.25rem !important;
-            background: rgba(255, 255, 255, 0.97) !important;
-            backdrop-filter: blur(14px) saturate(1.2);
-            -webkit-backdrop-filter: blur(14px) saturate(1.2);
+            background: rgba(255, 255, 255, 0.78) !important;
+            backdrop-filter: blur(18px) saturate(1.15);
+            -webkit-backdrop-filter: blur(18px) saturate(1.15);
             border-radius: 24px !important;
-            border: 1px solid rgba(255, 255, 255, 0.85) !important;
+            border: 1px solid rgba(255, 255, 255, 0.45) !important;
             box-shadow:
-                0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
-                0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.22),
-                inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+                0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.06),
+                0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.18),
+                inset 0 1px 0 rgba(255, 255, 255, 0.55) !important;
             animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
         }}
         h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
@@ -3470,10 +3470,14 @@ def aplicar_estilo():
         /* Container com borda (st.container(border=True)) — reforço visual opcional */
         [data-testid="stVerticalBlockBorderWrapper"] {{
             border-radius: 16px !important;
+            background: transparent !important;
+        }}
+        form[data-testid="stForm"] {{
+            background: transparent !important;
         }}
         .section-card {{
-            border: 1px solid rgba(226, 232, 240, 0.95);
-            background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+            border: 1px solid rgba(226, 232, 240, 0.65);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.88) 0%, rgba(250, 251, 252, 0.82) 100%);
             border-radius: 16px;
             padding: 1.1rem 1.35rem 1rem 1.35rem;
             margin-bottom: 1.15rem;
