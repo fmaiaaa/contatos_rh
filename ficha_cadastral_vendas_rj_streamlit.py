@@ -1,2131 +1,2381 @@
 # -*- coding: utf-8 -*-
 """
-Ficha de credenciamento — Direcional Vendas RJ (corretores).
+Previsão de vendas — Direcional (Streamlit).
 
-Arquivo único para deploy (ex.: Streamlit Cloud): campos, planilha Google, segurança e app.
-Dependências: streamlit, gspread, google-auth, simple_salesforce (requirements.txt).
+Arquivo único para deploy (ex.: Streamlit Cloud): leitura Google Sheets/CSV, pipeline de ML,
+relatório HTML e identidade visual alinhada à ficha Vendas RJ. Dependências: ver
+`requirements.txt` / `requirements-previsao.txt`.
 """
+
 from __future__ import annotations
 
-import base64
-import html
+# ----- inlined: load.py -----
+
 import io
-import json
-import os
-import platform
 import re
-import smtplib
-import sys
-import time
-from datetime import date, datetime, timezone
+import unicodedata
 from pathlib import Path
-from xml.sax.saxutils import escape as _xml_escape_para_pdf
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Mapping, Optional, Union
 
-import requests
-import streamlit as st
+import pandas as pd
 
-_DIR_APP = Path(__file__).resolve().parent
-
-# --- Salesforce (simple_salesforce; antes: salesforce_api.py) ---
-try:
-    from simple_salesforce import Salesforce, SalesforceAuthenticationFailed
-except ImportError:
-    Salesforce = None  # type: ignore[misc, assignment]
-    SalesforceAuthenticationFailed = Exception  # type: ignore[misc, assignment]
-
-_SF_SDK_DISPONIVEL = Salesforce is not None
+PathLike = Union[str, Path, BinaryIO]
 
 
-def conectar_salesforce():
-    if not _SF_SDK_DISPONIVEL:
-        return None
-    username = (os.environ.get("SALESFORCE_USER") or "").strip()
-    password = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
-    token = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
-    if not username or not password:
-        return None
-    try:
-        if token:
-            return Salesforce(
-                username=username,
-                password=password,
-                security_token=token,
-                domain="login",
-            )
-        return Salesforce(username=username, password=password, domain="login")
-    except SalesforceAuthenticationFailed:
-        return None
-    except Exception:
-        return None
-
-
-def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
-    try:
-        res = sf.Contact.create(payload)
-        return res.get("id"), None
-    except Exception as e:
-        return None, str(e)
-
-
-def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
-    """
-    INVALID_CROSS_REFERENCE_KEY em RecordTypeId: o Id 012… costuma estar certo; o usuário da API
-    frequentemente não tem esse tipo de registro no perfil (mensagem em PT: «ID do tipo de registro»).
-    """
-    base = (str(err).strip() if err is not None else "") or "Erro desconhecido"
-    u = base.upper()
-    compact = u.replace(" ", "")
-    if "INVALID_CROSS_REFERENCE_KEY" not in compact:
-        return base
-    if "RECORDTYPE" not in compact and "TIPODEREGISTRO" not in compact.replace("_", ""):
-        if "REGISTRO" not in u:
-            return base
-    return (
-        base
-        + "\n\n▸ O Id na URL (prefixo **012**) em geral está correto. Este erro indica que o **usuário da integração** "
-        "(login em [salesforce] **USER** nos Secrets) **não pode usar esse Record Type** no objeto Contact.\n"
-        "  • Ajuste no org: **Setup → Profiles** (ou **Permission Sets**) do usuário da API → **Object Settings** → "
-        "**Contact** → **Record Types** → inclua o tipo desejado (ex.: o da URL que você copiou).\n"
-        "  • **Enquanto isso:** nos Secrets use **RECORD_TYPE_ID = \"omit\"** ou remova a chave — o insert deixa de enviar "
-        "**RecordTypeId** e o Salesforce usa um tipo que o usuário já tenha como padrão (confira depois no registro)."
-    )
-
-
-def _html_erro_salesforce_multilinha(msg: Any) -> str:
-    """Escape HTML e preserva quebras para _alert_vermelho_html."""
-    return html.escape(str(msg)).replace("\n", "<br/>")
-
-
-# =============================================================================
-# INTEGRADO: corretor_campos
-# =============================================================================
-# Opcional: Id do Record Type Contact (URL Setup → Object Manager → Contact → Record Types → …/012…/view).
-# Só é usado se [salesforce] RECORD_TYPE_ID estiver vazio. Ex. de org: 012f1000000n6nNAAQ.
-# INVALID_CROSS_REFERENCE_KEY em RecordTypeId com Id 012 válido → veja _explicacao_erro_record_type_se_aplicavel (perfil).
-RECORD_TYPE_CORRETOR = ""
-
-_SF_ID_15_18 = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
-
-
-def _id_e_record_type_plausivel(rid: str) -> bool:
-    """Record Type Id no Salesforce usa prefixo de chave 012 (005 = usuário, não serve em RecordTypeId)."""
-    if not rid or len(rid) < 3 or not _SF_ID_15_18.match(rid):
-        return False
-    return rid[:3] == "012"
-
-
-_EMAIL_CONTATO_RE = re.compile(
-    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
-)
-
-
-def email_contato_formato_valido(val: Any) -> bool:
-    """Validação simples de e-mail para formulário e SMTP (evita destinos como «K»)."""
-    s = (str(val).strip() if val is not None else "") or ""
-    if not s or len(s) > 254:
-        return False
-    return bool(_EMAIL_CONTATO_RE.match(s))
-
-
-def record_type_id_contato_payload_e_aviso() -> Tuple[str, str]:
-    """
-    Record Type Id de Contact começa com **012**. **005…** é Id de **usuário** → INVALID_CROSS_REFERENCE_KEY.
-    Retorna (id_ou_vazio, aviso_se_config_incorreta).
-    """
-    for candidate in (
-        (os.environ.get("SF_RECORD_TYPE_ID") or "").strip(),
-        (RECORD_TYPE_CORRETOR or "").strip(),
-    ):
-        if not candidate:
-            continue
-        if not _SF_ID_15_18.match(candidate):
-            continue
-        if _id_e_record_type_plausivel(candidate):
-            return candidate, ""
-        return (
-            "",
-            "Secrets **[salesforce] RECORD_TYPE_ID** está incorreto: o valor não é um **Record Type Id** de Contact "
-            "(no Salesforce ele começa com **012**). **005…** é Id de **usuário**, não de tipo de registro. "
-            "Ajuste em **Setup → Object Manager → Contact → Record Types** (abra o tipo, ex.: Corretor, e copie o Id da URL) "
-            "ou remova a chave nos Secrets para usar o tipo padrão da integração.",
-        )
-    return "", ""
-
-
-def record_type_id_contato_payload() -> str:
-    rid, _ = record_type_id_contato_payload_e_aviso()
-    return rid
-
-# Ordem de navegação no Streamlit (não altera mapeamento de campos para Salesforce)
-SEC_ORDER: Tuple[str, ...] = (
-    "Dados Pessoais",
-    "Dados para Contato",
-    "Dados Familiares",
-    "Dados Bancários Pessoa Física",
-    "Informações para contato",
-    "CRECI/TTI",
-    "Preferência de contato",
-    "Dados de Usuário",
-    "Dados Integração",
-)
-
-SF_OMIT_INSERT = frozenset(
-    {
-        "Blacklist__c",
-        "RetornoIntegracaoContaBancaria__c",
-        "C_digo_Pessoa_UAU__c",
-        "Corretor_Associado__c",
-        "MultiplicadorFinal__c",
-        "Contact_ID__c",
-        "ErroIntegracaoUAU__c",
-        "RetornoIntegracaoPessoa__c",
-        "Data_Descredenciamento__c",
-        # Evita falha de picklist restrita em orgs onde "Indicação" não existe para Origem__c.
-        "Origem__c",
-    }
-)
-
-REGIONAIS = [
-    "--Nenhum--",
-    "AC",
-    "AL",
-    "AM",
-    "AP",
-    "BA",
-    "CE",
-    "DF",
-    "ES",
-    "GO",
-    "MA",
-    "MG",
-    "MS",
-    "MT",
-    "PA",
-    "PE",
-    "PI",
-    "PR",
-    "RJ",
-    "RN",
-    "RO",
-    "RR",
-    "RS",
-    "SC",
-    "SE",
-    "SP",
-    "TO",
-]
-
-ORIGENS = [
-    "--Nenhum--",
-    "RH",
-    "Indicação",
-    "Gerente",
-    "Diretor",
-    "DiRi Talent",
-    "Coordenador",
-    "Gupy",
-    "MARINHA",
-    "Creci",
-    "Parceria Estácio",
-]
-
-STATUS_CORRETOR = ["--Nenhum--", "Ativo", "Inativo", "Pré credenciado", "Reativado"]
-
-SALUTATIONS = ["--Nenhum--", "Sr.", "Sra.", "Dr.", "Dra."]
-
-SEXOS = ["--Nenhum--", "Masculino", "Feminino"]
-
-CAMISETAS = ["--Nenhum--", "PP", "P", "M", "G", "GG", "XGG"]
-
-# Valores exibidos no formulário Vendas RJ (mapeados para o picklist SF em `montar_payload_salesforce`).
-UNIDADE_REDE_OUTRA_IMOBILIARIA = "Outra imobiliária (parceira)"
-UNIDADES_NEGOCIO = [
-    "--Nenhum--",
-    "Direcional",
-    "Riva",
-    UNIDADE_REDE_OUTRA_IMOBILIARIA,
-]
-
-# Atividade restrita ao fluxo Vendas RJ (picklist SF: Corretor Parceiro, Corretor, Captador).
-ATIVIDADE_VENDAS_RJ_OPTS = ["--Nenhum--", "Corretor Parceiro", "Corretor", "Captador"]
-
-# Alinhamento às validation rules do Contact (CRECICoretor, Validade_CRECI, MatriculaTTI_Estagiario…).
-_SF_ATIVIDADE_EXIGE_CRECI_NUMERO = frozenset({"Corretor"})
-_SF_ATIVIDADE_EXIGE_VALIDADE_CRECI = frozenset({"Corretor", "Estagiário"})
-_SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO = frozenset({"Estagiário"})
-
-# Preenchimento automático no JSON do Salesforce quando o usuário não informa (ex.: «Possui CRECI» = Não).
-DEFAULT_CRECI_NUMERO_FALLBACK = 1
-DEFAULT_NOME_RESPONSAVEL_CRECI_FALLBACK = "Lucas Maia"
-
-TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Telefone", "Chave aleatória"]
-
-ESTADOS_UF = [
-    "--Nenhum--",
-    "AC",
-    "AL",
-    "AM",
-    "AP",
-    "BA",
-    "CE",
-    "DF",
-    "ES",
-    "GO",
-    "MA",
-    "MG",
-    "MS",
-    "MT",
-    "PA",
-    "PB",
-    "PE",
-    "PI",
-    "PR",
-    "RJ",
-    "RN",
-    "RO",
-    "RR",
-    "RS",
-    "SC",
-    "SE",
-    "SP",
-    "TO",
-]
-
-# Capitais dos estados (IBGE) — naturalidade segue automaticamente a UF Naturalidade.
-CAPITAL_POR_UF_BR: Dict[str, str] = {
-    "AC": "Rio Branco",
-    "AL": "Maceió",
-    "AM": "Manaus",
-    "AP": "Macapá",
-    "BA": "Salvador",
-    "CE": "Fortaleza",
-    "DF": "Brasília",
-    "ES": "Vitória",
-    "GO": "Goiânia",
-    "MA": "São Luís",
-    "MG": "Belo Horizonte",
-    "MS": "Campo Grande",
-    "MT": "Cuiabá",
-    "PA": "Belém",
-    "PB": "João Pessoa",
-    "PE": "Recife",
-    "PI": "Teresina",
-    "PR": "Curitiba",
-    "RJ": "Rio de Janeiro",
-    "RN": "Natal",
-    "RO": "Porto Velho",
-    "RR": "Boa Vista",
-    "RS": "Porto Alegre",
-    "SC": "Florianópolis",
-    "SE": "Aracaju",
-    "SP": "São Paulo",
-    "TO": "Palmas",
-}
-
-
-def _naturalidade_capital_por_uf(uf: Any) -> str:
-    s = (str(uf).strip() if uf is not None else "") or ""
-    if s in ("", "--Nenhum--", "Nenhum"):
+def normalize_header(name: str) -> str:
+    if name is None or (isinstance(name, float) and pd.isna(name)):
         return ""
-    return CAPITAL_POR_UF_BR.get(s, "")
-
-
-POSSUI_FILHOS = ["--Nenhum--", "Sim", "Não"]
-
-TIPO_CONTA_BANCARIA = ["--Nenhum--", "Corrente", "Poupança"]
-
-# Picklists Contact (fonte: salesforce_objetos_describe.json — alinhar ao org ao atualizar o describe)
-_ESTADO_CIVIL = ["Solteiro", "Casado", "Divorciado", "Viúvo"]
-_ESCOLARIDADE = [
-    "Ensino Fundamental",
-    "Ensino Médio",
-    "Superior em Andamento",
-    "Superior Completo",
-    "Mestrado em Andamento",
-    "Mestrado Concluído",
-    "Doutorado em Andamento",
-    "Doutorado Concluído",
-]
-_NACIONALIDADE = ["Brasileiro", "Estrangeira", "Espanhola"]
-_ATIVIDADE = [
-    "Captador",
-    "Estagiário",
-    "Corretor",
-    "Coordenador",
-    "Gerente de Vendas",
-    "Gerente Regional",
-    "Diretor",
-    "Gerente",
-    "Captador Recruta+",
-    "Gerente Recruta+",
-    "Corretor N1",
-    "Gerente de Vendas N1",
-    "Diretor de Vendas",
-    "Analista",
-    "Assistente",
-    "Cliente",
-    "Coordenador de Produto",
-    "Coordenador de Vendas",
-    "Diretor de Incorporação",
-    "Gerente Comercial",
-    "Gerente de Parcerias",
-    "Imobiliária Parceira",
-    "Pasteiro (a)",
-    "Superintendente",
-    "Supervisor",
-    "Autônomo Parceiro",
-    "Corretor Parceiro",
-    "Recepção",
-    "Coordenador de Parcerias",
-]
-_TIPO_CORRETOR = [
-    "Direcional Vendas – GRI (CLT)",
-    "Direcional Vendas – Autônomos",
-    "Parceiros (Externo)",
-]
-_STATUS_CRECI = [
-    "Concluído Provas",
-    "Definitivo",
-    "Estágio",
-    "Matriculado",
-    "Pendente",
-    "Protocolo Definitivo",
-    "Protocolo Estágio",
-    "Pendente Prova",
-]
-_MOTIVO_INATIVIDADE = [
-    "Solicitação do Corretor",
-    "Solicitação do Gerente de Vendas",
-    "Solicitação do Gerente Regional",
-    "Solicitação do Diretor",
-]
-_MOTIVO_DESCREDENCIAMENTO = [
-    "Falta de recurso financeiro",
-    "Oportunidade CLT",
-    "Distância",
-    "Relacionamento com o Gestor",
-    "Baixa performance",
-    "Abandono",
-    "Desistente da Incubadora",
-    "Mudança de Cidade / Estado",
-    "Problemas de Saúde",
-    "Concorrência",
-    "Comportamento Inadequado",
-    "Promoção Interna",
-    "Corretor Parceiro",
-]
-_TIPO_DESLIGAMENTO = ["Ativo", "Passivo"]
-_FORNECEDOR_UAU = ["Não", "Sim"]
-_BANCO = [
-    "001 – Banco do Brasil S.A.",
-    "004 - BANCO DO NORDESTE DO BRASIL S.A.",
-    "033 – Banco Santander (Brasil) S.A.",
-    "070 - BCO BRB SA - BRASILIA",
-    "104 – Caixa Econômica Federal",
-    "121 - Banco Agiplan",
-    "197 – Stone Pagamentos S.A.",
-    "208 – Banco BTG Pactual",
-    "212 - Banco Original S.A.",
-    "218 – Banco Bonsucesso SA",
-    "237 – Banco Bradesco S.A.",
-    "246 - Banco ABC Brasil S.A.",
-    "260 – Banco Nubank",
-    "290 – PagSeguro Internt SA",
-    "318 - BCO BMG COMERCIAL S.A",
-    "323 – Mercado Pago",
-    "336 - BANCO C6 S.A.",
-    "340 – Super digital",
-    "341 – Banco Itaú S.A.",
-    "356 – Banco Real S.A. (antigo)",
-    "364 - Gerencianet",
-    "380 – PicPay",
-    "389 – Banco Mercantil do Brasil S.A.",
-    "399 – HSBC Bank Brasil S.A. – Banco Múltiplo",
-    "403 – CORA SOCIEDADE DE CR",
-    "413 – BV",
-    "422 – Banco Safra S.A.",
-    "453 – Banco Rural S.A.",
-    "473 - Banco Caixa Geral - Brasil S.A.",
-    "623 – Banco Panamericano S.A",
-    "633 – Banco Rendimento S.A.",
-    "637 - Bco Sofisa SA.",
-    "652 – Itaú Unibanco Holding S.A.",
-    "655 – Banco Votorantim S.A.",
-    "735 - BANCO POTTENCIAL S.A.",
-    "745 – Banco Citibank S.A.",
-    "746 - BCO MODAL SA.",
-    "748 – BCO COOP. SICREDI SA",
-    "756 – Banco SICCOB S.A",
-    "77 - BCO INTERMEDIUM SA",
-    "79 - Banco Original Agro",
-    "92 - BANCO BRK",
-    "348 - BANCO XP S.A",
-    "679 - CloudWalk Instituição de Pagamento",
-    "536 – NEON PAGAMENTOS",
-    "335 -  Banco Digio S.A.",
-]
-
-ESTADO_CIVIL_OPTS = ["--Nenhum--"] + _ESTADO_CIVIL
-ESCOLARIDADE_OPTS = ["--Nenhum--"] + _ESCOLARIDADE
-NACIONALIDADE_OPTS = ["--Nenhum--"] + _NACIONALIDADE
-ATIVIDADE_OPTS = ["--Nenhum--"] + _ATIVIDADE
-TIPO_CORRETOR_OPTS = ["--Nenhum--"] + _TIPO_CORRETOR
-STATUS_CRECI_OPTS = ["--Nenhum--"] + _STATUS_CRECI
-MOTIVO_INATIVIDADE_OPTS = ["--Nenhum--"] + _MOTIVO_INATIVIDADE
-MOTIVO_DESCREDENCIAMENTO_OPTS = ["--Nenhum--"] + _MOTIVO_DESCREDENCIAMENTO
-TIPO_DESLIGAMENTO_OPTS = ["--Nenhum--"] + _TIPO_DESLIGAMENTO
-FORNECEDOR_UAU_OPTS = ["--Nenhum--"] + _FORNECEDOR_UAU
-BANCO_OPTS = ["--Nenhum--"] + _BANCO
-
-# Valores alinhados ao picklist do Salesforce (somente opções em português).
-PREFERRED_METHOD_OPTS = [
-    "Telefone de Trabalho",
-    "Telefone residencial",
-    "Celular",
-    "Email de trabalho",
-    "Email pessoal",
-    "Sem preferência",
-]
-
-# Fallback se [ficha_defaults] não tiver account_names — substitua ou use Secrets.
-NOMES_CONTA_FIXOS: Tuple[str, ...] = ("Ajuste em ficha_defaults.account_names",)
-
-Campo = Dict[str, Any]
-
-
-def _z(**kw) -> Campo:
-    return kw
-
-
-def _campos_def() -> List[Campo]:
-    """
-    Ordem idêntica ao formulário Salesforce (Novo Contato: Corretor).
-    * = obrigatório no layout (req=True), salvo quando combinado com outro campo.
-    """
-    return [
-        # ——— Informações para contato ———
-        _z(
-            key="account_name_nao_sei",
-            label="Sabe o nome do gerente na planilha? *",
-            sec="Informações para contato",
-            tipo="select",
-            sf=None,
-            opcoes=["--Nenhum--", "Sim", "Não"],
-            req=True,
-            help="**Sim:** escolha o nome na lista abaixo. **Não:** o cadastro segue com uma conta interna automática (o campo de escolha fica oculto).",
-        ),
-        _z(
-            key="account_name",
-            label="Nome do gerente (conta) *",
-            sec="Informações para contato",
-            tipo="select",
-            sf=None,
-            opcoes=list(NOMES_CONTA_FIXOS),
-            req=False,
-            help="Coluna «Nome da Conta» na aba «Gerentes» da planilha ([google_sheets]); senão [ficha_defaults].",
-        ),
-        _z(
-            key="account_id",
-            label="Nome da conta — Id (Account)",
-            sec="Informações para contato",
-            tipo="id",
-            sf="AccountId",
-            req=False,
-            help="Id Salesforce da conta (18 caracteres).",
-        ),
-        _z(
-            key="owner_id",
-            label="Proprietário do contato",
-            sec="Informações para contato",
-            tipo="id",
-            sf="OwnerId",
-            req=False,
-            help="Id do usuário proprietário (opcional).",
-        ),
-        _z(
-            key="nome_completo",
-            label="Nome completo *",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf=None,
-            req=True,
-            help="Primeira palavra = nome (Primeiro Nome no Salesforce); o restante = sobrenome. Apelido gerado automaticamente.",
-        ),
-        _z(
-            key="salutation",
-            label="Tratamento",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Salutation",
-            opcoes=SALUTATIONS,
-            req=False,
-        ),
-        _z(
-            key="apelido",
-            label="Apelido",
-            sec="Informações para contato",
-            tipo="text",
-            sf="Apelido__c",
-            req=False,
-            help="Preenchido automaticamente: primeiro nome + _RJ01",
-        ),
-        _z(
-            key="status_corretor",
-            label="Status Corretor *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Status_Corretor__c",
-            opcoes=STATUS_CORRETOR,
-            req=True,
-        ),
-        _z(
-            key="regional",
-            label="Regional *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Regional__c",
-            opcoes=REGIONAIS,
-            req=True,
-        ),
-        _z(
-            key="origem",
-            label="Origem *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Origem__c",
-            opcoes=ORIGENS,
-            req=True,
-        ),
-        _z(
-            key="sexo",
-            label="Sexo *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Sexo__c",
-            opcoes=SEXOS,
-            req=True,
-        ),
-        _z(
-            key="camiseta",
-            label="Camiseta *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Camiseta__c",
-            opcoes=CAMISETAS,
-            req=True,
-        ),
-        _z(
-            key="unidade_negocio",
-            label="Fará parte de qual rede? *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Unidade_Negocio__c",
-            opcoes=UNIDADES_NEGOCIO,
-            req=True,
-            help="Direcional, Riva ou imobiliária parceira (externa).",
-        ),
-        _z(
-            key="atividade",
-            label="Função na operação *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Atividade__c",
-            opcoes=ATIVIDADE_OPTS,
-            req=True,
-            help="No fluxo Vendas RJ o formulário restringe a Corretor Parceiro, Corretor (próprio) e Captador. Corretor = corretor próprio. Parceira externa: gravado como Corretor Parceiro.",
-        ),
-        _z(
-            key="escolaridade",
-            label="Escolaridade",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Escolaridade__c",
-            opcoes=ESCOLARIDADE_OPTS,
-            req=False,
-        ),
-        _z(
-            key="data_entrevista",
-            label="Data da Entrevista",
-            sec="Informações para contato",
-            tipo="date",
-            sf="Data_da_Entrevista__c",
-            req=False,
-            help="Definida automaticamente na data do envio.",
-        ),
-        # ——— Dados Pessoais ———
-        _z(
-            key="birthdate",
-            label="Data de nascimento *",
-            sec="Dados Pessoais",
-            tipo="date",
-            sf="Birthdate",
-            req=True,
-            help="Toque no ícone do calendário para escolher a data, ou digite (dia-mês-ano).",
-        ),
-        _z(
-            key="estado_civil",
-            label="Estado Civil *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="EstadoCivil__c",
-            opcoes=ESTADO_CIVIL_OPTS,
-            req=True,
-        ),
-        _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
-        _z(
-            key="nacionalidade",
-            label="Nacionalidade *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="Nacionalidade__c",
-            opcoes=NACIONALIDADE_OPTS,
-            req=True,
-        ),
-        _z(
-            key="uf_naturalidade",
-            label="UF Naturalidade *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="UF_Naturalidade__c",
-            opcoes=ESTADOS_UF,
-            req=True,
-        ),
-        _z(
-            key="naturalidade",
-            label="Naturalidade *",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf="Naturalidade__c",
-            req=True,
-            help="Preenchida automaticamente com a capital do estado escolhido em UF Naturalidade.",
-        ),
-        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
-        _z(
-            key="uf_rg",
-            label="UF RG *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="UF_RG__c",
-            opcoes=ESTADOS_UF,
-            req=True,
-        ),
-        _z(
-            key="tipo_pix",
-            label="Tipo do PIX *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="Tipo_do_PIX__c",
-            opcoes=TIPO_PIX,
-            req=True,
-        ),
-        _z(
-            key="dados_pix",
-            label="Dados para PIX *",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf="Dados_para_PIX__c",
-            req=True,
-        ),
-        # ——— Dados de Usuário ———
-        _z(
-            key="multiplicador_nivel",
-            label="Multiplicador de Nível",
-            sec="Dados de Usuário",
-            tipo="number",
-            sf="Multiplicador__c",
-            req=False,
-        ),
-        _z(
-            key="multiplicador_regime",
-            label="Multiplicador de Regime",
-            sec="Dados de Usuário",
-            tipo="number",
-            sf="Multiplicador_de_Regime__c",
-            req=False,
-        ),
-        # ——— Dados para Contato ———
-        _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
-        _z(key="mobile", label="Celular *", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=True),
-        _z(
-            key="email",
-            label="E-mail *",
-            sec="Dados para Contato",
-            tipo="text",
-            sf="Email",
-            req=True,
-            help="Use o e-mail corporativo: nomesobrenome.direcionalvendas@gmail.com",
-        ),
-        # ——— Dados Familiares ———
-        _z(
-            key="nome_pai",
-            label="Nome do Pai *",
-            sec="Dados Familiares",
-            tipo="text",
-            sf="Nome_do_Pai__c",
-            req=True,
-        ),
-        _z(
-            key="possui_filhos",
-            label="Possui Filho(s)?",
-            sec="Dados Familiares",
-            tipo="select",
-            sf="Possui_Filho__c",
-            opcoes=POSSUI_FILHOS,
-            req=False,
-        ),
-        _z(
-            key="nome_mae",
-            label="Nome da Mãe *",
-            sec="Dados Familiares",
-            tipo="text",
-            sf="Nome_da_Mae__c",
-            req=True,
-        ),
-        _z(
-            key="qtd_filhos",
-            label="Quantidade de Filhos",
-            sec="Dados Familiares",
-            tipo="number",
-            sf="Quantidade_de_Filhos__c",
-            req=False,
-        ),
-        _z(
-            key="nome_conjuge",
-            label="Nome do Cônjuge",
-            sec="Dados Familiares",
-            tipo="text",
-            sf="Nome_do_Conjuge__c",
-            req=False,
-        ),
-        # ——— Dados Bancários Pessoa Física ———
-        _z(
-            key="banco",
-            label="Banco *",
-            sec="Dados Bancários Pessoa Física",
-            tipo="select",
-            sf="Banco__c",
-            opcoes=BANCO_OPTS,
-            req=True,
-        ),
-        _z(
-            key="conta_bancaria",
-            label="Conta Bancária *",
-            sec="Dados Bancários Pessoa Física",
-            tipo="text",
-            sf="Conta_Banc_ria__c",
-            req=True,
-        ),
-        _z(
-            key="agencia_bancaria",
-            label="Agência Bancária *",
-            sec="Dados Bancários Pessoa Física",
-            tipo="text",
-            sf="Ag_ncia_Banc_ria__c",
-            req=True,
-        ),
-        _z(
-            key="retorno_integracao_bancaria",
-            label="Retorno integração conta bancária",
-            sec="Dados Bancários Pessoa Física",
-            tipo="textarea",
-            sf="RetornoIntegracaoContaBancaria__c",
-            req=False,
-            help="Somente leitura no Salesforce — uso informativo na planilha.",
-        ),
-        _z(
-            key="tipo_conta",
-            label="Tipo de Conta",
-            sec="Dados Bancários Pessoa Física",
-            tipo="select",
-            sf="Tipo_de_Conta__c",
-            opcoes=TIPO_CONTA_BANCARIA,
-            req=False,
-        ),
-        # ——— CRECI/TTI ———
-        _z(
-            key="possui_creci",
-            label="Possui CRECI? *",
-            sec="CRECI/TTI",
-            tipo="select",
-            sf=None,
-            opcoes=["Sim", "Não"],
-            req=True,
-            help="Se «Sim», os campos de CRECI aparecem para preenchimento. Se «Não», eles ficam ocultos; na gravação no "
-            "Salesforce, valores vazios exigidos pelas regras do org são preenchidos automaticamente (CRECI 1, datas de hoje, "
-            "responsável Lucas Maia).",
-        ),
-        _z(
-            key="data_matricula_tti",
-            label="Data Matrícula - TTI",
-            sec="CRECI/TTI",
-            tipo="date",
-            sf="Data_Matricula_TTI__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="status_creci",
-            label="Status CRECI",
-            sec="CRECI/TTI",
-            tipo="select",
-            sf="Status_CRECI__c",
-            opcoes=STATUS_CRECI_OPTS,
-            req=False,
-        ),
-        _z(
-            key="data_conclusao",
-            label="Data de conclusão",
-            sec="CRECI/TTI",
-            tipo="date",
-            sf="Data_de_conclusao__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(key="creci", label="CRECI", sec="CRECI/TTI", tipo="text", sf="CRECI__c", req=False),
-        _z(
-            key="observacoes_creci",
-            label="Observações",
-            sec="CRECI/TTI",
-            tipo="textarea",
-            sf="Observacoes__c",
-            req=False,
-        ),
-        _z(
-            key="validade_creci",
-            label="Validade CRECI",
-            sec="CRECI/TTI",
-            tipo="date",
-            sf="Validade_CRECI__c",
-            req=False,
-            help="Formato: 31/12/2024",
-        ),
-        _z(
-            key="nome_responsavel",
-            label="Nome do Responsável",
-            sec="CRECI/TTI",
-            tipo="text",
-            sf="Nome_do_Responsavel__c",
-            req=False,
-        ),
-        _z(
-            key="creci_responsavel",
-            label="CRECI do Responsável",
-            sec="CRECI/TTI",
-            tipo="number",
-            sf="CRECI_do_Responsavel__c",
-            req=False,
-        ),
-        _z(
-            key="tipo_comissionamento",
-            label="Tipo de Comissionamento",
-            sec="CRECI/TTI",
-            tipo="text",
-            sf=None,
-            req=False,
-        ),
-        # ——— Dados Integração (campos ocultos: tipo/datas preenchidos pelo enriquecedor Vendas RJ) ———
-        _z(
-            key="tipo_corretor",
-            label="Tipo Corretor *",
-            sec="Dados Integração",
-            tipo="select",
-            sf="Tipo_Corretor__c",
-            opcoes=TIPO_CORRETOR_OPTS,
-            req=False,
-        ),
-        _z(
-            key="data_contrato",
-            label="Data Contrato",
-            sec="Dados Integração",
-            tipo="date",
-            sf="Data_Contrato__c",
-            req=False,
-            help="Definida automaticamente na data do envio.",
-        ),
-        _z(
-            key="data_credenciamento",
-            label="Data Credenciamento",
-            sec="Dados Integração",
-            tipo="date",
-            sf="Data_Credenciamento__c",
-            req=False,
-            help="Definida automaticamente na data do envio.",
-        ),
-        # ——— Dados Integração ———
-        _z(
-            key="codigo_pessoa_uau",
-            label="Código Pessoa UAU",
-            sec="Dados Integração",
-            tipo="text",
-            sf="C_digo_Pessoa_UAU__c",
-            req=False,
-        ),
-        _z(
-            key="erro_integracao_uau",
-            label="Erro Integração UAU",
-            sec="Dados Integração",
-            tipo="textarea",
-            sf="ErroIntegracaoUAU__c",
-            req=False,
-        ),
-        _z(
-            key="retorno_integracao_pessoa",
-            label="Retorno Integração Pessoa",
-            sec="Dados Integração",
-            tipo="textarea",
-            sf="RetornoIntegracaoPessoa__c",
-            req=False,
-        ),
-        # ——— Preferência de contato ———
-        _z(
-            key="preferred_contact_method",
-            label="Preferência de contato",
-            sec="Preferência de contato",
-            tipo="multiselect",
-            sf="Preferred_Contact_Method__c",
-            opcoes=PREFERRED_METHOD_OPTS,
-            req=False,
-        ),
-    ]
-
-
-CAMPOS: List[Campo] = _campos_def()
-
-# Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
-# valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
-# tipo_corretor / multiplicadores / apelido / datas: enriquecer_derivados_vendas_rj.
-CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
-    {
-        "codigo_pessoa_uau",
-        "erro_integracao_uau",
-        "retorno_integracao_pessoa",
-        "retorno_integracao_bancaria",
-        "status_corretor",
-        "regional",
-        "origem",
-        "account_id",
-        "owner_id",
-        "tipo_corretor",
-        "apelido",
-        "data_entrevista",
-        "data_contrato",
-        "data_credenciamento",
-        "multiplicador_nivel",
-        "multiplicador_regime",
-        "salutation",
-    }
-)
-
-
-def campos_planilha_corretor() -> List[Campo]:
-    """
-    Colunas da aba principal: só o que o corretor vê/preenche no fluxo (sem campos ocultos de sistema).
-    Ordem = SEC_ORDER, depois a ordem de definição em CAMPOS dentro de cada seção.
-    """
-    out: List[Campo] = []
-    seen: set[str] = set()
-    for sec in SEC_ORDER:
-        for c in CAMPOS:
-            if c["sec"] != sec or c["key"] in CAMPOS_OCULTOS_FORMULARIO:
-                continue
-            k = c["key"]
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(c)
-    return out
-
-
-# Campos da seção CRECI/TTI exibidos só quando «Possui CRECI?» = Sim.
-CAMPOS_CRECI_DETALHES: frozenset[str] = frozenset(
-    {
-        "data_matricula_tti",
-        "tti",
-        "status_creci",
-        "data_conclusao",
-        "creci",
-        "observacoes_creci",
-        "validade_creci",
-        "nome_responsavel",
-        "creci_responsavel",
-        "tipo_comissionamento",
-    }
-)
-
-# Campos Salesforce de CRECI/TTI: removidos do JSON de insert quando «Possui CRECI?» ≠ Sim.
-# Observations__c não entra aqui — pode reunir outras observações além do bloco CRECI.
-SF_CAMPOS_CRECI_OMITIR_SEM_POSSE: frozenset[str] = frozenset(
-    {
-        "CRECI__c",
-        "Validade_CRECI__c",
-        "Status_CRECI__c",
-        "Data_Matricula_TTI__c",
-        "Data_de_conclusao__c",
-        "Nome_do_Responsavel__c",
-        "CRECI_do_Responsavel__c",
-    }
-)
-
-
-def campos_por_secao_visiveis(
-    sec: str, dados: Optional[Dict[str, Any]] = None
-) -> List[Campo]:
-    cols = [
-        c
-        for c in CAMPOS
-        if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO
-    ]
-    if sec == "CRECI/TTI":
-        d = dados or {}
-        if not _formulario_exibe_creci_detalhado(d):
-            cols = [c for c in cols if c["key"] == "possui_creci"]
-    if sec == "Informações para contato":
-        d = dados or {}
-        if _norm_picklist(d.get("unidade_negocio")) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
-            cols = [c for c in cols if c["key"] != "atividade"]
-        if _norm_picklist(d.get("account_name_nao_sei")) != "Sim":
-            cols = [c for c in cols if c["key"] != "account_name"]
-    if sec == "Dados Familiares":
-        d = dados or {}
-        ec = _norm_picklist(d.get("estado_civil"))
-        if ec == "Solteiro" or not ec:
-            cols = [c for c in cols if c["key"] != "nome_conjuge"]
-    return cols
-
-
-def secoes_com_campos_visiveis() -> List[str]:
-    presentes = {
-        c["sec"] for c in CAMPOS if c["key"] not in CAMPOS_OCULTOS_FORMULARIO
-    }
-    return [s for s in SEC_ORDER if s in presentes]
-
-
-_ID_RE = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
-
-
-def _norm_picklist(val: Any) -> str:
-    """Remove marcador '--Nenhum--' como vazio."""
-    s = (str(val).strip() if val is not None else "") or ""
-    if s in ("--Nenhum--", "Nenhum"):
-        return ""
+    s = str(name).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
 
-def _atividade_sf_norm(dados: Optional[Dict[str, Any]]) -> str:
-    if not dados:
-        return ""
-    return _norm_picklist(dados.get("atividade"))
-
-
-def _status_creci_em_estagio(dados: Optional[Dict[str, Any]]) -> bool:
-    if not dados:
-        return False
-    return _norm_picklist(dados.get("status_creci")) == "Estágio"
-
-
-def _formulario_exibe_creci_detalhado(dados: Optional[Dict[str, Any]]) -> bool:
-    """Campos detalhados de CRECI só aparecem quando «Possui CRECI?» = Sim (mesmo que a atividade exija no Salesforce)."""
-    if not dados:
-        return False
-    return (str(dados.get("possui_creci") or "").strip()) == "Sim"
-
-
-def _incluir_campo_creci_detalhe_no_payload(dados: Dict[str, Any], key: str) -> bool:
-    if key not in CAMPOS_CRECI_DETALHES:
-        return True
-    return _formulario_exibe_creci_detalhado(dados)
-
-
-def parse_data_br(val: Any) -> Optional[str]:
-    if val is None or (isinstance(val, float) and str(val) == "nan"):
-        return None
-    if isinstance(val, date) and not isinstance(val, datetime):
-        return val.isoformat()
-    if isinstance(val, datetime):
-        return val.date().isoformat()
-    s = str(val).strip()
-    if not s:
-        return None
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt).date().isoformat()
-        except ValueError:
-            continue
-    return None
-
-
-def _erro_validacao_nascimento(v: Any) -> Optional[str]:
-    """None = OK no formato e na faixa; vazio não gera erro aqui (obrigatoriedade é outra regra)."""
-    if v is None:
-        return None
-    if isinstance(v, (date, datetime)):
-        d = v.date() if isinstance(v, datetime) else v
-    else:
-        s = str(v).strip()
-        if not s:
-            return None
-        iso = parse_data_br(s)
-        if not iso:
-            return (
-                "Data de nascimento * (use o calendário ou digite em dia-mês-ano, "
-                "ex.: 08-12-2004 ou 08/12/2004)"
-            )
-        try:
-            d = datetime.strptime(iso, "%Y-%m-%d").date()
-        except ValueError:
-            return "Data de nascimento * (data inválida)"
-    if d < date(1920, 1, 1) or d > date.today():
-        return "Data de nascimento * (informe uma data entre 1920 e hoje)"
-    return None
-
-
-def _erros_preenchimento_creci_se_sim(dados: Dict[str, Any]) -> List[str]:
-    """Se «Possui CRECI?» = Sim, exige status CRECI (número/validade/matrícula/responsável têm fallback no Salesforce se vazios)."""
-    if (str(dados.get("possui_creci") or "").strip()) != "Sim":
-        return []
-    er: List[str] = []
-    if not _norm_picklist(dados.get("status_creci")):
-        er.append("Status CRECI *")
-    return er
-
-
-def _erros_conjuge_se_casado(dados: Dict[str, Any]) -> List[str]:
-    """Se estado civil for Casado, exige nome do cônjuge."""
-    if _norm_picklist(dados.get("estado_civil")) != "Casado":
-        return []
-    if not (str(dados.get("nome_conjuge") or "").strip()):
-        return ["Nome do Cônjuge *"]
-    return []
-
-
-def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s:
-        return None
-    if sf_field in ("AccountId", "OwnerId", "GerenteAnterior__c", "Solicitantedescredenciamento__c"):
-        if _ID_RE.match(s):
-            return s
-    if sf_field == "Produto_de_Atuacao__c" and _ID_RE.match(s):
-        return s
-    return None
-
-
-def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
-    erros: List[str] = []
-    for c in CAMPOS:
-        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
-            continue
-        if c["key"] == "atividade" and _norm_picklist(
-            dados.get("unidade_negocio")
-        ) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
-            continue
-        if not c.get("req"):
-            continue
-        k = c["key"]
-        v = dados.get(k)
-        if c["tipo"] == "multiselect":
-            if not v or (isinstance(v, list) and len(v) == 0):
-                erros.append(c["label"])
-            continue
-        if c["tipo"] == "select":
-            if not _norm_picklist(v):
-                erros.append(c["label"])
-            continue
-        if v is None or (isinstance(v, str) and not str(v).strip()):
-            erros.append(c["label"])
-    sabe_ger = _norm_picklist(dados.get("account_name_nao_sei"))
-    aid = (dados.get("account_id") or "").strip()
-    aname = (dados.get("account_name") or "").strip()
-    if sabe_ger == "Sim" and not aid and not aname:
-        erros.append(
-            "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
-            "(ou selecione o nome do gerente / conta)."
-        )
-    nc = (dados.get("nome_completo") or "").strip()
-    if not nc:
-        erros.append("Nome completo *")
-    em = (dados.get("email") or "").strip()
-    if em and not email_contato_formato_valido(em):
-        erros.append(
-            "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
-        )
-    erros.extend(_erros_preenchimento_creci_se_sim(dados))
-    erros.extend(_erros_conjuge_se_casado(dados))
-    cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
-    if cpf_d and len(cpf_d) != 11:
-        erros.append("CPF * (informe 11 dígitos)")
-    eb = _erro_validacao_nascimento(dados.get("birthdate"))
-    if eb:
-        erros.append(eb)
-    return list(dict.fromkeys(erros))
-
-
-def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
-    """
-    Valida apenas campos obrigatórios da seção atual (para bloquear «Avançar» no formulário por etapas).
-    Replica a lógica de `validar_obrigatorios` para `c['sec'] == sec` e, na seção
-    «Informações para contato», as regras de conta.
-    """
-    erros: List[str] = []
-    for c in CAMPOS:
-        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
-            continue
-        if (
-            c["key"] == "atividade"
-            and sec == "Informações para contato"
-            and _norm_picklist(dados.get("unidade_negocio"))
-            == UNIDADE_REDE_OUTRA_IMOBILIARIA
-        ):
-            continue
-        if c["sec"] != sec or not c.get("req"):
-            continue
-        k = c["key"]
-        v = dados.get(k)
-        if c["tipo"] == "multiselect":
-            if not v or (isinstance(v, list) and len(v) == 0):
-                erros.append(c["label"])
-            continue
-        if c["tipo"] == "select":
-            if not _norm_picklist(v):
-                erros.append(c["label"])
-            continue
-        if v is None or (isinstance(v, str) and not str(v).strip()):
-            erros.append(c["label"])
-    if sec == "Informações para contato":
-        sabe_ger = _norm_picklist(dados.get("account_name_nao_sei"))
-        if not sabe_ger:
-            erros.append("Sabe o nome do gerente na planilha? *")
-        if sabe_ger == "Sim":
-            aid = (dados.get("account_id") or "").strip()
-            aname = (dados.get("account_name") or "").strip()
-            if not aid and not aname:
-                erros.append(
-                    "Conta Salesforce: defina account_id em [ficha_defaults] nos Secrets "
-                    "(ou selecione o nome do gerente / conta)."
-                )
-    if sec == "Dados para Contato":
-        em = (dados.get("email") or "").strip()
-        if em and not email_contato_formato_valido(em):
-            erros.append(
-                "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
-            )
-    if sec == "Dados Pessoais":
-        erros.extend(_erros_conjuge_se_casado(dados))
-        cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
-        if cpf_d and len(cpf_d) != 11:
-            erros.append("CPF * (informe 11 dígitos)")
-        eb = _erro_validacao_nascimento(dados.get("birthdate"))
-        if eb:
-            erros.append(eb)
-    if sec == "CRECI/TTI":
-        erros.extend(_erros_preenchimento_creci_se_sim(dados))
-    return list(dict.fromkeys(erros))
-
-
-def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
-    """Primeira palavra → FirstName; restante → LastName (sem campos separados no formulário)."""
-    nc = (dados.get("nome_completo") or "").strip()
-    if not nc:
-        return
-    partes = nc.split(None, 1)
-    payload["FirstName"] = partes[0][:40]
-    payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
-
-
-def _soql_escape(s: str) -> str:
-    """Escape mínimo para string literal em SOQL."""
-    return (s or "").replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _resolver_account_id_por_nome(sf: Any, nome_conta: str) -> Optional[str]:
-    """
-    Resolve AccountId a partir do nome exato da conta.
-    Retorna None quando não encontra ou em erro.
-    """
-    nome = (nome_conta or "").strip()
-    if not nome:
-        return None
-    try:
-        q = (
-            "SELECT Id FROM Account "
-            f"WHERE Name = '{_soql_escape(nome)}' "
-            "ORDER BY LastModifiedDate DESC LIMIT 1"
-        )
-        res = sf.query(q)
-        recs = (res or {}).get("records") or []
-        if recs:
-            rid = (recs[0].get("Id") or "").strip()
-            return rid or None
-    except Exception:
-        return None
-    return None
-
-
-def _proximo_apelido_disponivel(sf: Any, primeiro_nome: str) -> Optional[str]:
-    """
-    Gera apelido incremental: <primeiro>_RJ01, _RJ02, ... com base nos contatos existentes.
-    """
-    base = (primeiro_nome or "").strip()
-    if not base:
-        return None
-    base_sf = _soql_escape(base)
-    try:
-        q = (
-            "SELECT Apelido__c FROM Contact "
-            f"WHERE Apelido__c LIKE '{base_sf}_RJ%' "
-            "ORDER BY LastModifiedDate DESC LIMIT 200"
-        )
-        res = sf.query(q)
-        recs = (res or {}).get("records") or []
-    except Exception:
-        # Fallback seguro se a consulta falhar por qualquer motivo.
-        return f"{base}_RJ01"
-
-    max_n = 0
-    pat = re.compile(rf"^{re.escape(base)}_RJ(\d+)$", re.IGNORECASE)
-    for r in recs:
-        a = str((r or {}).get("Apelido__c") or "").strip()
-        m = pat.match(a)
-        if not m:
-            continue
-        try:
-            n = int(m.group(1))
-        except ValueError:
-            continue
-        if n > max_n:
-            max_n = n
-    prox = max_n + 1
-    return f"{base}_RJ{prox:02d}"
-
-
-def _salesforce_possui_creci_field_name() -> str:
-    """
-    Opcional: API name de um checkbox no Contact (ex.: Possui_CRECI__c).
-    Configure em [salesforce] POSSUI_CRECI_FIELD nos Secrets ou env SF_POSSUI_CRECI_FIELD.
-    Permite que a regra de validação do org exija CRECI só quando o corretor declara que possui.
-    """
-    try:
-        if hasattr(st, "secrets"):
-            s = st.secrets.get("salesforce")
-            if isinstance(s, dict):
-                v = (s.get("POSSUI_CRECI_FIELD") or s.get("possui_creci_field") or "").strip()
-                if v:
-                    return v
-    except Exception:
-        pass
-    return (os.environ.get("SF_POSSUI_CRECI_FIELD") or "").strip()
-
-
-def _ajustar_payload_creci_conforme_possui(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
-    """Remove campos de CRECI do insert quando «Possui CRECI» = Não (defaults são aplicados depois, se o SF exigir)."""
-    possui = (str(dados.get("possui_creci") or "").strip())
-    chk = _salesforce_possui_creci_field_name()
-    if possui == "Sim":
-        if chk:
-            payload[chk] = True
-        return
-    for k in SF_CAMPOS_CRECI_OMITIR_SEM_POSSE:
-        payload.pop(k, None)
-    if chk:
-        payload[chk] = False
-
-
-def _campo_data_sf_vazio_no_payload(val: Any) -> bool:
-    if val is None:
-        return True
-    return isinstance(val, str) and not val.strip()
-
-
-def _campo_creci_numero_sf_vazio_no_payload(val: Any) -> bool:
-    if val is None:
-        return True
-    if isinstance(val, str) and not re.sub(r"\D", "", val).strip():
-        return True
-    if isinstance(val, (int, float)) and int(val) == 0:
-        return True
-    return False
-
-
-def _data_hoje_iso_brasilia() -> str:
-    try:
-        from zoneinfo import ZoneInfo
-
-        return datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat()
-    except Exception:
-        return date.today().isoformat()
-
-
-def _aplicar_defaults_creci_campos_vazios_salesforce(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
-    """
-    Se as validation rules do org exigem CRECI/validade/matrícula/responsável e o valor não veio do formulário,
-    preenche: CRECI = 1, datas = hoje (Brasília), nome do responsável = Lucas Maia.
-    """
-    hoje_iso = _data_hoje_iso_brasilia()
-    act = _atividade_sf_norm(dados)
-    est = act in _SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO or _status_creci_em_estagio(dados)
-
-    if act == "Corretor":
-        if _campo_creci_numero_sf_vazio_no_payload(payload.get("CRECI__c")):
-            payload["CRECI__c"] = DEFAULT_CRECI_NUMERO_FALLBACK
-        if _campo_data_sf_vazio_no_payload(payload.get("Validade_CRECI__c")):
-            payload["Validade_CRECI__c"] = hoje_iso
-
-    if act in _SF_ATIVIDADE_EXIGE_VALIDADE_CRECI and act != "Corretor":
-        if _campo_data_sf_vazio_no_payload(payload.get("Validade_CRECI__c")):
-            payload["Validade_CRECI__c"] = hoje_iso
-
-    if est:
-        if _campo_data_sf_vazio_no_payload(payload.get("Validade_CRECI__c")):
-            payload["Validade_CRECI__c"] = hoje_iso
-        if _campo_data_sf_vazio_no_payload(payload.get("Data_Matricula_TTI__c")):
-            payload["Data_Matricula_TTI__c"] = hoje_iso
-        nome = payload.get("Nome_do_Responsavel__c")
-        if nome is None or (isinstance(nome, str) and not nome.strip()):
-            payload["Nome_do_Responsavel__c"] = DEFAULT_NOME_RESPONSAVEL_CRECI_FALLBACK
-
-
-def _aplicar_enriquecimentos_payload_sf(
-    payload: Dict[str, Any], dados: Dict[str, Any], sf: Any, avisos: List[str]
-) -> None:
-    """
-    Ajustes finais dependentes do org:
-    - Origem sempre RH
-    - resolve AccountId por Nome da conta quando não veio ID
-    - gera Apelido__c incremental
-    """
-    payload["Origem__c"] = "RH"
-
-    if not (payload.get("AccountId") or "").strip():
-        aid = _resolver_account_id_por_nome(sf, str(dados.get("account_name") or ""))
-        if aid:
-            payload["AccountId"] = aid
+def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [normalize_header(c) for c in out.columns]
+    # colisões raras: sufixo numérico
+    seen: dict[str, int] = {}
+    new_cols = []
+    for c in out.columns:
+        base = c or "col"
+        if base in seen:
+            seen[base] += 1
+            new_cols.append(f"{base}_{seen[base]}")
         else:
-            nconta = (str(dados.get("account_name") or "").strip())
-            if nconta:
-                avisos.append(f"Nome da conta não localizado no Salesforce: {nconta}")
-
-    primeiro = (payload.get("FirstName") or "").strip()
-    apel = _proximo_apelido_disponivel(sf, primeiro)
-    if apel:
-        payload["Apelido__c"] = apel
-
-
-def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    payload: Dict[str, Any] = {}
-    rt, rt_aviso = record_type_id_contato_payload_e_aviso()
-    if rt:
-        payload["RecordTypeId"] = rt
-    avisos: List[str] = []
-    if rt_aviso:
-        avisos.append(rt_aviso)
-    extras_obs: List[str] = []
-    possui_creci_sf = (str(dados.get("possui_creci") or "").strip())
-
-    for c in CAMPOS:
-        key = c["key"]
-        sf = c.get("sf")
-        raw = dados.get(key)
-
-        if not _incluir_campo_creci_detalhe_no_payload(dados, key):
-            continue
-
-        if key == "nome_completo":
-            continue
-
-        if sf is None:
-            if raw and str(raw).strip() and key not in ("nome_completo",):
-                extras_obs.append(f"{c['label']}: {raw}")
-            continue
-
-        if sf in SF_OMIT_INSERT:
-            if raw and str(raw).strip():
-                extras_obs.append(f"{c['label']}: {raw}")
-            continue
-
-        tipo = c["tipo"]
-
-        if tipo == "date":
-            iso = parse_data_br(raw)
-            if iso:
-                payload[sf] = iso
-            continue
-
-        if tipo == "id":
-            lid = _limpa_id(sf, raw)
-            if lid:
-                payload[sf] = lid
-            elif raw and str(raw).strip():
-                avisos.append(f"{c['label']}: valor não parece Id Salesforce — omitido.")
-            continue
-
-        if tipo == "number":
-            if raw is None or raw == "":
-                continue
-            try:
-                payload[sf] = float(str(raw).replace(",", "."))
-            except ValueError:
-                avisos.append(f"{c['label']}: número inválido — omitido.")
-            continue
-
-        if tipo == "multiselect":
-            if isinstance(raw, list) and raw:
-                payload[sf] = ";".join(raw)
-            continue
-
-        if tipo == "textarea":
-            s = (str(raw).strip() if raw is not None else "") or ""
-            if s:
-                if sf == "Observacoes__c":
-                    extras_obs.insert(0, s)
-                else:
-                    payload[sf] = s
-            continue
-
-        if tipo == "select":
-            s = _norm_picklist(raw)
-            if key == "unidade_negocio":
-                if s:
-                    payload[sf] = s
-                if s == "Riva":
-                    extras_obs.append("Rede de atuação informada: Riva")
-                continue
-            if key == "origem":
-                # Regra de negócio: origem sempre RH.
-                s = "RH"
-            if key == "tipo_conta":
-                s_norm = s.lower()
-                if s_norm in ("poupanca", "poupança"):
-                    s = "Poupança"
-                elif s_norm == "corrente":
-                    s = "Corrente"
-            if s:
-                payload[sf] = s
-            continue
-
-        if key == "cpf" and sf == "CPF__c":
-            digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
-            if digits:
-                payload[sf] = digits
-            continue
-
-        if key == "creci" and sf == "CRECI__c":
-            digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
-            if digits:
-                try:
-                    payload[sf] = int(digits)
-                except ValueError:
-                    payload[sf] = digits
-            continue
-
-        s = (str(raw).strip() if raw is not None else "") or ""
-        if not s:
-            continue
-        payload[sf] = s
-
-    _aplicar_nome_completo(payload, dados)
-
-    acc = dados.get("account_id")
-    acc_txt = dados.get("account_name")
-    if (not acc or not str(acc).strip()) and acc_txt and str(acc_txt).strip():
-        extras_obs.append(f"Nome da conta (referência): {acc_txt}")
-
-    obs_final = (payload.get("Observacoes__c") or "").strip()
-    extra_block = "\n".join(extras_obs)
-    if extra_block:
-        payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
-
-    payload = {k: v for k, v in payload.items() if v is not None and v != ""}
-    _ajustar_payload_creci_conforme_possui(payload, dados)
-    _aplicar_defaults_creci_campos_vazios_salesforce(payload, dados)
-
-    return payload, avisos
-
-
-def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Regras Vendas RJ: rede (Direcional/Riva/parceira) → tipo de corretor e Unidade SF;
-    parceira → Atividade Corretor Parceiro e Origem RH; função → multiplicadores;
-    apelido e datas automáticos.
-    """
-    out = dict(dados)
-
-    sx = _norm_picklist(out.get("sexo"))
-    if sx == "Masculino":
-        out["salutation"] = "Sr."
-    elif sx == "Feminino":
-        out["salutation"] = "Sra."
-    else:
-        out["salutation"] = ""
-
-    sabe_ger = _norm_picklist(out.get("account_name_nao_sei"))
-    if sabe_ger == "Não":
-        opts = _opcoes_nome_conta()
-        if opts:
-            out["account_name"] = opts[0]
-        elif NOMES_CONTA_FIXOS:
-            out["account_name"] = str(NOMES_CONTA_FIXOS[0])
-
-    rede = _norm_picklist(out.get("unidade_negocio"))
-
-    if rede == UNIDADE_REDE_OUTRA_IMOBILIARIA:
-        out["atividade"] = "Corretor Parceiro"
-    else:
-        act = _norm_picklist(out.get("atividade"))
-        out["atividade"] = act if act else "Corretor"
-    out["origem"] = "RH"
-
-    if rede in ("Direcional", "Riva"):
-        out["tipo_corretor"] = "Direcional Vendas – Autônomos"
-    elif rede:
-        out["tipo_corretor"] = "Parceiros (Externo)"
-    else:
-        out["tipo_corretor"] = ""
-
-    act_final = out.get("atividade") or ""
-    if act_final == "Captador":
-        out["multiplicador_nivel"] = 0.9
-        out["multiplicador_regime"] = 1.0
-    elif act_final in ("Corretor", "Corretor Parceiro"):
-        out["multiplicador_nivel"] = 1.0
-        out["multiplicador_regime"] = 1.0
-    else:
-        out["multiplicador_nivel"] = 1.0
-        out["multiplicador_regime"] = 1.0
-
-    nc = (out.get("nome_completo") or "").strip()
-    primeiro = nc.split(None, 1)[0] if nc else ""
-    out["apelido"] = f"{primeiro}_RJ01" if primeiro else ""
-    hoje = date.today().strftime("%d/%m/%Y")
-    out["data_entrevista"] = hoje
-    out["data_contrato"] = hoje
-    out["data_credenciamento"] = hoje
-    if (str(out.get("possui_creci") or "").strip()) != "Sim":
-        for k in CAMPOS_CRECI_DETALHES:
-            if k in out:
-                del out[k]
-
-    ufn = _norm_picklist(out.get("uf_naturalidade"))
-    cap = _naturalidade_capital_por_uf(ufn)
-    if cap:
-        out["naturalidade"] = cap
+            seen[base] = 0
+            new_cols.append(base)
+    out.columns = new_cols
     return out
 
 
-def _agora_envio_brasilia() -> tuple[str, str]:
-    """Data/hora legível em Brasília e ISO (mesmo instante)."""
-    try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo("America/Sao_Paulo")
-        now = datetime.now(tz)
-        return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
-    except Exception:
-        now = datetime.now(timezone.utc)
-        return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
+def _score_header_df(df: pd.DataFrame) -> int:
+    """Prioriza tabelas com muitas colunas e nomes que parecem cabeçalho de negócio."""
+    if df is None or df.shape[1] == 0:
+        return -1
+    names = [normalize_header(c) for c in df.columns]
+    non_empty = sum(1 for n in names if n and not n.startswith("unnamed"))
+    data_hits = sum(1 for n in names if "data" in n)
+    return int(df.shape[1] * 3 + non_empty * 2 + data_hits * 15)
 
 
-def linha_planilha(dados: Dict[str, Any]) -> List[str]:
-    data_hora_br, iso = _agora_envio_brasilia()
-    row: List[str] = []
-    for c in campos_planilha_corretor():
-        k = c["key"]
-        v = dados.get(k)
-        if c["tipo"] == "multiselect" and isinstance(v, list):
-            row.append("; ".join(str(x) for x in v))
-        elif v is None:
-            row.append("")
-        else:
-            row.append(str(v))
-    row.append(data_hora_br)
-    row.append(iso)
-    row.append("")  # Envio? — preenchido após tentativa Salesforce
-    row.append("")  # Log / erro
-    row.append("")  # Link do contato
-    return row
-
-
-def cabecalho_planilha() -> List[str]:
-    return [c["label"] for c in campos_planilha_corretor()] + [
-        "Data e hora do envio",
-        "Carimbo ISO",
-        "Envio?",
-        "Log / erro",
-        "Link do contato",
-    ]
-
-
-def _norm_cabecalho_planilha(s: str) -> str:
-    """Normaliza texto de cabeçalho para casar com colunas da planilha."""
-    return " ".join((s or "").strip().split()).casefold()
-
-
-def _strip_valor_celula_planilha(val: Any) -> str:
-    """Remove espaços invisíveis (NBSP etc.) e bordas — comum em cópias do Excel/Sheets."""
-    if val is None:
-        return ""
-    s = str(val).replace("\u00a0", " ").replace("\u2007", " ").replace("\u202f", " ")
-    return s.strip()
-
-
-def _indice_coluna_planilha_para_campo(
-    hmap: Dict[str, int], headers: List[str], label_campo: str
-) -> Optional[int]:
+def read_excel(source: PathLike, **kwargs: Any) -> pd.DataFrame:
     """
-    Índice da coluna cujo cabeçalho casa com o rótulo do campo.
-    Aceita cabeçalho com ou sem o sufixo « *» usado nos rótulos obrigatórios do app.
+    Lê .xlsx com tolerância a: folha não predefinida, título nas primeiras linhas,
+    cabeçalho na linha 1–7, ou ficheiros onde a 1.ª linha está vazia.
     """
-    lab = (label_campo or "").strip()
-    candidatos: List[str] = []
-    candidatos.append(_norm_cabecalho_planilha(lab))
-    if lab.endswith(" *"):
-        candidatos.append(_norm_cabecalho_planilha(lab[:-2].strip()))
-    for cand in candidatos:
-        if cand in hmap:
-            return hmap[cand]
-    for i, h in enumerate(headers):
-        hs = (h or "").strip()
-        if not hs:
+    engine = kwargs.pop("engine", "openpyxl")
+    sheet_kw = kwargs.pop("sheet_name", None)
+
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+    if isinstance(source, io.BufferedIOBase) or hasattr(source, "read"):
+        pos = source.tell() if hasattr(source, "tell") else None
+        raw = source.read()
+        if pos is not None and pos == 0:
+            try:
+                source.seek(0)
+            except Exception:
+                pass
+        buf = io.BytesIO(raw)
+        xl: pd.ExcelFile = pd.ExcelFile(buf, engine=engine)
+    else:
+        xl = pd.ExcelFile(source, engine=engine)
+
+    if sheet_kw is not None:
+        for hdr in range(0, 10):
+            try:
+                df_try = pd.read_excel(
+                    xl, sheet_name=sheet_kw, header=hdr, engine=engine, **kwargs
+                )
+            except Exception:
+                continue
+            if df_try.shape[1] > 0:
+                return normalize_dataframe_columns(df_try)
+
+    best_df: pd.DataFrame | None = None
+    best_score = -1
+    for sheet in xl.sheet_names:
+        s_low = str(sheet).strip().lower()
+        if s_low.startswith("graf") or "chart" in s_low:
             continue
-        if hs == lab:
-            return i
-        if lab.endswith(" *") and hs == lab[:-2].strip():
-            return i
-        if _norm_cabecalho_planilha(hs) in candidatos:
-            return i
+        for hdr in range(0, 10):
+            try:
+                df = pd.read_excel(
+                    xl, sheet_name=sheet, header=hdr, engine=engine, **kwargs
+                )
+            except Exception:
+                continue
+            if df.shape[1] == 0:
+                continue
+            sc = _score_header_df(df)
+            if sc > best_score:
+                best_score = sc
+                best_df = df
+
+    if best_df is None or best_df.shape[1] == 0:
+        raise ValueError(
+            "Não foi possível ler nenhuma folha com colunas neste Excel. "
+            "Confirme que há dados numa folha e que o cabeçalho está nas primeiras 10 linhas."
+        )
+
+    return normalize_dataframe_columns(best_df)
+
+
+def _match_file_role(filename: str) -> Optional[str]:
+    u = normalize_header(filename).replace(" ", "")
+    u_sp = normalize_header(filename)
+    # Base de respostas do formulário (previsão humana) — antes de "vendas" genérico
+    if "esboco" in u_sp or "esboço" in filename.lower():
+        if "previsao" in u or "predicao" in u or "vendas" in u_sp:
+            return "formulario_previsao"
+    if "resposta" in u_sp and (
+        "formulario" in u_sp or "formulário" in filename.lower()
+    ):
+        return "formulario_previsao"
+    if ("previsao" in u or "predicao" in u) and (
+        "resposta" in u_sp or "formulario" in u_sp
+    ):
+        return "formulario_previsao"
+    if "vendas" in u and "predicao" in u.replace("ç", "c"):
+        return "vendas"
+    if "leads" in u:
+        return "leads"
+    if "pastas" in u:
+        return "pastas"
+    if "agendamento" in u or "visitas" in u or "visita" in u:
+        return "agendamentos"
+    # fallback por palavra solta
+    if "vendas" in u:
+        return "vendas"
+    if "leads" in u:
+        return "leads"
     return None
 
 
-def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[str, Any]:
+def classify_upload(name: str) -> str:
+    role = _match_file_role(name)
+    if role:
+        return role
+    u = normalize_header(name)
+    if "formulario" in u and "resposta" in u:
+        return "formulario_previsao"
+    if "venda" in u:
+        return "vendas"
+    if "lead" in u:
+        return "leads"
+    if "pasta" in u:
+        return "pastas"
+    return "agendamentos"
+
+
+def read_excel_formulario_previsao(source: PathLike) -> pd.DataFrame:
     """
-    Converte uma linha da aba Corretores (valores alinhados aos cabeçalhos) em dict de chaves do formulário.
-    Cabeçalhos da parte de dados = rótulos de `campos_planilha_corretor()` + colunas de sistema no final.
-    Campos ocultos ficam vazios até `_merge_defaults_ficha_em_dict` / `enriquecer_derivados_vendas_rj`.
+    Lê o Excel tipo *ESBOÇO* / respostas ao formulário.
+    Prioriza folha cujo nome normalizado contenha 'resposta' e 'formulario'.
     """
-    hmap: Dict[str, int] = {}
-    for i, h in enumerate(headers):
-        key = _norm_cabecalho_planilha(h)
-        if key and key not in hmap:
-            hmap[key] = i
-    # Garante células alinhadas ao número de colunas do cabeçalho
-    if len(cells) < len(headers):
-        cells = list(cells) + [""] * (len(headers) - len(cells))
-    dados: Dict[str, Any] = {}
-    for c in CAMPOS:
-        idx = _indice_coluna_planilha_para_campo(hmap, headers, c["label"])
-        raw = ""
-        if idx is not None and idx < len(cells):
-            raw = _strip_valor_celula_planilha(cells[idx])
-        tipo = c["tipo"]
-        if tipo == "multiselect":
-            if not raw:
-                dados[c["key"]] = []
-            else:
-                partes = [
-                    _strip_valor_celula_planilha(p)
-                    for p in re.split(r"[;\n]", raw)
-                    if _strip_valor_celula_planilha(p)
-                ]
-                dados[c["key"]] = partes
-        elif tipo == "number":
-            if not raw:
-                dados[c["key"]] = None
-            else:
-                try:
-                    dados[c["key"]] = float(raw.replace(",", "."))
-                except ValueError:
-                    dados[c["key"]] = None
-        elif tipo == "checkbox":
-            v = raw.lower()
-            dados[c["key"]] = v in ("true", "1", "sim", "yes", "verdadeiro", "x")
-        else:
-            dados[c["key"]] = raw or ""
-    return dados
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+    if isinstance(source, io.BufferedIOBase) or hasattr(source, "read"):
+        raw = source.read()
+        buf = io.BytesIO(raw)
+        xl: pd.ExcelFile = pd.ExcelFile(buf, engine="openpyxl")
+    else:
+        xl = pd.ExcelFile(source, engine="openpyxl")
 
+    sheet_order: list[str] = []
+    for sheet in xl.sheet_names:
+        ns = normalize_header(sheet)
+        if "resposta" in ns and "formulario" in ns:
+            sheet_order.insert(0, sheet)
+        elif "resposta" in ns:
+            sheet_order.append(sheet)
+    if not sheet_order:
+        sheet_order = list(xl.sheet_names)
 
-def ler_planilha_corretores_bruta(
-    creds_dict: Dict[str, Any],
-    spreadsheet_id: str,
-    worksheet_name: str,
-) -> Tuple[List[str], List[List[str]]]:
-    """Cabeçalho (linha 1) e linhas de dados seguintes (ignora linhas totalmente vazias)."""
-    gc = _cliente_gspread(creds_dict)
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
-    all_v = ws.get_all_values()
-    if not all_v:
-        return [], []
-    headers = list(all_v[0])
-    rows: List[List[str]] = []
-    for r in all_v[1:]:
-        if any((c or "").strip() for c in r):
-            rows.append(list(r))
-    return headers, rows
-
-
-def _preview_linha_planilha(headers: List[str], cells: List[str]) -> str:
-    d = dados_dict_de_linha_planilha(headers, cells)
-    nome = (d.get("nome_completo") or "").strip()[:36]
-    em = (d.get("email") or "").strip()[:32]
-    partes = [p for p in (nome, em) if p]
-    return " · ".join(partes) if partes else "(sem nome/e-mail visível)"
-
-
-def _teste_planilha_sf_habilitado() -> bool:
-    """Controlado pela constante `FICHA_TEST_PLANILHA_ATIVO` (bloco «Modo teste» junto aos IDs da planilha)."""
-    if FICHA_MODO_PRODUCAO:
-        return False
-    return bool(FICHA_TEST_PLANILHA_ATIVO)
-
-
-def _aplicar_dados_teste_ao_session_state(dados: Dict[str, Any]) -> None:
-    """Grava valores no session_state e no snapshot para todas as etapas enxergarem os dados."""
-    ss = st.session_state
-    snap = dict(ss.get("ficha_snap_campos") or {})
-    for c in CAMPOS:
-        k = c["key"]
-        if k not in dados:
+    best_df: pd.DataFrame | None = None
+    best_score = -1
+    for sheet in sheet_order:
+        if str(sheet).lower().startswith("graf") or "chart" in str(sheet).lower():
             continue
-        val = dados[k]
-        if k == "birthdate":
-            d = _coerce_date_widget_value(val)
-            val = d if d is not None else val
-        ss[f"fld_{k}"] = val
-        snap[k] = val
-    ss["ficha_snap_campos"] = snap
-
-
-def _executar_teste_criar_sf_de_linha_planilha(
-    *,
-    row_1based_sheet: int,
-    headers: List[str],
-    cells: List[str],
-    atualizar_status_nesta_linha: bool,
-    anexar_nova_linha_duplicada: bool,
-    enviar_email_boas_vindas: bool,
-) -> Tuple[bool, str]:
-    """
-    Monta payload a partir da linha da planilha, cria contato no Salesforce.
-    Retorna (ok, mensagem_html_ou_texto).
-    """
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
-    if not creds:
-        return False, "Configure **[google_sheets]** nos Secrets (SERVICE_ACCOUNT_JSON)."
-
-    gs: Dict[str, Any] = {}
-    if hasattr(st, "secrets"):
-        try:
-            gs = dict(st.secrets.get("google_sheets", {}))
-        except Exception:
-            gs = {}
-    sid, wname = _ids_planilha_modo_teste(gs)
-
-    dados = dados_dict_de_linha_planilha(headers, cells)
-    dados = _merge_defaults_ficha_em_dict(dados)
-    dados = enriquecer_derivados_vendas_rj(dados)
-    erros = validar_obrigatorios(dados)
-    if erros:
-        lista = "<br>".join(f"• {html.escape(e)}" for e in erros)
-        return False, f"<strong>Validação:</strong><br>{lista}"
-
-    _aplicar_secrets_sf()
-    if not _credenciais_salesforce_ok():
-        return False, "Salesforce não configurado (Secrets / variáveis USER, PASSWORD, TOKEN)."
-    if not _SF_SDK_DISPONIVEL:
-        return False, "Pacote **simple_salesforce** não instalado."
-
-    payload, avisos = montar_payload_salesforce(dados)
-    avisos = list(avisos)
-    avisos.extend(_enriquecer_mobile_phone(payload, dados))
-
-    row_num_atualizar = row_1based_sheet
-
-    if anexar_nova_linha_duplicada:
-        try:
-            linha = linha_planilha(dados)
-            cab = cabecalho_planilha()
-            row_num_atualizar = anexar_linha(linha, cab, sid, wname, creds, gs)
-        except Exception as e:
-            return False, f"Erro ao anexar linha na planilha: {html.escape(str(e))}"
-
-    sf = conectar_salesforce()
-    if not sf:
-        if atualizar_status_nesta_linha and row_num_atualizar >= 2:
+        for hdr in range(0, 10):
             try:
-                atualizar_status_envio_salesforce(
-                    sid, wname, creds, row_num_atualizar, "Erro",
-                    "Falha ao conectar ao Salesforce.", "",
+                df = pd.read_excel(
+                    xl, sheet_name=sheet, header=hdr, engine="openpyxl"
                 )
             except Exception:
-                pass
-        return False, "Falha ao conectar ao Salesforce (credenciais ou rede)."
+                continue
+            if df.shape[1] < 5:
+                continue
+            sc = _score_header_df(df)
+            if sc > best_score:
+                best_score = sc
+                best_df = df
 
-    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
-    cid, err = criar_contato_payload(sf, payload)
-    link = _url_contact(cid) if cid else ""
-
-    if atualizar_status_nesta_linha and row_num_atualizar >= 2:
-        try:
-            if cid:
-                atualizar_status_envio_salesforce(sid, wname, creds, row_num_atualizar, "Sucesso", "", link)
-            else:
-                atualizar_status_envio_salesforce(
-                    sid,
-                    wname,
-                    creds,
-                    row_num_atualizar,
-                    "Erro",
-                    (_explicacao_erro_record_type_se_aplicavel(err))[:49000]
-                    if err
-                    else "Erro desconhecido",
-                    "",
-                )
-        except Exception as ex:
-            avisos.append(f"Planilha (status): {ex}")
-
-    if enviar_email_boas_vindas:
-        try:
-            _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
-        except Exception as ex:
-            avisos.append(f"E-mail: {ex}")
-
-    av_txt = ""
-    if avisos:
-        av_txt = "<br><strong>Avisos:</strong><br>" + "<br>".join(f"• {html.escape(str(a))}" for a in avisos)
-
-    if cid:
-        url_esc = html.escape(link)
-        return True, (
-            f"<strong>Contato criado.</strong> Id: <code>{html.escape(str(cid))}</code><br>"
-            f'<a href="{url_esc}" target="_blank" rel="noopener">Abrir no Salesforce</a>'
-            f"{av_txt}"
+    if best_df is None or best_df.shape[1] == 0:
+        raise ValueError(
+            "Não foi possível ler folha útil do Excel do formulário de previsão."
         )
-    err_txt = _explicacao_erro_record_type_se_aplicavel(err) if err else "desconhecido"
-    return False, f"<strong>Erro Salesforce:</strong> {_html_erro_salesforce_multilinha(err_txt)}{av_txt}"
+    return normalize_dataframe_columns(best_df)
 
 
-def _render_sidebar_teste_planilha_sf() -> None:
-    """Painel na sidebar: escolher linha da planilha e testar criação no SF (sem preencher o formulário manualmente)."""
-    with st.sidebar:
-        st.markdown("##### Teste rápido — planilha → Salesforce")
-        st.caption(
-            "Lê a planilha definida em **FICHA_TEST_PLANILHA_SPREADSHEET_ID** / "
-            "**FICHA_TEST_PLANILHA_WORKSHEET_NAME** (se vazios, usa Secrets). **Não** exige LGPD. "
-            "Em produção: **FICHA_TEST_PLANILHA_ATIVO = False**."
-        )
-        if st.button("Carregar linhas da planilha", key="test_pl_carregar"):
-            creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
-            if not creds:
-                st.error("Secrets **google_sheets** ausente ou JSON inválido.")
-            else:
-                gs: Dict[str, Any] = {}
-                if hasattr(st, "secrets"):
-                    try:
-                        gs = dict(st.secrets.get("google_sheets", {}))
-                    except Exception:
-                        gs = {}
-                sid, wname = _ids_planilha_modo_teste(gs)
-                try:
-                    h, rows = ler_planilha_corretores_bruta(creds, sid, wname)
-                    st.session_state["test_pl_headers"] = h
-                    st.session_state["test_pl_rows"] = rows
-                    st.success(f"{len(rows)} linha(s) com dados (cabeçalho: {len(h)} colunas).")
-                except Exception as e:
-                    st.error(f"Falha ao ler a planilha: {e}")
-
-        headers = list(st.session_state.get("test_pl_headers") or [])
-        rows = list(st.session_state.get("test_pl_rows") or [])
-        if not rows or not headers:
-            st.info(
-                "Clique em **Carregar linhas da planilha**. A aba vem das constantes de teste ou de **WORKSHEET_NAME** nos Secrets."
+def load_four_files(
+    files: Mapping[str, PathLike],
+) -> dict[str, pd.DataFrame]:
+    """files: keys must be leads, agendamentos, pastas, vendas; opcional formulario_previsao."""
+    required = {"leads", "agendamentos", "pastas", "vendas"}
+    missing = required - set(files)
+    if missing:
+        raise ValueError(f"Faltam bases: {sorted(missing)}")
+    out: dict[str, pd.DataFrame] = {}
+    for k in sorted(required):
+        src = files[k]
+        label = str(src) if not hasattr(src, "read") else "(stream)"
+        try:
+            df = read_excel(src)
+        except Exception as e:
+            raise ValueError(
+                f"Erro ao ler a base '{k}' ({label}): {e}"
+            ) from e
+        if df.shape[1] == 0:
+            raise ValueError(
+                f"A base '{k}' ficou sem colunas após a leitura ({label}). "
+                "Pode ser folha em branco, ficheiro errado na pasta ou Excel corrompido."
             )
-            return
+        out[k] = df
+    if "formulario_previsao" in files and files["formulario_previsao"] is not None:
+        fp = files["formulario_previsao"]
+        label = str(fp) if not hasattr(fp, "read") else "(stream)"
+        try:
+            out["formulario_previsao"] = read_excel_formulario_previsao(fp)
+        except Exception as e:
+            raise ValueError(
+                f"Erro ao ler formulário de previsão ({label}): {e}"
+            ) from e
+    return out
 
-        labels = [
-            f"Linha {i + 2} — {_preview_linha_planilha(headers, rows[i])}"
-            for i in range(len(rows))
+
+def find_column(df: pd.DataFrame, must_contain: list[str]) -> Optional[str]:
+    for col in df.columns:
+        c = str(col)
+        if all(part in c for part in must_contain):
+            return col
+    return None
+
+
+def find_column_any(df: pd.DataFrame, alternatives: list[list[str]]) -> Optional[str]:
+    for parts in alternatives:
+        hit = find_column(df, parts)
+        if hit:
+            return hit
+    return None
+
+
+def eda_dataframe(df: pd.DataFrame, name: str) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "nome": name,
+        "linhas": int(len(df)),
+        "colunas": int(df.shape[1]),
+        "colunas_lista": list(df.columns),
+        "tipos": {str(k): int(v) for k, v in df.dtypes.astype(str).value_counts().items()},
+        "nulos_por_coluna": df.isna().sum().sort_values(ascending=False).head(25).to_dict(),
+        "amostra_head": df.head(5).to_html(classes="table", border=0, index=False),
+    }
+    date_cols = []
+    for col in df.columns:
+        if df[col].dtype == "datetime64[ns]" or "data" in str(col):
+            s = pd.to_datetime(df[col], errors="coerce")
+            if s.notna().sum() > max(10, len(df) * 0.05):
+                vmin, vmax = s.min(), s.max()
+                date_cols.append(
+                    {
+                        "coluna": col,
+                        "nao_nulos": int(s.notna().sum()),
+                        "min": vmin.isoformat() if pd.notna(vmin) else None,
+                        "max": vmax.isoformat() if pd.notna(vmax) else None,
+                    }
+                )
+    summary["colunas_data_candidatas"] = date_cols[:20]
+    return summary
+
+# ----- inlined: metric_suite.py -----
+
+from typing import Any
+
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    explained_variance_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    median_absolute_error,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+
+
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    yt = np.asarray(y_true, dtype=float).ravel()
+    yp = np.asarray(y_pred, dtype=float).ravel()
+    out: dict[str, float] = {
+        "MAE": float(mean_absolute_error(yt, yp)),
+        "RMSE": float(np.sqrt(mean_squared_error(yt, yp))),
+        "R2": float(r2_score(yt, yp)),
+        "MedAE": float(median_absolute_error(yt, yp)),
+        "ExplainedVar": float(explained_variance_score(yt, yp)),
+        "MaxError": float(np.max(np.abs(yt - yp))),
+    }
+    return out
+
+
+def binary_from_regression(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold_y: float,
+) -> dict[str, float]:
+    """
+    y alto = valor real acima da mediana de referência (só do treino, sem leakage).
+    Classe predita: predição acima do mesmo limiar em escala de y.
+    Score para ROC: valor predito (ordenável).
+    """
+    yt = np.asarray(y_true, dtype=float).ravel()
+    yp = np.asarray(y_pred, dtype=float).ravel()
+    y_true_bin = (yt > threshold_y).astype(int)
+    y_pred_bin = (yp > threshold_y).astype(int)
+    out: dict[str, float] = {
+        "Accuracy": float(accuracy_score(y_true_bin, y_pred_bin)),
+        "Precision": float(
+            precision_score(y_true_bin, y_pred_bin, zero_division=0)
+        ),
+        "Recall": float(recall_score(y_true_bin, y_pred_bin, zero_division=0)),
+        "F1": float(f1_score(y_true_bin, y_pred_bin, zero_division=0)),
+    }
+    if len(np.unique(y_true_bin)) > 1:
+        try:
+            out["ROC_AUC"] = float(roc_auc_score(y_true_bin, yp))
+        except ValueError:
+            out["ROC_AUC"] = float("nan")
+    else:
+        out["ROC_AUC"] = float("nan")
+    return out
+
+
+def roc_curve_data(
+    y_true: np.ndarray, y_pred: np.ndarray, threshold_y: float
+) -> dict[str, Any]:
+    yt = np.asarray(y_true, dtype=float).ravel()
+    yp = np.asarray(y_pred, dtype=float).ravel()
+    y_true_bin = (yt > threshold_y).astype(int)
+    if len(np.unique(y_true_bin)) < 2:
+        return {"fpr": [], "tpr": [], "auc": float("nan")}
+    fpr, tpr, _ = roc_curve(y_true_bin, yp)
+    auc = float(roc_auc_score(y_true_bin, yp))
+    return {
+        "fpr": [float(x) for x in fpr],
+        "tpr": [float(x) for x in tpr],
+        "auc": auc,
+    }
+
+# ----- inlined: train_eval.py -----
+
+import math
+import warnings
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin, clone
+from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import (
+    GradientBoostingRegressor,
+    RandomForestRegressor,
+    VotingRegressor,
+)
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import PolynomialFeatures
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+try:
+    from xgboost import XGBRegressor
+except ImportError:
+    XGBRegressor = None  # type: ignore[misc, assignment]
+
+
+@dataclass
+class TrainResult:
+    pipeline: Any
+    metrics_val: dict[str, float]
+    metrics_test: dict[str, float]
+    importance: pd.Series
+    y_val: pd.Series
+    y_val_pred: np.ndarray
+    y_test: pd.Series
+    y_test_pred: np.ndarray
+    best_params: dict[str, Any]
+    dates_val: pd.Index
+    dates_test: pd.Index
+    model_label: str
+    full_period_train: bool = False
+    chart_dates: list[str] = field(default_factory=list)
+    chart_y_real: list[float] = field(default_factory=list)
+    chart_y_pred: list[float] = field(default_factory=list)
+    chart_split_index: int = 0
+    benchmark_appendix: dict[str, Any] | None = None
+
+
+class PrevHtmlPolyEnricher(BaseEstimator, TransformerMixin):
+    """
+    Correlação absoluta com y → top 30 colunas + PolynomialFeatures(grau=2),
+    como em prevhtml.py (sem bias polinomial).
+    """
+
+    def fit(self, X, y=None):
+        if y is None:
+            raise ValueError("PrevHtmlPolyEnricher requer y no fit.")
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        y_s = pd.Series(np.asarray(y).ravel(), index=X_df.index).astype(float)
+        X_num = X_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        corr = X_num.corrwith(y_s).abs().fillna(0.0)
+        k = min(30, max(1, X_num.shape[1]))
+        self.top_cols_: list[Any] = corr.nlargest(k).index.tolist()
+        self.rest_cols_: list[Any] = [c for c in X_num.columns if c not in self.top_cols_]
+        self._in_columns_: list[Any] = list(X_num.columns)
+        self.poly_ = PolynomialFeatures(degree=2, interaction_only=False, include_bias=False)
+        self.poly_.fit(X_num[self.top_cols_].astype(np.float32))
+        return self
+
+    def transform(self, X):
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        X_aligned = X_df.reindex(columns=self._in_columns_, fill_value=0.0)
+        X_num = X_aligned.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        P = self.poly_.transform(X_num[self.top_cols_].astype(np.float32))
+        names = [
+            str(n).replace(" ", "_X_").replace(":", "")
+            for n in self.poly_.get_feature_names_out(self.top_cols_)
         ]
-        opts_idx = list(range(len(labels)))
-        escolha = st.selectbox(
-            "Linha da planilha (linha 2 = primeira de dados)",
-            opts_idx,
-            format_func=lambda i: labels[i],
-            key="test_pl_select_idx",
-        )
-        idx = int(escolha) if escolha is not None else 0
-        row_1based = idx + 2
+        poly_df = pd.DataFrame(P, columns=names, index=X_num.index)
+        return pd.concat([X_num[self.rest_cols_], poly_df], axis=1)
 
-        atualizar = st.checkbox(
-            "Atualizar **Envio?**, **Log / erro** e **Link do contato** na planilha "
-            "(na linha escolhida; se duplicar abaixo, na **linha nova**)",
-            value=True,
-            key="test_pl_atualizar_status",
-        )
-        duplicar = st.checkbox(
-            "Antes do SF, **anexar** cópia da linha no fim da aba (mantém a linha original intacta)",
-            value=False,
-            key="test_pl_duplicar_linha",
-        )
-        mail_test = st.checkbox("Disparar também **e-mail de boas-vindas** (mais lento)", value=False, key="test_pl_mail")
 
-        if st.button("Carregar esta linha no formulário", key="test_pl_aplicar_form"):
-            cells = rows[idx]
-            dados = enriquecer_derivados_vendas_rj(dados_dict_de_linha_planilha(headers, cells))
-            _aplicar_dados_teste_ao_session_state(dados)
-            st.session_state["ficha_secao_idx"] = 0
-            st.success("Formulário preenchido a partir da planilha. Revise as etapas e envie se quiser.")
-            st.rerun()
+class _PrevHtmlQtdPredictor:
+    """Regressor + enriquecimento prevhtml já ajustados (apenas .predict)."""
 
-        if st.button("Criar contato no Salesforce (teste)", type="primary", key="test_pl_criar_sf"):
-            cells = rows[idx]
-            ok, msg = _executar_teste_criar_sf_de_linha_planilha(
-                row_1based_sheet=row_1based,
-                headers=headers,
-                cells=cells,
-                atualizar_status_nesta_linha=atualizar,
-                anexar_nova_linha_duplicada=duplicar,
-                enviar_email_boas_vindas=mail_test,
+    def __init__(self, enricher: PrevHtmlPolyEnricher, regressor: Any) -> None:
+        self._enricher = enricher
+        self._regressor = regressor
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        Xt = self._enricher.transform(X)
+        pr = np.asarray(self._regressor.predict(Xt), dtype=float).ravel()
+        return np.maximum(0.0, np.nan_to_num(pr, nan=0.0, posinf=0.0, neginf=0.0))
+
+
+def _smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.abs(y_true) + np.abs(y_pred) + 1e-6
+    return float(np.mean(200.0 * np.abs(y_true - y_pred) / denom))
+
+
+def _mape_nz(y_true: np.ndarray, y_pred: np.ndarray, min_y: float) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    m = y_true >= min_y
+    if m.sum() < 3:
+        return float("nan")
+    yt, yp = y_true[m], y_pred[m]
+    return float(np.mean(np.abs(yt - yp) / np.maximum(yt, min_y)) * 100.0)
+
+
+def _metrics_dict(
+    y_true: np.ndarray, y_pred: np.ndarray, target_name: str
+) -> dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    out: dict[str, float] = {
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "R2": float(r2_score(y_true, y_pred)),
+        "sMAPE": _smape(y_true, y_pred),
+    }
+    if target_name == "qtd":
+        out["MAPE"] = _mape_nz(y_true, y_pred, min_y=0.5)
+    else:
+        pos = y_true[y_true > 0]
+        p15 = float(np.percentile(pos, 15)) if len(pos) >= 5 else 1e5
+        floor = max(50_000.0, p15)
+        out["MAPE"] = _mape_nz(y_true, y_pred, min_y=floor)
+    return out
+
+
+def _accuracy_vs_train_median(
+    y_true: np.ndarray, y_pred: np.ndarray, y_train_reference: np.ndarray
+) -> float:
+    """
+    Acurácia direcional auxiliar: concordância com a mediana do treino (acima/abaixo).
+    Complementa MAE/R² na avaliação sem substituir métricas de regressão.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ref = np.asarray(y_train_reference, dtype=float)
+    ref = ref[np.isfinite(ref)]
+    if len(y_true) < 5 or len(ref) < 5:
+        return float("nan")
+    med = float(np.median(ref))
+    if not np.isfinite(med):
+        return float("nan")
+    tb = (y_true > med).astype(int)
+    pb = (y_pred > med).astype(int)
+    return float((tb == pb).mean())
+
+
+def temporal_train_test_indices(n: int, train_frac: float = 0.7) -> tuple[slice, slice]:
+    """Primeiros train_frac para treino; resto para teste out-of-sample (ex.: 70%/30%)."""
+    i_tr = max(1, int(n * train_frac))
+    if i_tr >= n:
+        raise ValueError(
+            "Série muito curta para o split temporal (treino/teste). "
+            "Aumente o histórico diário ou reduza o horizonte."
+        )
+    return slice(0, i_tr), slice(i_tr, n)
+
+
+def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
+    """JSON-friendly: converte numpy e substitui NaN/Inf por null."""
+
+    def fix(x: Any) -> Any:
+        if x is None:
+            return None
+        if isinstance(x, dict):
+            return {str(k): fix(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [fix(v) for v in x]
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating, float)):
+            xf = float(x)
+            if math.isnan(xf) or math.isinf(xf):
+                return None
+            return xf
+        if isinstance(x, np.ndarray):
+            return fix(x.tolist())
+        return x
+
+    return fix(d)
+
+
+def _prevhtml_model_templates(random_state: int) -> dict[str, Any]:
+    """
+    Modelagem explícita (script executivo): XGBRegressor, RandomForestRegressor,
+    GradientBoostingRegressor, Ridge(alpha=1.0) e VotingRegressor sobre os quatro primeiros.
+    Hiperparâmetros alinhados ao pipeline de referência (n_estimators=100, etc.).
+    """
+    bases: list[tuple[str, Any]] = []
+    if XGBRegressor is not None:
+        bases.append(
+            (
+                "XGBoost",
+                XGBRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=random_state,
+                ),
             )
-            if ok:
-                st.markdown(
-                    f'<div class="ficha-alert ficha-alert--azul">{msg}</div>',
-                    unsafe_allow_html=True,
-                )
+        )
+    bases.extend(
+        [
+            (
+                "Random Forest",
+                RandomForestRegressor(
+                    n_estimators=100, max_depth=5, random_state=random_state
+                ),
+            ),
+            (
+                "Gradient Boosting",
+                GradientBoostingRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=random_state,
+                ),
+            ),
+            ("Ridge Linear", Ridge(alpha=1.0)),
+        ]
+    )
+    out = dict(bases)
+    out["Ensemble (Voting)"] = VotingRegressor(
+        estimators=[(n, clone(e)) for n, e in bases]
+    )
+    return out
+
+
+def _train_one_target_prevhtml(
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int,
+    random_state: int,
+    show_progress: bool,
+    full_period_train: bool,
+    train_frac: float,
+) -> TrainResult:
+    """
+    Estratégia prevhtml.py: correlação → top-30 → polinômio grau 2;
+    split cronológico 70/30 dentro da zona de treino para competição por MAE;
+    vencedor reajustado em toda a zona de treino; modelo final em toda a série (como o app).
+    """
+    hz = int(horizon)
+    idx = X.index.intersection(y.index)
+    Xa = X.loc[idx].copy()
+    ya = pd.to_numeric(y.loc[idx], errors="coerce").astype(float)
+
+    if not full_period_train:
+        sl_tr, sl_te = temporal_train_test_indices(len(Xa), float(train_frac))
+        X_fit_zone = Xa.iloc[sl_tr]
+        y_fit_zone = ya.iloc[sl_tr]
+        X_outer = Xa.iloc[sl_te]
+        y_outer = ya.iloc[sl_te]
+    else:
+        X_fit_zone = Xa
+        y_fit_zone = ya
+        X_outer = Xa
+        y_outer = ya
+
+    enrich = PrevHtmlPolyEnricher()
+    enrich.fit(X_fit_zone, y_fit_zone)
+    Xef = enrich.transform(X_fit_zone)
+
+    n_in = len(Xef)
+    split_i = int(n_in * 0.7)
+    if split_i < 1 or (n_in - split_i) < 1:
+        raise ValueError(
+            "Série curta demais para o split interno 70/30 (estratégia prevhtml, alvo quantidade)."
+        )
+
+    X_p_tr = Xef.iloc[:split_i]
+    X_p_te = Xef.iloc[split_i:]
+    y_p_tr = y_fit_zone.iloc[:split_i]
+    y_p_te = y_fit_zone.iloc[split_i:]
+
+    templates = _prevhtml_model_templates(random_state)
+    maes: dict[str, float] = {}
+    loop = list(templates.items())
+    if show_progress:
+        loop = list(tqdm(loop, desc="Prevhtml (qtd)", leave=False, unit="modelo"))
+    for name, tpl in loop:
+        m = clone(tpl)
+        try:
+            m.fit(X_p_tr, y_p_tr)
+            pv = np.maximum(0.0, m.predict(X_p_te))
+            maes[name] = float(mean_absolute_error(y_p_te, pv))
+        except Exception:
+            continue
+
+    if not maes:
+        dm = DummyRegressor(strategy="median")
+        dm.fit(X_p_tr, y_p_tr)
+        pv0 = np.maximum(0.0, dm.predict(X_p_te))
+        win_name = "Baseline mediana (fallback)"
+        templates = {win_name: dm}
+        maes = {win_name: float(mean_absolute_error(y_p_te, pv0))}
+
+    win_name = min(maes, key=lambda k: maes[k])
+    win_tpl = templates[win_name]
+
+    reg_fit_zone = clone(win_tpl)
+    reg_fit_zone.fit(Xef, y_fit_zone)
+
+    X_all_enr = enrich.transform(Xa)
+    reg_prod = clone(win_tpl)
+    reg_prod.fit(X_all_enr, ya)
+
+    pipe = _PrevHtmlQtdPredictor(enrich, reg_prod)
+
+    reg_eval = clone(win_tpl)
+    reg_eval.fit(X_p_tr, y_p_tr)
+    pred_inner_te = np.maximum(0.0, reg_eval.predict(X_p_te))
+    y_max_tr = float(np.percentile(y_p_tr, 99.5)) if len(y_p_tr) else 0.0
+    long_hz = hz >= 21
+    cap_mult = 2.75 if long_hz else 2.35
+    cap = max(y_max_tr * cap_mult, 1.0)
+    pred_inner_te = np.clip(
+        np.nan_to_num(pred_inner_te, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+    )
+
+    thr = float(np.median(y_p_tr))
+
+    if full_period_train:
+        pred_outer = pred_inner_te
+        yo = y_p_te
+        do = X_p_te.index
+    else:
+        X_outer_enr = enrich.transform(X_outer)
+        pred_outer = np.maximum(0.0, reg_fit_zone.predict(X_outer_enr))
+        pred_outer = np.clip(
+            np.nan_to_num(pred_outer, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+        )
+        yo = y_outer
+        do = X_outer.index
+
+    metrics_val = _metrics_dict(y_p_te.values, pred_inner_te, "qtd")
+    metrics_test = _metrics_dict(np.asarray(yo, dtype=float), np.asarray(pred_outer, dtype=float), "qtd")
+    metrics_val["n_features"] = float(Xa.shape[1])
+    metrics_test["n_features"] = float(Xa.shape[1])
+
+    pred_chart = pipe.predict(Xa)
+    pred_chart = np.clip(
+        np.nan_to_num(pred_chart, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+    )
+    chart_dates = [d.strftime("%Y-%m-%d") for d in Xa.index]
+    chart_y_real = ya.tolist()
+    chart_y_pred = pred_chart.tolist()
+    chart_split_index = int(len(X_fit_zone)) if not full_period_train else split_i
+
+    y_tr_ref = np.asarray(y_p_tr, dtype=float)
+    metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        y_p_te.values, pred_inner_te, y_tr_ref
+    )
+    metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        np.asarray(yo, dtype=float), pred_outer, y_tr_ref
+    )
+
+    bench_rows: list[dict[str, Any]] = []
+    for name, tpl in templates.items():
+        m = clone(tpl)
+        try:
+            m.fit(X_p_tr, y_p_tr)
+            pv = np.maximum(0.0, m.predict(X_p_te))
+            if full_period_train:
+                pt = pv
+                y_te_b = y_p_te
             else:
-                st.markdown(
-                    f'<div class="ficha-alert ficha-alert--vermelho">{msg}</div>',
-                    unsafe_allow_html=True,
-                )
+                pt = np.maximum(0.0, m.predict(enrich.transform(X_outer)))
+                y_te_b = y_outer
+            bench_rows.append(
+                {
+                    "name": name,
+                    "mae_val": float(mean_absolute_error(y_p_te, pv)),
+                    "reg_val": regression_metrics(y_p_te.values, pv),
+                    "reg_test": regression_metrics(np.asarray(y_te_b, dtype=float), pt),
+                    "bin_val": binary_from_regression(y_p_te.values, pv, thr),
+                    "bin_test": binary_from_regression(
+                        np.asarray(y_te_b, dtype=float), pt, thr
+                    ),
+                    "roc_test": roc_curve_data(
+                        np.asarray(y_te_b, dtype=float), pt, thr
+                    ),
+                }
+            )
+        except Exception:
+            continue
+    bench_rows.sort(key=lambda r: r["mae_val"])
+    benchmark_appendix = _sanitize_benchmark_appendix(
+        {
+            "rows": bench_rows,
+            "winner_label": win_name,
+            "winner_names": [win_name],
+            "winner_weights": [1.0],
+            "threshold_y": thr,
+        }
+    )
+
+    best_params: dict[str, Any] = {
+        "estrategia": "prevhtml_poly_correlacao_70_30",
+        "modelo_vencedor": win_name,
+        "mae_split_interno": maes,
+        "horizonte_alvo": hz,
+    }
+
+    return TrainResult(
+        pipeline=pipe,
+        metrics_val=metrics_val,
+        metrics_test=metrics_test,
+        importance=pd.Series(dtype=float),
+        y_val=y_p_te,
+        y_val_pred=pred_inner_te,
+        y_test=pd.Series(np.asarray(yo, dtype=float), index=do),
+        y_test_pred=np.asarray(pred_outer, dtype=float),
+        best_params=best_params,
+        dates_val=X_p_te.index,
+        dates_test=do,
+        model_label=f"Prevhtml: {win_name}",
+        full_period_train=full_period_train,
+        chart_dates=chart_dates,
+        chart_y_real=chart_y_real,
+        chart_y_pred=chart_y_pred,
+        chart_split_index=chart_split_index,
+        benchmark_appendix=benchmark_appendix,
+    )
 
 
-def secoes_ordenadas() -> List[str]:
-    presentes = {c["sec"] for c in CAMPOS}
-    return [s for s in SEC_ORDER if s in presentes]
+def train_one_target(
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int,
+    target_name: str,
+    n_trials: int = 0,
+    n_splits_tss: int = 7,
+    random_state: int = 42,
+    optuna_seed: int = 42,
+    blend_top_k: int = 5,
+    show_progress: bool = True,
+    full_period_train: bool = False,
+    train_frac: float = 0.7,
+) -> TrainResult:
+    """
+    Treino único alinhado a prevhtml.py (sem Optuna): quantidade apenas.
+    Parâmetros n_trials, optuna_seed, blend_top_k e n_splits_tss mantêm-se na
+    assinatura por compatibilidade com chamadas existentes, mas são ignorados.
+    """
+    del n_trials, n_splits_tss, optuna_seed, blend_top_k
+    if target_name != "qtd":
+        raise ValueError(
+            "Apenas target_name='qtd' é suportado (pipeline prevhtml.py, sem Optuna nem VGV)."
+        )
+    return _train_one_target_prevhtml(
+        X,
+        y,
+        horizon=horizon,
+        random_state=random_state,
+        show_progress=show_progress,
+        full_period_train=full_period_train,
+        train_frac=train_frac,
+    )
+
+# ----- inlined: macro_features.py -----
+import json as _macro_json
+import logging as _macro_logging
+import os as _macro_os
+import urllib.error as _macro_urllib_error
+import urllib.request as _macro_urllib_request
+
+_macro_logger = _macro_logging.getLogger(__name__)
 
 
-def campos_por_secao(sec: str) -> List[Campo]:
-    return [c for c in CAMPOS if c["sec"] == sec]
+def _parse_bcb_valor(vs: str) -> float:
+    """Converte string `valor` da API SGS (ponto decimal ou formato 1.234,56)."""
+    s = str(vs).strip()
+    if not s:
+        return float("nan")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
 
-# =============================================================================
-# INTEGRADO: google_sheets_corretor
-# =============================================================================
+
+MACRO_BCB_SPECS: list[tuple[str, int, int, str]] = [
+    ("macro_ptax_usd", 1, 3, "d"),
+    ("macro_tr_dia", 11, 3, "d"),
+    ("macro_selic_aa", 432, 3, "d"),
+    ("macro_ipca_mom", 13522, 45, "m"),
+    ("macro_ipca_12m", 433, 45, "m"),
+    ("macro_ibc_br_dessaz", 24364, 45, "m"),
+    ("macro_igpm_mom", 189, 45, "m"),
+    ("macro_pmc_materiais_constr", 21859, 45, "m"),
+    ("macro_pmc_indice_20786", 20786, 45, "m"),
+    ("macro_pmc_volume_20539", 20539, 45, "m"),
+    ("macro_setor_const_7459", 7459, 45, "m"),
+]
+
+
+def _macro_disabled() -> bool:
+    v = (_macro_os.environ.get("PREVISAO_MACRO_BCB") or "").strip().lower()
+    return v in ("0", "false", "no", "off")
+
+
+def _fetch_bcb_sgs(codigo: int, data_inicial: str, data_final: str) -> pd.Series:
+    url = (
+        f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados"
+        f"?formato=json&dataInicial={data_inicial}&dataFinal={data_final}"
+    )
+    req = _macro_urllib_request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; PrevisaoVendas/1.3)"},
+    )
+    try:
+        with _macro_urllib_request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+    except (
+        _macro_urllib_error.URLError,
+        _macro_urllib_error.HTTPError,
+        TimeoutError,
+        OSError,
+    ) as e:
+        _macro_logger.warning("BCB SGS %s: falha de rede — %s", codigo, e)
+        return pd.Series(dtype=float)
+    if not raw or raw[0] not in "[{":
+        return pd.Series(dtype=float)
+    try:
+        data = _macro_json.loads(raw)
+    except _macro_json.JSONDecodeError:
+        return pd.Series(dtype=float)
+    if not isinstance(data, list) or not data:
+        return pd.Series(dtype=float)
+    dates: list[pd.Timestamp] = []
+    vals: list[float] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        ds = str(row.get("data", "")).strip()
+        vs = str(row.get("valor", "")).strip()
+        if not ds:
+            continue
+        try:
+            dt = pd.to_datetime(ds, dayfirst=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            v = _parse_bcb_valor(vs)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(v):
+            dates.append(pd.Timestamp(dt).normalize())
+            vals.append(v)
+    if not dates:
+        return pd.Series(dtype=float)
+    s = pd.Series(vals, index=pd.DatetimeIndex(dates))
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    return s
+
+
+def _align_series_to_index(
+    s: pd.Series,
+    idx: pd.DatetimeIndex,
+    lag_days: int,
+) -> pd.Series:
+    if s.empty or len(idx) == 0:
+        return pd.Series(0.0, index=idx)
+    s = s.copy()
+    s.index = pd.DatetimeIndex(s.index) + pd.Timedelta(days=int(lag_days))
+    start = min(s.index.min(), idx.min())
+    end = idx.max()
+    daily = pd.date_range(start, end, freq="D")
+    expanded = s.reindex(daily).ffill()
+    out = expanded.reindex(idx.normalize()).ffill()
+    return out.fillna(0.0)
+
+
+def merge_macro_bcb_into_daily(
+    df_master: pd.DataFrame,
+    *,
+    show_progress: bool = False,
+) -> None:
+    if _macro_disabled():
+        for name, *_ in MACRO_BCB_SPECS:
+            df_master[name] = 0.0
+        df_master["macro_ptax_ret20d"] = 0.0
+        return
+
+    idx = pd.DatetimeIndex(df_master.index).normalize()
+    if len(idx) == 0:
+        return
+
+    buf = pd.Timedelta(days=800)
+    d0 = (idx.min() - buf).strftime("%d/%m/%Y")
+    d1 = idx.max().strftime("%d/%m/%Y")
+
+    for col, codigo, lag, _freq in MACRO_BCB_SPECS:
+        s = _fetch_bcb_sgs(codigo, d0, d1)
+        aligned = _align_series_to_index(s, idx, lag)
+        df_master[col] = aligned.values
+
+    if "macro_ptax_usd" in df_master.columns:
+        px = pd.to_numeric(df_master["macro_ptax_usd"], errors="coerce").replace(
+            0.0, np.nan
+        )
+        chg = px.pct_change(periods=20).shift(1).fillna(0.0).clip(-0.5, 0.5)
+        df_master["macro_ptax_ret20d"] = chg.values
+    else:
+        df_master["macro_ptax_ret20d"] = 0.0
+
+    if show_progress:
+        nz = sum(
+            1 for c, *_ in MACRO_BCB_SPECS if float(df_master[c].abs().sum()) > 0
+        )
+        print(f"Macro BCB: {nz}/{len(MACRO_BCB_SPECS)} séries com valores não nulos.")
+
+
+# ----- inlined: features.py -----
+
+import hashlib
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+# Após o sábado de referência, os totais do formulário só entram como feature (evita vazamento).
+FORMULARIO_FEATURE_LAG_DIAS = 7
+
+# Feriados nacionais + estaduais (RJ) — pacote `holidays`; se ausente, colunas ficam a zero.
+CAL_SUBDIV_BR = "RJ"
+
+
+def _br_holiday_dates_for_index(idx: pd.DatetimeIndex) -> frozenset:
+    """Conjunto de datas (date) de feriado no Brasil (RJ). Vazio se `holidays` não estiver instalado."""
+    try:
+        import holidays
+    except ImportError:
+        return frozenset()
+    try:
+        y0 = int(pd.Timestamp(idx.min()).year) - 1
+        y1 = int(pd.Timestamp(idx.max()).year) + 2
+        years = range(y0, y1 + 1)
+        cal = holidays.Brazil(subdiv=CAL_SUBDIV_BR, years=years)
+        return frozenset(cal.keys())
+    except Exception:
+        return frozenset()
+
+
+def _inject_calendario_feriados_br(
+    df_master: pd.DataFrame, idx: pd.DatetimeIndex, H: frozenset
+) -> None:
+    """
+    Flags de calendário (sem leakage: só o dia t).
+    H: datas (date) de feriado — Brasil subdiv RJ (nacional + estaduais).
+    """
+    from bisect import bisect_left, bisect_right
+    from datetime import timedelta
+
+    n = len(idx)
+    if not H:
+        df_master["cal_feriado_br"] = 0
+        df_master["cal_vespera_feriado_br"] = 0
+        df_master["cal_pos_feriado_br"] = 0
+        df_master["cal_feriado_pontu"] = 0
+        df_master["cal_dias_ate_proximo_feriado"] = 0.0
+        df_master["cal_dias_desde_feriado"] = 0.0
+        return
+
+    sorted_h = sorted(H)
+    fer = np.zeros(n, dtype=np.float64)
+    ves = np.zeros(n, dtype=np.float64)
+    pos = np.zeros(n, dtype=np.float64)
+    pont = np.zeros(n, dtype=np.float64)
+    ate = np.full(n, 30.0, dtype=np.float64)
+    desde = np.full(n, 30.0, dtype=np.float64)
+
+    def _feriado_em_ponte(d) -> bool:
+        """Feriado em sexta/sáb/dom ou segunda (padrão típico de emenda)."""
+        if d not in H:
+            return False
+        wd = d.weekday()
+        return wd in (0, 4, 5, 6)
+
+    for i, ts in enumerate(idx):
+        d = pd.Timestamp(ts).normalize().date()
+        if d in H:
+            fer[i] = 1.0
+            if _feriado_em_ponte(d):
+                pont[i] = 1.0
+        if (d + timedelta(days=1)) in H:
+            ves[i] = 1.0
+        if (d - timedelta(days=1)) in H:
+            pos[i] = 1.0
+        j = bisect_left(sorted_h, d)
+        if j < len(sorted_h):
+            ate[i] = min(30.0, float((sorted_h[j] - d).days))
+        k = bisect_right(sorted_h, d) - 1
+        if k >= 0:
+            desde[i] = min(30.0, float((d - sorted_h[k]).days))
+
+    df_master["cal_feriado_br"] = fer
+    df_master["cal_vespera_feriado_br"] = ves
+    df_master["cal_pos_feriado_br"] = pos
+    df_master["cal_feriado_pontu"] = pont
+    df_master["cal_dias_ate_proximo_feriado"] = ate
+    df_master["cal_dias_desde_feriado"] = desde
+
+
+def _to_day(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.normalize()
+
+
+def _strip_timezone_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    return pd.DatetimeIndex(idx).normalize()
+
+
+def _winsorize_positive_series(s: pd.Series, pct: float = 99.5, mult_vs_median: float = 80.0) -> pd.Series:
+    """Limita cauda superior de valores positivos (erros de digitação em VGV) sem cortar dias normais."""
+    v = pd.to_numeric(s, errors="coerce").fillna(0.0).clip(lower=0.0)
+    pos = v[v > 0]
+    if len(pos) < 25:
+        return v
+    cap = float(np.nanpercentile(pos.to_numpy(dtype=float), pct))
+    med = float(pos.median()) if len(pos) else 0.0
+    hi = max(cap, med * mult_vs_median) if med > 0 else cap
+    return v.clip(upper=max(hi, 1.0))
+
+
+def _resolve_leads(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    date_c = find_column_any(
+        df,
+        [
+            ["data", "criacao"],
+            ["data", "criacao", "lead"],
+            ["data", "atendimento"],
+            ["data", "lead"],
+        ],
+    )
+    if date_c is None:
+        date_c = find_column_any(df, [["data", "criacao"]])
+    if date_c is None:
+        raise ValueError(
+            "Base Leads: não encontrei coluna de data (ex.: 'Data de criação'). "
+            f"Colunas: {list(df.columns)}"
+        )
+    out = df[[date_c]].copy()
+    out["_d"] = _to_day(out[date_c])
+    out = out.loc[out["_d"].notna()].copy()
+    return out, date_c
+
+
+def _resolve_agendamentos(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
+    c_ag = find_column_any(df, [["data", "agendamento"]])
+    c_vis = find_column_any(df, [["data", "visita"]])
+    if c_ag is None:
+        raise ValueError(
+            "Base Agendamentos: falta 'Data Agendamento'. "
+            f"Colunas: {list(df.columns)}"
+        )
+    if c_vis is None:
+        raise ValueError(
+            "Base Agendamentos: falta 'Data da visita'. "
+            f"Colunas: {list(df.columns)}"
+        )
+    out = df[[c_ag, c_vis]].copy()
+    out["_dag"] = _to_day(out[c_ag])
+    out["_dvi"] = _to_day(out[c_vis])
+    out = out.loc[out["_dag"].notna()].copy()
+    return out, c_ag, c_vis
+
+
+def _resolve_pastas(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    c = find_column_any(
+        df,
+        [
+            ["data", "criacao", "pasta"],
+            ["data", "criacao"],
+        ],
+    )
+    if c is None:
+        raise ValueError(
+            "Base Pastas: não encontrei 'Data Criação Pasta'. "
+            f"Colunas: {list(df.columns)}"
+        )
+    out = df[[c]].copy()
+    out["_d"] = _to_day(out[c])
+    out = out.loc[out["_d"].notna()].copy()
+    return out, c
+
+
+def _resolve_vendas(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
+    c_data = find_column_any(
+        df,
+        [
+            ["data", "venda"],
+            ["data", "fechamento"],
+        ],
+    )
+    if c_data is None:
+        raise ValueError(
+            "Base Vendas: não encontrei 'Data da venda'. "
+            f"Colunas: {list(df.columns)}"
+        )
+    c_val = find_column_any(
+        df,
+        [
+            ["valor", "real", "venda"],
+            ["valor", "real"],
+            ["vgv", "real"],
+            ["valor", "venda"],
+            ["vgv"],
+        ],
+    )
+    if c_val is None:
+        c_val = find_column_any(df, [["valor"]])
+    if c_val is None:
+        raise ValueError(
+            "Base Vendas: não encontrei 'Valor Real de Venda'. "
+            f"Colunas: {list(df.columns)}"
+        )
+    out = df[[c_data, c_val]].copy()
+    out["_d"] = _to_day(out[c_data])
+    out = out.loc[out["_d"].notna()].copy()
+    out["_valor"] = _winsorize_positive_series(out[c_val])
+    return out, c_data, c_val
+
+
+def _vdim_slug(part: str, max_len: int = 36) -> str:
+    t = normalize_header(str(part).strip())[:max_len]
+    t = re.sub(r"[^a-z0-9_]+", "_", t).strip("_")
+    return t or "na"
+
+
+def build_vendas_wide_daily(
+    df_v: pd.DataFrame,
+    *,
+    max_dim_combinations: int = 4000,
+) -> pd.DataFrame:
+    """
+    Agrega a base bruta de vendas num painel diário largo: por dia, contagens e soma de VGV
+    por combinação de dimensões (corretor, ranking, empreendimento, regional, canal, …).
+
+    Colunas geradas: prefixo ``vdim_q__`` (quantidade) e ``vdim_v__`` (soma VGV).
+    Não entram no treino ML (filtradas em ``build_feature_matrix`` / ``build_xy_for_horizon``).
+    """
+    if df_v is None or len(df_v) < 1:
+        return pd.DataFrame()
+    fn = normalize_dataframe_columns(df_v.copy())
+    c_data = find_column_any(
+        fn,
+        [
+            ["data", "venda"],
+            ["data", "fechamento"],
+        ],
+    )
+    c_val = find_column_any(
+        fn,
+        [
+            ["valor", "real", "venda"],
+            ["valor", "real"],
+            ["vgv", "real"],
+            ["valor", "venda"],
+            ["vgv"],
+        ],
+    )
+    if c_val is None:
+        c_val = find_column(fn, ["valor"])
+    if c_data is None or c_val is None:
+        return pd.DataFrame()
+
+    dim_candidates: list[tuple[str, str | None]] = [
+        ("corretor", find_column_any(fn, [["corretor"], ["vendedor"], ["broker"]])),
+        ("ranking", find_column_any(fn, [["ranking"], ["rank"]])),
+        (
+            "empreend",
+            find_column_any(
+                fn,
+                [
+                    ["empreendimento"],
+                    ["empreend"],
+                    ["produto"],
+                ],
+            ),
+        ),
+        ("regional", find_column_any(fn, [["regional", "imob"], ["regional"]])),
+        ("canal", find_column(fn, ["canal"])),
+    ]
+    dims = [(tag, c) for tag, c in dim_candidates if c is not None and c in fn.columns]
+    if not dims:
+        return pd.DataFrame()
+
+    work = fn.copy()
+    work["_d"] = _to_day(work[c_data])
+    work = work.loc[work["_d"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["_valor"] = pd.to_numeric(work[c_val], errors="coerce").fillna(0.0)
+
+    parts: list[pd.Series] = []
+    for _tag, col in dims:
+        s = work[col].fillna("").astype(str).str.strip()
+        s = s.replace("", "na").replace("nan", "na")
+        parts.append(s.map(_vdim_slug))
+
+    combo = parts[0].astype(str)
+    for p in parts[1:]:
+        combo = combo + "__" + p.astype(str)
+
+    if combo.nunique() > max_dim_combinations:
+        vc = combo.value_counts()
+        top = set(vc.nlargest(max(1, max_dim_combinations - 1)).index)
+        combo = combo.where(combo.isin(top), "_outros_agrupados")
+
+    work["_dim"] = combo
+    g = work.groupby(["_d", "_dim"], observed=True)
+    cnt = g.size().unstack(fill_value=0).astype(np.float64)
+    vgv = g["_valor"].sum().unstack(fill_value=0.0).astype(np.float64)
+
+    def _col_name(prefix: str, raw: str) -> str:
+        body = str(raw)
+        if len(body) > 72:
+            body = hashlib.sha256(body.encode("utf-8")).hexdigest()[:24]
+        else:
+            body = re.sub(r"[^a-z0-9_]+", "_", body.lower()).strip("_") or "x"
+        return f"{prefix}{body}"
+
+    cnt.columns = [_col_name("vdim_q__", c) for c in cnt.columns]
+    vgv.columns = [_col_name("vdim_v__", c) for c in vgv.columns]
+    out = pd.concat([cnt, vgv], axis=1)
+    out.index = pd.DatetimeIndex(pd.to_datetime(out.index).normalize())
+    out = out.sort_index().fillna(0.0)
+    out = out.loc[:, ~out.columns.duplicated()]
+    return out.replace([np.inf, -np.inf], 0.0)
+
+
+def forward_calendar_features(index: pd.DatetimeIndex, horizon: int) -> pd.DataFrame:
+    """
+    Por cada dia t: contagens no calendário dos dias t+1..t+H.
+    Não usa vendas — apenas datas (permitido para previsão).
+    Inclui feriados BR (RJ) no horizonte futuro.
+    """
+    from datetime import timedelta
+
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    fwd_wknd = np.zeros(len(index), dtype=float)
+    fwd_bday = np.zeros(len(index), dtype=float)
+    fwd_fer = np.zeros(len(index), dtype=float)
+    fwd_ves = np.zeros(len(index), dtype=float)
+    fwd_pos = np.zeros(len(index), dtype=float)
+    fwd_pont = np.zeros(len(index), dtype=float)
+    for i, ts in enumerate(index):
+        dr = pd.date_range(ts + pd.Timedelta(days=1), periods=horizon, freq="D")
+        dow = dr.dayofweek.to_numpy()
+        fwd_wknd[i] = float((dow >= 5).sum())
+        fwd_bday[i] = float((dow < 5).sum())
+        if H:
+            nf = nv = npos = npont = 0
+            for dt in dr:
+                d = pd.Timestamp(dt).normalize().date()
+                if d in H:
+                    nf += 1
+                    if _ponte(d):
+                        npont += 1
+                if (d + timedelta(days=1)) in H:
+                    nv += 1
+                if (d - timedelta(days=1)) in H:
+                    npos += 1
+            fwd_fer[i] = float(nf)
+            fwd_ves[i] = float(nv)
+            fwd_pos[i] = float(npos)
+            fwd_pont[i] = float(npont)
+    h = float(horizon)
+    return pd.DataFrame(
+        {
+            "fwd_h": h,
+            "fwd_wknd_h": fwd_wknd,
+            "fwd_bday_h": fwd_bday,
+            "fwd_wknd_ratio": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_h": fwd_fer,
+            "fwd_vesperas_h": fwd_ves,
+            "fwd_pos_feriado_h": fwd_pos,
+            "fwd_feriado_pontu_h": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def forward_sum_offsets(series: pd.Series, offsets: list[int]) -> pd.Series:
+    """Soma das vendas nos dias t+off para cada off em `offsets` (off > 0)."""
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    offs = sorted({int(o) for o in offsets if int(o) > 0})
+    y = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        s = 0.0
+        ok = True
+        for o in offs:
+            j = i + o
+            if j >= n:
+                ok = False
+                break
+            s += arr[j]
+        if ok:
+            y[i] = s
+    return pd.Series(y, index=series.index)
+
+
+def forward_calendar_features_offsets(
+    index: pd.DatetimeIndex, offsets: list[int]
+) -> pd.DataFrame:
+    """Calendário e feriados BR apenas nos dias exatos t+off (ex.: combinação 4,11,12)."""
+    from datetime import timedelta
+
+    offs = sorted({int(o) for o in offsets if int(o) > 0})
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    n = len(index)
+    fwd_wknd = np.zeros(n, dtype=float)
+    fwd_bday = np.zeros(n, dtype=float)
+    fwd_fer = np.zeros(n, dtype=float)
+    fwd_ves = np.zeros(n, dtype=float)
+    fwd_pos = np.zeros(n, dtype=float)
+    fwd_pont = np.zeros(n, dtype=float)
+    for i, ts in enumerate(index):
+        for o in offs:
+            dt = (ts + pd.Timedelta(days=int(o))).normalize()
+            dow = int(dt.dayofweek)
+            if dow >= 5:
+                fwd_wknd[i] += 1.0
+            else:
+                fwd_bday[i] += 1.0
+            d = dt.date()
+            if H and d in H:
+                fwd_fer[i] += 1.0
+                if _ponte(d):
+                    fwd_pont[i] += 1.0
+            if H and (d + timedelta(days=1)) in H:
+                fwd_ves[i] += 1.0
+            if H and (d - timedelta(days=1)) in H:
+                fwd_pos[i] += 1.0
+    h = float(len(offs)) if offs else 1.0
+    return pd.DataFrame(
+        {
+            "fwd_h_custom": h,
+            "fwd_wknd_custom": fwd_wknd,
+            "fwd_bday_custom": fwd_bday,
+            "fwd_wknd_ratio_custom": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_custom": fwd_fer,
+            "fwd_vesperas_custom": fwd_ves,
+            "fwd_pos_feriado_custom": fwd_pos,
+            "fwd_feriado_ponte_custom": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def forward_sum_same_month_dom(series: pd.Series, doms: list[int]) -> pd.Series:
+    """
+    Soma vendas nos dias do mês (calendário) estritamente posteriores ao dia corrente.
+    Ex.: no dia 3, com doms [7,14,15], soma vendas nos dias 7, 14 e 15 do mesmo mês.
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(series.index).normalize())
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    date_to_pos = {idx[i]: i for i in range(n)}
+    y = np.full(n, np.nan, dtype=float)
+    doms_u = sorted({int(d) for d in doms if 1 <= int(d) <= 31})
+
+    for i in range(n):
+        ts = idx[i]
+        y0, m0, d0 = ts.year, ts.month, ts.day
+        total = 0.0
+        n_hit = 0
+        valid = True
+        for dom in doms_u:
+            if dom <= d0:
+                continue
+            try:
+                fut = pd.Timestamp(year=y0, month=m0, day=dom).normalize()
+            except ValueError:
+                valid = False
+                break
+            j = date_to_pos.get(fut)
+            if j is None:
+                valid = False
+                break
+            total += arr[j]
+            n_hit += 1
+        if not valid:
+            y[i] = np.nan
+        elif n_hit == 0:
+            y[i] = 0.0
+        else:
+            y[i] = total
+    return pd.Series(y, index=series.index)
+
+
+def forward_calendar_features_dom(
+    index: pd.DatetimeIndex, doms: list[int]
+) -> pd.DataFrame:
+    """Fins de semana e feriados nos dias-alvo (mesmo mês, dia do mês > dia de t)."""
+    from datetime import timedelta
+
+    doms_u = sorted({int(d) for d in doms if 1 <= int(d) <= 31})
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    n = len(index)
+    fwd_wknd = np.zeros(n, dtype=float)
+    fwd_bday = np.zeros(n, dtype=float)
+    fwd_fer = np.zeros(n, dtype=float)
+    fwd_ves = np.zeros(n, dtype=float)
+    fwd_pos = np.zeros(n, dtype=float)
+    fwd_pont = np.zeros(n, dtype=float)
+    n_days = np.zeros(n, dtype=float)
+
+    for i, ts in enumerate(index):
+        y0, m0, d0 = ts.year, ts.month, ts.day
+        for dom in doms_u:
+            if dom <= d0:
+                continue
+            try:
+                dti = pd.Timestamp(year=y0, month=m0, day=dom).normalize()
+            except ValueError:
+                continue
+            n_days[i] += 1.0
+            dow = int(dti.dayofweek)
+            if dow >= 5:
+                fwd_wknd[i] += 1.0
+            else:
+                fwd_bday[i] += 1.0
+            d = dti.date()
+            if H and d in H:
+                fwd_fer[i] += 1.0
+                if _ponte(d):
+                    fwd_pont[i] += 1.0
+            if H and (d + timedelta(days=1)) in H:
+                fwd_ves[i] += 1.0
+            if H and (d - timedelta(days=1)) in H:
+                fwd_pos[i] += 1.0
+
+    h = np.maximum(n_days, 1.0)
+    return pd.DataFrame(
+        {
+            "fwd_h_dom": n_days,
+            "fwd_wknd_dom": fwd_wknd,
+            "fwd_bday_dom": fwd_bday,
+            "fwd_wknd_ratio_dom": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_dom": fwd_fer,
+            "fwd_vesperas_dom": fwd_ves,
+            "fwd_pos_feriado_dom": fwd_pos,
+            "fwd_feriado_ponte_dom": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def forward_sum_calendar_date_range(
+    series: pd.Series, d_start: pd.Timestamp, d_end: pd.Timestamp
+) -> pd.Series:
+    """
+    Para cada dia t: soma do alvo nos dias d da série com t < d e d_start <= d <= d_end (inclusive).
+    Linhas sem dias futuros no intervalo ficam com NaN (excluídas do treino).
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(series.index).normalize())
+    d_lo = pd.Timestamp(d_start).normalize()
+    d_hi = pd.Timestamp(d_end).normalize()
+    if d_hi < d_lo:
+        d_lo, d_hi = d_hi, d_lo
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    y = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        ts = idx[i]
+        total = 0.0
+        hits = 0
+        for j in range(n):
+            d_j = idx[j]
+            if d_j <= ts or d_j < d_lo or d_j > d_hi:
+                continue
+            total += arr[j]
+            hits += 1
+        if hits == 0:
+            y[i] = np.nan
+        else:
+            y[i] = total
+    return pd.Series(y, index=series.index)
+
+
+def forward_calendar_features_date_range(
+    index: pd.DatetimeIndex, d_start: pd.Timestamp, d_end: pd.Timestamp
+) -> pd.DataFrame:
+    """Fins de semana e feriados BR nos dias da série que entram no intervalo (após t)."""
+    from datetime import timedelta
+
+    d_lo = pd.Timestamp(d_start).normalize()
+    d_hi = pd.Timestamp(d_end).normalize()
+    if d_hi < d_lo:
+        d_lo, d_hi = d_hi, d_lo
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    n = len(index)
+    idx_norm = pd.DatetimeIndex(pd.to_datetime(index).normalize())
+    fwd_wknd = np.zeros(n, dtype=float)
+    fwd_bday = np.zeros(n, dtype=float)
+    fwd_fer = np.zeros(n, dtype=float)
+    fwd_ves = np.zeros(n, dtype=float)
+    fwd_pos = np.zeros(n, dtype=float)
+    fwd_pont = np.zeros(n, dtype=float)
+    n_days = np.zeros(n, dtype=float)
+
+    for i in range(n):
+        ts = idx_norm[i]
+        for j in range(n):
+            d_j = idx_norm[j]
+            if d_j <= ts or d_j < d_lo or d_j > d_hi:
+                continue
+            n_days[i] += 1.0
+            dow = int(d_j.dayofweek)
+            if dow >= 5:
+                fwd_wknd[i] += 1.0
+            else:
+                fwd_bday[i] += 1.0
+            d = d_j.date()
+            if H and d in H:
+                fwd_fer[i] += 1.0
+                if _ponte(d):
+                    fwd_pont[i] += 1.0
+            if H and (d + timedelta(days=1)) in H:
+                fwd_ves[i] += 1.0
+            if H and (d - timedelta(days=1)) in H:
+                fwd_pos[i] += 1.0
+
+    h = np.maximum(n_days, 1.0)
+    return pd.DataFrame(
+        {
+            "fwd_h_range": n_days,
+            "fwd_wknd_range": fwd_wknd,
+            "fwd_bday_range": fwd_bday,
+            "fwd_wknd_ratio_range": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_range": fwd_fer,
+            "fwd_vesperas_range": fwd_ves,
+            "fwd_pos_feriado_range": fwd_pos,
+            "fwd_feriado_ponte_range": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def build_xy_custom_date_range(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    d_start: pd.Timestamp,
+    d_end: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.Series]:
+    y = forward_sum_calendar_date_range(df_master[target_daily_col], d_start, d_end)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features_date_range(df_master.index, d_start, d_end)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
+def build_xy_custom_offsets(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    offsets: list[int],
+) -> tuple[pd.DataFrame, pd.Series]:
+    y = forward_sum_offsets(df_master[target_daily_col], offsets)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features_offsets(df_master.index, offsets)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
+def build_xy_custom_dom(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    doms: list[int],
+) -> tuple[pd.DataFrame, pd.Series]:
+    y = forward_sum_same_month_dom(df_master[target_daily_col], doms)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features_dom(df_master.index, doms)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
+def predict_last_row_custom_offsets(
+    df_master: pd.DataFrame, pipeline: Any, offsets: list[int]
+) -> float:
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features_offsets(df_master.index, offsets)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
+
+
+def predict_last_row_custom_dom(
+    df_master: pd.DataFrame, pipeline: Any, doms: list[int]
+) -> float:
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features_dom(df_master.index, doms)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
+
+
+def predict_last_row_custom_date_range(
+    df_master: pd.DataFrame,
+    pipeline: Any,
+    d_start: pd.Timestamp,
+    d_end: pd.Timestamp,
+) -> float:
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features_date_range(df_master.index, d_start, d_end)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
+
+
+def _inject_ts_and_stl_features(
+    df_master: pd.DataFrame, show_progress: bool = False
+) -> None:
+    """Picos, quantis, eco semanal, ticket e STL rolante (statsmodels) — só passado."""
+    for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
+        s = df_master[col].astype(float)
+        df_master[f"ts_rollmax7_{short}"] = s.shift(1).rolling(7, min_periods=1).max()
+        df_master[f"ts_rollmax30_{short}"] = s.shift(1).rolling(30, min_periods=1).max()
+        df_master[f"ts_q85_30_{short}"] = (
+            s.shift(1).rolling(30, min_periods=10).quantile(0.85)
+        )
+        df_master[f"ts_q90_60_{short}"] = (
+            s.shift(1).rolling(60, min_periods=15).quantile(0.90)
+        )
+        df_master[f"ts_ewm_short_{short}"] = s.shift(1).ewm(span=5, adjust=False).mean()
+        roll_m = s.shift(1).rolling(14, min_periods=3).mean()
+        df_master[f"ts_burst_{short}"] = (s.shift(1) / (roll_m + 1e-6)).fillna(0.0)
+
+    tv = df_master["target_valor"]
+    tq = df_master["target_qtd"]
+    df_master["ts_weekly_echo_vgv"] = (
+        0.45 * tv.shift(7) + 0.30 * tv.shift(14) + 0.25 * tv.shift(21)
+    ).fillna(0.0)
+    df_master["ts_weekly_echo_qtd"] = (
+        0.45 * tq.shift(7) + 0.30 * tq.shift(14) + 0.25 * tq.shift(21)
+    ).fillna(0.0)
+    df_master["ts_ticket_lag1"] = (tv.shift(1) / (tq.shift(1) + 1e-6)).fillna(0.0)
+
+    try:
+        from statsmodels.tsa.seasonal import STL
+    except ImportError:
+        for short in ("vgv", "qtd"):
+            df_master[f"ts_stl_trend_{short}"] = 0.0
+            df_master[f"ts_stl_seasamp_{short}"] = 0.0
+        return
+
+    win, period = 91, 7
+    for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
+        s = df_master[col].astype(float)
+        n = len(s)
+        arr = s.to_numpy(dtype=float)
+        trend = np.zeros(n)
+        seas_amp = np.zeros(n)
+        idx_iter = range(win, n)
+        if show_progress:
+            idx_iter = tqdm(
+                idx_iter,
+                desc=f"STL {short}",
+                leave=False,
+                unit="dia",
+                mininterval=0.12,
+                miniters=1,
+                dynamic_ncols=True,
+            )
+        for i in idx_iter:
+            seg = arr[i - win : i]
+            if np.nanmax(seg) - np.nanmin(seg) < 1e-11:
+                trend[i] = seg[-1]
+                seas_amp[i] = 0.0
+                continue
+            try:
+                r = STL(seg, period=period, robust=True).fit()
+                trend[i] = float(r.trend[-1])
+                seas_amp[i] = float(np.std(r.seasonal))
+            except Exception:
+                trend[i] = float(np.nanmean(seg[-period:]))
+                seas_amp[i] = 0.0
+        df_master[f"ts_stl_trend_{short}"] = trend
+        df_master[f"ts_stl_seasamp_{short}"] = seas_amp
+
+
+def _find_formulario_vgv_col(
+    df: pd.DataFrame,
+    alternatives: list[list[str]],
+    *,
+    used: set[str],
+) -> str | None:
+    """
+    Coluna numérica de VGV no formulário (exclui colunas cujo nome sugere quantidade).
+    Tenta várias convenções de cabeçalho: muitas folhas usam 'vgv' em vez de 'vendas'.
+    """
+    for parts in alternatives:
+        for col in df.columns:
+            if col in used:
+                continue
+            c = str(col)
+            if "qtd" in c:
+                continue
+            if all(p in c for p in parts):
+                used.add(col)
+                return col
+    return None
+
+
+def _find_qtd_col(
+    df: pd.DataFrame,
+    parts: list[str],
+    *,
+    used: set[str] | None = None,
+) -> str | None:
+    for col in df.columns:
+        if used is not None and col in used:
+            continue
+        c = str(col)
+        if "qtd" not in c:
+            continue
+        if all(p in c for p in parts):
+            if used is not None:
+                used.add(col)
+            return col
+    return None
+
+
+def _find_formulario_qtd_col(
+    df: pd.DataFrame,
+    alternatives: list[list[str]],
+    *,
+    used: set[str],
+) -> str | None:
+    for parts in alternatives:
+        c = _find_qtd_col(df, parts, used=used)
+        if c is not None:
+            return c
+    return None
+
+
+def _week_end_saturday(ts: pd.Timestamp) -> pd.Timestamp:
+    t = pd.Timestamp(ts).normalize()
+    try:
+        p = t.to_period("W-SAT")
+        return pd.Timestamp(p.end_time).normalize()
+    except Exception:
+        days = (5 - t.weekday()) % 7
+        return (t + pd.Timedelta(days=days)).normalize()
+
+
+def build_formulario_weekly_aggregates(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrupa por 'Data de referência' (sábado): soma VGV e QTD previstas/reais
+    (facilitadas vs normais), como no formulário ESBOÇO 2.
+    Índice = data normalizada do sábado de referência.
+    """
+    ref_c = find_column_any(
+        df,
+        [
+            ["data", "referencia", "sabado"],
+            ["referencia", "sabado"],
+            ["data", "referencia"],
+        ],
+    )
+    if ref_c is None:
+        raise ValueError(
+            "Formulário: não encontrei coluna de data de referência (sábado). "
+            f"Colunas disponíveis: {list(df.columns)[:35]}"
+        )
+
+    used_v: set[str] = set()
+    val_prev_fac = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "facilitadas", "previstas"],
+            ["vgv", "facilitadas", "previstas"],
+            ["valor", "facilitadas", "previstas"],
+            ["facilitadas", "previstas", "vgv"],
+            ["facilitadas", "previstas"],
+        ],
+        used=used_v,
+    )
+    val_prev_norm = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "normais", "previstas"],
+            ["vgv", "normais", "previstas"],
+            ["valor", "normais", "previstas"],
+            ["normais", "previstas", "vgv"],
+            ["normais", "previstas"],
+        ],
+        used=used_v,
+    )
+    val_real_fac = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "facilitadas", "reais"],
+            ["vendas", "facilitadas", "real"],
+            ["vgv", "facilitadas", "reais"],
+            ["facilitadas", "reais", "vgv"],
+            ["facilitadas", "reais"],
+            ["facilitadas", "realizado"],
+            ["facilitadas", "realizada"],
+        ],
+        used=used_v,
+    )
+    val_real_norm = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "normais", "reais"],
+            ["vendas", "normais", "real"],
+            ["vgv", "normais", "reais"],
+            ["normais", "reais", "vgv"],
+            ["normais", "reais"],
+            ["normais", "realizado"],
+            ["normais", "realizada"],
+        ],
+        used=used_v,
+    )
+    used_q: set[str] = set()
+    q_prev_fac = _find_formulario_qtd_col(
+        df,
+        [
+            ["facilitadas", "previstas"],
+            ["facilitada", "prevista"],
+        ],
+        used=used_q,
+    )
+    q_prev_norm = _find_formulario_qtd_col(
+        df,
+        [
+            ["normais", "previstas"],
+            ["normal", "prevista"],
+        ],
+        used=used_q,
+    )
+    q_real_fac = _find_formulario_qtd_col(
+        df,
+        [
+            ["facilitadas", "reais"],
+            ["facilitadas", "real"],
+            ["facilitada", "real"],
+        ],
+        used=used_q,
+    )
+    q_real_norm = _find_formulario_qtd_col(
+        df,
+        [
+            ["normais", "reais"],
+            ["normais", "real"],
+            ["normal", "real"],
+        ],
+        used=used_q,
+    )
+
+    dref = _to_day(df[ref_c])
+    base = pd.DataFrame({"_ref": dref})
+    specs: list[tuple[str, str | None]] = [
+        ("fb_vgv_prev_fac_sum", val_prev_fac),
+        ("fb_vgv_prev_norm_sum", val_prev_norm),
+        ("fb_vgv_real_fac_sum", val_real_fac),
+        ("fb_vgv_real_norm_sum", val_real_norm),
+        ("fb_qtd_prev_fac_sum", q_prev_fac),
+        ("fb_qtd_prev_norm_sum", q_prev_norm),
+        ("fb_qtd_real_fac_sum", q_real_fac),
+        ("fb_qtd_real_norm_sum", q_real_norm),
+    ]
+    for out_name, col in specs:
+        if col is None:
+            base[out_name] = 0.0
+        else:
+            base[out_name] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    base = base.dropna(subset=["_ref"])
+    weekly = base.groupby("_ref", sort=True).sum()
+    weekly.index = pd.DatetimeIndex(weekly.index).normalize()
+    weekly = weekly.sort_index()
+    return weekly
+
+
+def merge_formulario_weekly_into_daily(
+    df_master: pd.DataFrame, weekly: pd.DataFrame | None
+) -> pd.DataFrame:
+    """Alinha cada dia ao sábado da semana (W-SAT) e aplica defasagem temporal."""
+    if weekly is None or weekly.empty:
+        return df_master
+
+    idx = df_master.index
+    keys = [_week_end_saturday(pd.Timestamp(d)) for d in idx]
+    cols = list(weekly.columns)
+    data = {c: [] for c in cols}
+    for i, _d in enumerate(idx):
+        k = keys[i]
+        if k in weekly.index:
+            row = weekly.loc[k]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+        else:
+            row = pd.Series(0.0, index=cols)
+        for c in cols:
+            data[c].append(float(row[c]) if c in row.index else 0.0)
+    fb = pd.DataFrame(data, index=idx)
+    fb = fb.shift(FORMULARIO_FEATURE_LAG_DIAS).fillna(0.0)
+    for c in fb.columns:
+        df_master[c] = fb[c].astype(float)
+    return df_master
+
+
+def forward_sum(series: pd.Series, horizon: int) -> pd.Series:
+    """Soma dos valores nos próximos `horizon` dias (t+1 .. t+H), sem incluir t."""
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    y = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        j1 = i + 1
+        j2 = i + 1 + horizon
+        if j2 <= n:
+            y[i] = float(arr[j1:j2].sum())
+    return pd.Series(y, index=series.index)
+
+
+def build_daily_master(
+    dict_dfs: dict[str, pd.DataFrame], show_progress: bool = True
+) -> pd.DataFrame:
+    """
+    dict_dfs keys: leads, agendamentos, pastas, vendas; opcional formulario_previsao.
+    Retorna DataFrame diário ordenado com volumes e alvos diários (para derivar H).
+    """
+    df_l = dict_dfs["leads"]
+    df_a = dict_dfs["agendamentos"]
+    df_p = dict_dfs["pastas"]
+    df_v = dict_dfs["vendas"]
+
+    l_df, _ = _resolve_leads(df_l)
+    a_df, _, _ = _resolve_agendamentos(df_a)
+    p_df, _ = _resolve_pastas(df_p)
+    v_df, _, _ = _resolve_vendas(df_v)
+
+    leads_day = l_df.groupby("_d").size().to_frame("vol_leads")
+
+    agend_day = a_df.groupby("_dag").size().to_frame("vol_agend")
+    visit_mask = a_df["_dvi"].notna()
+    visit_day = a_df.loc[visit_mask].groupby("_dvi").size().to_frame("vol_visit")
+
+    pastas_day = p_df.groupby("_d").size().to_frame("vol_pastas")
+
+    vendas_day = v_df.groupby("_d").agg(
+        target_qtd=("_d", "count"),
+        target_valor=("_valor", "sum"),
+    )
+
+    df_master = (
+        pd.concat([vendas_day, leads_day, agend_day, visit_day, pastas_day], axis=1)
+        .fillna(0.0)
+        .sort_index()
+    )
+    if df_master.index.duplicated().any():
+        df_master = df_master[~df_master.index.duplicated(keep="last")]
+
+    df_form = dict_dfs.get("formulario_previsao")
+    if df_form is not None and len(df_form) > 0:
+        try:
+            wk = build_formulario_weekly_aggregates(df_form)
+            df_master = merge_formulario_weekly_into_daily(df_master, wk)
+        except Exception as e:
+            if show_progress:
+                print(f"Aviso: não integrei o formulário de previsão: {e}")
+
+    colunas_base = [
+        "vol_leads",
+        "vol_agend",
+        "vol_visit",
+        "vol_pastas",
+        "target_qtd",
+        "target_valor",
+    ]
+    colunas_fb = [c for c in df_master.columns if c.startswith("fb_")]
+    for col in colunas_base + colunas_fb:
+        s = df_master[col]
+        for lag in (1, 3, 7, 14, 30):
+            df_master[f"{col}_lag_{lag}"] = s.shift(lag)
+        df_master[f"{col}_ma_7d"] = s.shift(1).rolling(7, min_periods=1).mean()
+        df_master[f"{col}_ma_15d"] = s.shift(1).rolling(15, min_periods=1).mean()
+        df_master[f"{col}_ma_30d"] = s.shift(1).rolling(30, min_periods=1).mean()
+        df_master[f"{col}_std_15d"] = s.shift(1).rolling(15, min_periods=1).std()
+        df_master[f"{col}_momentum"] = df_master[f"{col}_ma_7d"] / (
+            df_master[f"{col}_ma_30d"] + 1e-5
+        )
+
+    df_master["tx_agend_lead"] = (
+        df_master["vol_agend"].shift(1).rolling(7, min_periods=1).sum()
+        / (df_master["vol_leads"].shift(7).rolling(7, min_periods=1).sum() + 1e-5)
+    )
+    df_master["tx_visit_agend"] = (
+        df_master["vol_visit"].shift(1).rolling(7, min_periods=1).sum()
+        / (df_master["vol_agend"].shift(3).rolling(7, min_periods=1).sum() + 1e-5)
+    )
+    df_master["tx_pasta_visit"] = (
+        df_master["vol_pastas"].shift(1).rolling(7, min_periods=1).sum()
+        / (df_master["vol_visit"].shift(3).rolling(7, min_periods=1).sum() + 1e-5)
+    )
+
+    idx = df_master.index
+    day_of_month = pd.Series(idx.day, index=idx)
+    day_of_week = pd.Series(idx.dayofweek, index=idx)
+    df_master["sin_day"] = np.sin(2 * np.pi * day_of_month / 31.0)
+    df_master["cos_day"] = np.cos(2 * np.pi * day_of_month / 31.0)
+    df_master["sin_weekday"] = np.sin(2 * np.pi * day_of_week / 7.0)
+    df_master["cos_weekday"] = np.cos(2 * np.pi * day_of_week / 7.0)
+    df_master["time_idx"] = np.arange(len(df_master), dtype=float)
+    ti = df_master["time_idx"].to_numpy(dtype=float)
+    for period, tag in ((7.0, "w"), (30.44, "m"), (365.25, "y")):
+        for k in (1, 2):
+            df_master[f"fourier_{tag}_sin_{k}"] = np.sin(2 * np.pi * k * ti / period)
+            df_master[f"fourier_{tag}_cos_{k}"] = np.cos(2 * np.pi * k * ti / period)
+    df_master["is_weekend"] = day_of_week.isin([5, 6]).astype(int)
+    dias_fim = (idx + pd.offsets.MonthEnd(0) - idx).days
+    df_master["dias_para_fim_mes"] = dias_fim
+    df_master["is_month_end"] = (df_master["dias_para_fim_mes"] <= 3).astype(int)
+    df_master["distancia_pagamento"] = idx.day.map(lambda x: min(abs(x - 5), abs(x - 20)))
+
+    _holiday_dates = _br_holiday_dates_for_index(idx)
+    _inject_calendario_feriados_br(df_master, idx, _holiday_dates)
+
+    merge_macro_bcb_into_daily(df_master, show_progress=show_progress)
+
+    _inject_ts_and_stl_features(df_master, show_progress=show_progress)
+
+    try:
+        vw = build_vendas_wide_daily(df_v)
+        if vw is not None and not vw.empty:
+            df_master = df_master.join(vw, how="left")
+    except Exception as e:
+        if show_progress:
+            print(f"Aviso: painel desagregado de vendas (vdim_) omitido: {e}")
+
+    df_master.replace([np.inf, -np.inf], np.nan, inplace=True)
+    bad_tgt = df_master["target_qtd"].isna() | df_master["target_valor"].isna()
+    df_master = df_master.loc[~bad_tgt].copy()
+    feat_only = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    df_master[feat_only] = df_master[feat_only].fillna(0.0)
+    return df_master
+
+
+def build_feature_matrix(df_master: pd.DataFrame) -> pd.DataFrame:
+    """Matriz X alinhada ao índice diário (sem colunas de alvo bruto)."""
+    feature_cols = [
+        c
+        for c in df_master.columns
+        if c not in ("target_qtd", "target_valor") and not str(c).startswith("vdim_")
+    ]
+    X = df_master[feature_cols].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    return X.fillna(0.0)
+
+
+def build_xy_for_horizon(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    horizon: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """X sem colunas de alvo bruto; y = soma futura em H dias; inclui calendário futuro (H)."""
+    y = forward_sum(df_master[target_daily_col], horizon)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features(df_master.index, horizon)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
+def predict_last_row(df_master: pd.DataFrame, pipeline: Any, horizon: int) -> float:
+    """Previsão no último dia; `horizon` deve ser o mesmo usado no treino (colunas fwd_*)."""
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features(df_master.index, horizon)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
+
+# ----- inlined: gsheets_loader.py -----
+
+import io
+import json
+import logging
+import urllib.error
+import urllib.request
+from typing import Any, Callable
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
+# Fallback quando o export oficial devolve 403/HTML a partir de datacenters (ex.: Streamlit Cloud).
+GVIZ_CSV_URL = "https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&gid={gid}"
+_CSV_FETCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+ROLE_LABELS: dict[str, str] = {
+    "leads": "BD Leads",
+    "agendamentos": "BD Agendamentos e visitas",
+    "pastas": "BD Pastas",
+    "vendas": "BD Vendas",
+    "formulario_previsao": "Esboço — formulário",
+}
+
+
+def _validate_formulario_columns(df: pd.DataFrame) -> None:
+    """Confirma colunas de referência + pelo menos uma métrica prevista/real (facilitada ou normal)."""
+    fn = normalize_dataframe_columns(df.copy())
+    ref = find_column_any(
+        fn,
+        [
+            ["data", "referencia", "sabado"],
+            ["referencia", "sabado"],
+            ["data", "referencia"],
+        ],
+    )
+    if ref is None:
+        raise ValueError("sem coluna de data de referência (sábado)")
+    hits = 0
+    for c in fn.columns:
+        cl = str(c)
+        if ("previstas" in cl or "reais" in cl or "previst" in cl) and (
+            "facilitadas" in cl or "normais" in cl or "facilitada" in cl or "normal" in cl
+        ):
+            hits += 1
+    if hits < 2:
+        raise ValueError("poucas colunas de previsão/realização facilitada|normal")
+
+
+_SCORERS: dict[str, Callable[[pd.DataFrame], None]] = {
+    "leads": lambda df: _resolve_leads(df),
+    "agendamentos": lambda df: _resolve_agendamentos(df),
+    "pastas": lambda df: _resolve_pastas(df),
+    "vendas": lambda df: _resolve_vendas(df),
+    "formulario_previsao": lambda df: _validate_formulario_columns(df),
+}
+
+
+def score_dataframe_for_role(df: pd.DataFrame, role: str) -> float:
+    """Pontuação maior = melhor correspondência ao papel esperado."""
+    if df is None or df.shape[0] < 3 or df.shape[1] < 2:
+        return -1.0
+    fn = normalize_dataframe_columns(df.copy())
+    scorer = _SCORERS.get(role)
+    if scorer is None:
+        return -1.0
+    try:
+        scorer(fn)
+    except Exception:
+        return -1.0
+    n = min(len(fn), 50_000)
+    ncol = fn.shape[1]
+    return 10_000.0 + ncol * 15.0 + n * 0.02
+
+
+def _dataframe_from_values(
+    rows: list[list[Any]], header_row: int
+) -> pd.DataFrame | None:
+    if not rows or header_row >= len(rows):
+        return None
+    header = [str(x).strip() if x is not None else "" for x in rows[header_row]]
+    if sum(1 for h in header if h) < 2:
+        return None
+    data_rows = rows[header_row + 1 :]
+    if not data_rows:
+        return None
+    nc = len(header)
+    grid: list[list[Any]] = []
+    for r in data_rows:
+        r = list(r)
+        if len(r) < nc:
+            r = r + [""] * (nc - len(r))
+        grid.append(r[:nc])
+    return pd.DataFrame(grid, columns=header)
+
+
+def _best_df_from_values(rows: list[list[Any]], role: str) -> tuple[pd.DataFrame, float, int]:
+    """Varre linhas de cabeçalho candidatas (0..9)."""
+    best: tuple[pd.DataFrame, float, int] | None = None
+    max_h = min(10, max(0, len(rows) - 1))
+    for h in range(max_h + 1):
+        df = _dataframe_from_values(rows, h)
+        if df is None:
+            continue
+        sc = score_dataframe_for_role(df, role)
+        if sc < 0:
+            continue
+        if best is None or sc > best[1]:
+            best = (df, sc, h)
+    if best is None:
+        raise ValueError("Nenhuma disposição de cabeçalho válida.")
+    return best
+
+
 _PEM_END_MARKERS = (
     "-----END PRIVATE KEY-----",
     "-----END RSA PRIVATE KEY-----",
     "-----END ENCRYPTED PRIVATE KEY-----",
 )
 
+_SERVICE_ACCOUNT_JSON_KEYS = frozenset(
+    {
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+        "universe_domain",
+    },
+)
+
 
 def _reparar_private_key_json_com_quebras_literais(s: str) -> str:
-    """
-    Muitos ambientes colam o JSON com a chave PEM em várias linhas reais dentro da string,
-    o que quebra `json.loads`. Reescape o valor de private_key como uma única string JSON.
-    """
+    """Se o PEM foi colado com quebras reais dentro da string JSON, reescape para json.loads."""
     k = s.find('"private_key"')
     if k == -1:
         k = s.find("'private_key'")
@@ -2159,9 +2409,9 @@ def _reparar_private_key_json_com_quebras_literais(s: str) -> str:
     return s[:val_start] + inner_esc + '"' + tail
 
 
-def _parse_json_conta_servico_google(s: str) -> Optional[Dict[str, Any]]:
-    """Tenta json.loads; se falhar, repara private_key e tenta de novo."""
-    s = s.strip().lstrip("\ufeff")
+def _parse_service_account_json_string(raw: str) -> dict[str, Any] | None:
+    """Parse do JSON da conta de serviço (string única ou multilinha TOML)."""
+    s = (raw or "").strip().lstrip("\ufeff")
     if not s:
         return None
     candidates = (s, _reparar_private_key_json_com_quebras_literais(s))
@@ -2178,791 +2428,1804 @@ def _parse_json_conta_servico_google(s: str) -> Optional[Dict[str, Any]]:
             return parsed
     return None
 
-# ID padrão da planilha informada pelo usuário
-DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
-DEFAULT_WORKSHEET_NAME = "Corretores"
-# Segunda aba: documentação de valores preenchidos automaticamente (não digitados pelo corretor).
-DEFAULT_VALORES_FIXOS_WORKSHEET = "Valores fixos (automáticos)"
-# Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
-DEFAULT_GERENTES_WORKSHEET = "Gerentes"
-DEFAULT_COL_NOME_CONTA = "Nome da Conta"
-# Pasta raiz no Google Drive para documento de identidade (compartilhar com o e-mail da service account do JSON).
-# Padrão: pasta na conta pessoal indicada pelo time; sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
-DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1x2vGhf3Fnt_rtykdrU3nqJD7kh_pnrSv"
 
-# Documento de identidade: e-mail só se o upload ao Drive falhar (fallback; [ficha_email] SMTP).
-IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO = "ynara.silva@direcional.com.br"
-
-# Mensagens ao corretor: sem citar planilha, Salesforce ou outros sistemas internos.
-FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO = (
-    "Não foi possível concluir o envio no momento. Tente novamente em alguns minutos."
-)
-FICHA_MSG_SUCESSO_PERFIL = (
-    "Sucesso, formulário enviado. Iremos verificar o seu perfil e retornar com mais informações. "
-    "O envio não significa admissão automática pela equipe."
-)
-
-# --- Modo teste (sidebar): linha da planilha → criar contato no Salesforce ---
-# Altere aqui no código; deixe ATIVO = False em produção.
-FICHA_TEST_PLANILHA_ATIVO = False
-# Produção: esconde sidebar e desativa blocos de teste/debug de interface.
-FICHA_MODO_PRODUCAO = True
-# Se não vazio, o painel de teste lê esta planilha/aba (ignora SPREADSHEET_ID/WORKSHEET_NAME dos Secrets).
-FICHA_TEST_PLANILHA_SPREADSHEET_ID = ""
-FICHA_TEST_PLANILHA_WORKSHEET_NAME = ""
+def _service_account_credenciais_preenchidas(info: dict[str, Any]) -> bool:
+    """Ignora template com campos vazios (ex.: secrets de exemplo)."""
+    ce = str(info.get("client_email") or "").strip()
+    pk = str(info.get("private_key") or "").strip()
+    return bool(ce and pk and "BEGIN" in pk)
 
 
-def _ids_planilha_modo_teste(gs: Dict[str, Any]) -> Tuple[str, str]:
-    """ID e aba usados pelo teste rápido: constantes acima, senão Secrets / DEFAULT_*."""
-    fix_id = (FICHA_TEST_PLANILHA_SPREADSHEET_ID or "").strip()
-    if fix_id:
-        wn = (FICHA_TEST_PLANILHA_WORKSHEET_NAME or "").strip() or DEFAULT_WORKSHEET_NAME
-        return fix_id, wn
-    return str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)), str(
-        gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME)
+def _dict_google_sheets_sem_json_bruto(gs: dict[str, Any]) -> dict[str, Any]:
+    """Só chaves do JSON Google; exclui strings JSON embutidas e ruído."""
+    skip = frozenset(
+        {
+            "GOOGLE_SERVICE_ACCOUNT_JSON",
+            "google_service_account_json",
+            "SERVICE_ACCOUNT_JSON",
+            "service_account_json",
+        }
     )
-
-
-def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
-    """Lê JSON da conta de serviço a partir de st.secrets['google_sheets']. Nunca propaga exceção."""
-    try:
-        if st_secrets is None:
-            return None
-        gs = (
-            st_secrets.get("google_sheets")
-            if hasattr(st_secrets, "get")
-            else st_secrets["google_sheets"]
-        )
-    except (KeyError, TypeError, AttributeError):
-        return None
-    try:
-        if not gs:
-            return None
-        raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
-        if not raw:
-            return None
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            return _parse_json_conta_servico_google(raw)
-        return None
-    except Exception:
-        return None
-
-
-def _drive_parent_id_identidade(st_secrets: Any) -> str:
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            gd = st_secrets.get("google_drive")
-            if isinstance(gd, dict):
-                pid = (
-                    gd.get("PARENT_FOLDER_ID")
-                    or gd.get("identidade_parent_folder_id")
-                    or ""
-                ).strip()
-                if pid:
-                    return pid
-    except Exception:
-        pass
-    return DRIVE_IDENTIDADE_PASTA_RAIZ_ID
-
-
-def _drive_email_dono_apos_upload(st_secrets: Any) -> str:
-    """
-    E-mail para o qual a API tenta transferir a propriedade do arquivo após o upload
-    (conta de serviço não tem cota; dono passa a ser você / Workspace).
-    Secrets [google_drive]: TRANSFER_OWNERSHIP_TO_EMAIL ou FILE_OWNER_EMAIL ou OWNER_EMAIL.
-    """
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            gd = st_secrets.get("google_drive")
-            if isinstance(gd, dict):
-                for key in (
-                    "TRANSFER_OWNERSHIP_TO_EMAIL",
-                    "transfer_ownership_to_email",
-                    "FILE_OWNER_EMAIL",
-                    "file_owner_email",
-                    "OWNER_EMAIL",
-                    "owner_email",
-                ):
-                    v = str(gd.get(key) or "").strip()
-                    if v:
-                        return v
-    except Exception:
-        pass
-    return ""
-
-
-def _drive_transferir_propriedade_arquivo(
-    service: Any, file_id: str, email: str
-) -> Optional[str]:
-    """
-    Tenta `permissions.create` com transferOwnership (Drive v3).
-    Retorna None se OK; senão mensagem de erro para exibir ao usuário.
-    """
-    em = (email or "").strip()
-    if not em or not file_id:
-        return None
-    try:
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "user", "role": "owner", "emailAddress": em},
-            transferOwnership=True,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-        return None
-    except Exception as e:
-        return str(e)
-
-
-def _drive_escapar_nome_query(nome: str) -> str:
-    return (nome or "").replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _drive_obter_ou_criar_subpasta(service: Any, parent_id: str, nome_pasta: str) -> str:
-    """Retorna o ID da subpasta `nome_pasta` dentro de `parent_id` (cria se não existir)."""
-    q = (
-        f"name='{_drive_escapar_nome_query(nome_pasta)}' and "
-        f"'{parent_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    res = (
-        service.files()
-        .list(
-            q=q,
-            spaces="drive",
-            fields="files(id,name)",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
-    )
-    files = res.get("files") or []
-    if files:
-        return str(files[0]["id"])
-    body = {
-        "name": nome_pasta,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
+    return {
+        str(k): gs[k]
+        for k in gs
+        if str(k) not in skip and k in _SERVICE_ACCOUNT_JSON_KEYS
     }
-    created = service.files().create(
-        body=body, fields="id", supportsAllDrives=True
-    ).execute()
-    return str(created["id"])
 
 
-def _safe_filename_part(s: str) -> str:
-    t = re.sub(r"[^\w\-]+", "_", (s or "").strip(), flags=re.UNICODE)[:48]
-    return t or "arquivo"
+# Chaves em [google_sheets] que não são IDs de planilhas (credenciais, metadados, sub-tabelas).
+_GOOGLE_SHEETS_RESERVED_LOWER: frozenset[str] = frozenset(
+    x.lower()
+    for x in (
+        *_SERVICE_ACCOUNT_JSON_KEYS,
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "google_service_account_json",
+        "SERVICE_ACCOUNT_JSON",
+        "service_account_json",
+        "SPREADSHEET_ID",
+        "spreadsheet_id",
+        "WORKSHEET_NAME",
+        "worksheet_name",
+        "GERENTES_WORKSHEET",
+        "gerentes_worksheet",
+        "NOME_CONTA_COLUMN",
+        "nome_conta_column",
+        "VALORES_FIXOS_WORKSHEET",
+        "valores_fixos_worksheet",
+        "spreadsheet_ids",
+        "sheets",
+        "csv_gid_hints",
+    )
+)
 
 
-def _drive_nome_arquivo_identidade(dados: Dict[str, Any], nome_original: str) -> str:
-    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
-    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
-    suf = Path(nome_original or "doc").suffix.lower()
-    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
-        suf = ".pdf"
+def service_account_from_google_sheets_section(st: Any) -> dict[str, Any] | None:
+    """
+    Leitura alinhada à **Ficha Vendas RJ**: credenciais na secção `[google_sheets]`.
+    - `SERVICE_ACCOUNT_JSON` / `service_account_json` como **dict** (TOML) ou **string** JSON;
+    - repara `private_key` com quebras literais (`_reparar_private_key_json_com_quebras_literais`);
+    - ou as mesmas chaves do JSON em linhas TOML (`type`, `client_email`, `private_key`, …).
+    """
     try:
-        from zoneinfo import ZoneInfo
-
-        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
+        gs = st.secrets.get("google_sheets")
     except Exception:
-        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"identidade_{cpf_l}_{nc}_{agora}{suf}"
+        gs = None
+    if not isinstance(gs, dict):
+        return None
+    for jkey in (
+        "SERVICE_ACCOUNT_JSON",
+        "service_account_json",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "google_service_account_json",
+    ):
+        raw = gs.get(jkey)
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            if _service_account_credenciais_preenchidas(raw):
+                return raw
+            continue
+        info = _parse_service_account_json_string(_secret_str(raw))
+        if info and _service_account_credenciais_preenchidas(info):
+            return info
+    flat = _dict_google_sheets_sem_json_bruto(gs)
+    if flat.get("type") == "service_account" or (
+        str(flat.get("client_email") or "").strip()
+        and str(flat.get("private_key") or "").strip()
+    ):
+        if _service_account_credenciais_preenchidas(flat):
+            return flat
+    return None
 
 
-def upload_identidade_google_drive(
-    creds_dict: Dict[str, Any],
-    parent_folder_id: str,
-    uploaded: Any,
-    dados: Dict[str, Any],
-    *,
-    transferir_propriedade_para_email: str = "",
-) -> Tuple[Optional[str], str]:
-    """
-    Envia o arquivo para subpasta do dia (AAAA-MM-DD em Brasília) dentro de `parent_folder_id`.
-    Use pasta no **Meu Drive** de um usuário (compartilhada com a service account) ou **Shared Drive**;
-    opcionalmente `transferir_propriedade_para_email` repassa a propriedade após o create (API Drive).
-    Retorna (link_webViewLink ou None, mensagem_erro ou aviso — ex.: upload OK mas transferência falhou).
-    """
+def try_gspread_client() -> Any | None:
+    """Instancia cliente gspread a partir de credenciais no ambiente (sem Streamlit)."""
     try:
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseUpload
+        import gspread
     except ImportError:
-        return (
-            None,
-            "Dependência ausente: instale com «pip install google-api-python-client google-auth-httplib2» "
-            "e faça **redeploy** no Streamlit Cloud (o requirements.txt na pasta do app deve listar esses pacotes).",
-        )
-
+        return None
+    info = _service_account_info_from_env()
+    if not info:
+        return None
     try:
-        try:
-            from zoneinfo import ZoneInfo
-
-            dia = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d")
-        except Exception:
-            dia = datetime.now().strftime("%Y-%m-%d")
-
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        folder_dia_id = _drive_obter_ou_criar_subpasta(service, parent_folder_id, dia)
-
-        raw = uploaded.getvalue()
-        if not raw:
-            return None, "Arquivo vazio."
-
-        mime = getattr(uploaded, "type", None) or "application/octet-stream"
-        nome_out = _drive_nome_arquivo_identidade(dados, getattr(uploaded, "name", "") or "")
-
-        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=True)
-        body = {"name": nome_out, "parents": [folder_dia_id]}
-        created = (
-            service.files()
-            .create(body=body, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
-            .execute()
-        )
-        fid = (created.get("id") or "").strip()
-        link = (created.get("webViewLink") or "").strip()
-        if not link and fid:
-            link = f"https://drive.google.com/file/d/{fid}/view"
-
-        aviso = ""
-        te = (transferir_propriedade_para_email or "").strip()
-        if te and fid:
-            terr = _drive_transferir_propriedade_arquivo(service, fid, te)
-            if terr:
-                aviso = (
-                    f"Arquivo enviado, mas a transferência de propriedade para {te} falhou: {terr} "
-                    "(em Shared Drive a propriedade é do drive; em Gmail pessoal a API pode bloquear transferência a partir de conta de serviço)."
-                )
-        return (link or None), aviso
+        return gspread.service_account_from_dict(info)
     except Exception as e:
-        msg = str(e)
-        low = msg.lower()
-        if "404" in msg and ("not found" in low or "filenotfound" in low or "file not found" in low):
-            msg += (
-                " — Confirme o ID da pasta pai nos Secrets [google_drive] PARENT_FOLDER_ID. "
-                "A pasta precisa existir e estar compartilhada com o e-mail «client_email» da conta de serviço (JSON), "
-                "como Editor (o link no navegador pode abrir para você mesmo sem a API enxergar a pasta)."
-            )
-        if "storagequota" in low or "storage quota" in low or "do not have storage quota" in low:
-            msg += (
-                " — Prefira pasta dentro de um **Shared Drive** ou **Meu Drive** seu compartilhado com a service account; "
-                "opcionalmente defina [google_drive] TRANSFER_OWNERSHIP_TO_EMAIL com seu e-mail após o upload."
-            )
-        return None, msg
+        logger.warning("gspread service_account_from_dict falhou: %s", e)
+        return None
 
 
-def _cliente_gspread(creds_dict: Dict[str, Any]):
-    import gspread
-    from google.oauth2.service_account import Credentials
+def _service_account_info_from_env() -> dict[str, Any] | None:
+    import os
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(creds)
+    for env_key in ("GOOGLE_SERVICE_ACCOUNT_JSON", "SERVICE_ACCOUNT_JSON"):
+        raw = os.environ.get(env_key)
+        if not raw or not str(raw).strip():
+            continue
+        info = _parse_service_account_json_string(str(raw))
+        if info and _service_account_credenciais_preenchidas(info):
+            return info
+    return None
 
 
-def _col_letter(n: int) -> str:
-    """Converte índice de coluna 1-based para letra(s) A, B, ..., Z, AA."""
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
+def _secret_str(val: Any) -> str:
+    """Streamlit / TOML podem devolver tipos especiais; normaliza para string."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and "]" in s):
+        return s
     return s
 
 
-def _cabecalho_planilha_desalinhado(linha1: List[str], esperado: List[str]) -> bool:
-    """True se quantidade ou textos de cabeçalho não batem com o layout atual do app."""
-    if len(linha1) != len(esperado):
-        return True
-    for a, b in zip(linha1, esperado):
-        if _norm_cabecalho_planilha(a) != _norm_cabecalho_planilha(b):
-            return True
-    return False
-
-
-def _nome_aba_valores_fixos_planilha(gs: Dict[str, Any]) -> str:
-    return (
-        str(
-            gs.get("VALORES_FIXOS_WORKSHEET")
-            or gs.get("valores_fixos_worksheet")
-            or DEFAULT_VALORES_FIXOS_WORKSHEET
-        ).strip()
-        or DEFAULT_VALORES_FIXOS_WORKSHEET
-    )
-
-
-def _linhas_conteudo_aba_valores_fixos() -> List[List[str]]:
-    """Referência estática: o que o sistema preenche sem o corretor digitar (ou via Secrets)."""
-    return [
-        ["Campo / regra", "Origem", "Descrição"],
-        [
-            "Regional *",
-            "[ficha_defaults] · Secrets",
-            "Padrão típico: RJ (chave `regional`). Não aparece no formulário.",
-        ],
-        [
-            "Origem *",
-            "Fluxo Vendas RJ + [ficha_defaults]",
-            "No envio, o fluxo força RH; default em Secrets se vazio.",
-        ],
-        [
-            "Status Corretor *",
-            "[ficha_defaults] · Secrets",
-            "Padrão típico: Pré credenciado (`status_corretor`).",
-        ],
-        [
-            "Tratamento",
-            "Automático",
-            "Derivado de Sexo *: Masculino → Sr.; Feminino → Sra.; caso contrário vazio.",
-        ],
-        [
-            "Apelido",
-            "Automático",
-            "Primeiro nome do Nome completo * + sufixo _RJ01.",
-        ],
-        [
-            "Data da Entrevista",
-            "Automático",
-            "Data do envio (dd/mm/aaaa).",
-        ],
-        [
-            "Data Contrato",
-            "Automático",
-            "Data do envio.",
-        ],
-        [
-            "Data Credenciamento",
-            "Automático",
-            "Data do envio.",
-        ],
-        [
-            "Tipo Corretor *",
-            "Automático",
-            "Rede Direcional ou Riva → «Direcional Vendas – Autônomos»; Outra imobiliária (parceira) → «Parceiros (Externo)».",
-        ],
-        [
-            "Função na operação *",
-            "Automático (parceira)",
-            "Se «Fará parte de qual rede?» = Outra imobiliária (parceira), gravado como Corretor Parceiro.",
-        ],
-        [
-            "Multiplicador de Nível / Multiplicador de Regime",
-            "Automático",
-            "Captador → 0,9 e 1,0; Corretor ou Corretor Parceiro → 1,0 e 1,0.",
-        ],
-        [
-            "Naturalidade *",
-            "Automático",
-            "Capital do estado em UF Naturalidade * (ex.: DF → Brasília).",
-        ],
-        [
-            "Nome do gerente (conta) *",
-            "Automático",
-            "Se «Sabe o nome do gerente…» = Não, usa a primeira conta da lista (aba Gerentes ou [ficha_defaults]).",
-        ],
-        [
-            "AccountId / OwnerId",
-            "[ficha_defaults] · Secrets",
-            "Opcional: `account_id` e `owner_id` quando não resolvidos pelo nome da conta.",
-        ],
-        [
-            "Campos CRECI (número, validade, etc.)",
-            "Automático se «Possui CRECI?» = Não",
-            f"Valores mínimos para validações do org (ex.: CRECI {DEFAULT_CRECI_NUMERO_FALLBACK}, "
-            f"responsável {DEFAULT_NOME_RESPONSAVEL_CRECI_FALLBACK!r}, datas) — ver código.",
-        ],
-        [
-            "Código Pessoa UAU / retornos de integração",
-            "Sistema / Salesforce",
-            "Preenchidos por processos posteriores; não vêm do formulário do corretor.",
-        ],
-    ]
-
-
-def _garantir_aba_valores_fixos(sh: Any, gs: Dict[str, Any]) -> None:
-    """Cria ou atualiza a aba de referência «Valores fixos (automáticos)»."""
-    nome = _nome_aba_valores_fixos_planilha(gs)[:99]
-    body = _linhas_conteudo_aba_valores_fixos()
+def _service_account_from_flat_streamlit_root(st: Any) -> dict[str, Any] | None:
+    """Secrets com chaves do JSON Google na raiz do TOML (sem embutir JSON inteiro)."""
     try:
-        ws = sh.worksheet(nome)
-    except Exception:
-        ws = sh.add_worksheet(
-            title=nome,
-            rows=max(len(body) + 5, 80),
-            cols=max(len(body[0]) if body else 3, 6),
-        )
-    try:
-        cur = ws.get_all_values()
-        precisa = not cur or len(cur) < len(body)
-        if not precisa and cur:
-            for i, row in enumerate(body):
-                if i >= len(cur):
-                    precisa = True
-                    break
-                exp = row[:3]
-                got = (cur[i] + ["", "", ""])[:3]
-                if [_norm_cabecalho_planilha(x) for x in got] != [
-                    _norm_cabecalho_planilha(x) for x in exp
-                ]:
-                    precisa = True
-                    break
-        if precisa:
-            ws.clear()
-            ws.update(f"A1:{_col_letter(len(body[0]))}{len(body)}", body, value_input_option="USER_ENTERED")
+        if "client_email" not in st.secrets or "private_key" not in st.secrets:
+            return None
+        d: dict[str, Any] = {}
+        for k in _SERVICE_ACCOUNT_JSON_KEYS:
+            if k in st.secrets:
+                v = st.secrets[k]
+                if v is None:
+                    continue
+                if k == "private_key":
+                    pk = str(v).replace("\r\n", "\n").strip()
+                    if pk:
+                        d[k] = pk
+                else:
+                    sv = str(v).strip()
+                    if sv:
+                        d[k] = sv
+        if _service_account_credenciais_preenchidas(d):
+            return d
     except Exception:
         pass
+    return None
 
 
-def anexar_linha(
-    linha: List[str],
-    cabecalho: List[str],
-    spreadsheet_id: str,
-    worksheet_name: str,
-    creds_dict: Dict[str, Any],
-    google_sheets_extras: Optional[Dict[str, Any]] = None,
-) -> int:
+def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
     """
-    Garante que a aba existe, cabeçalho na linha 1 alinhado ao layout atual e anexa a linha.
-    Atualiza também a aba «Valores fixos (automáticos)» (nome configurável nos Secrets).
+    Ordem de leitura (compatível com **Ficha Vendas RJ** e deploys antigos):
+    1. `[google_sheets]` — SERVICE_ACCOUNT_JSON (dict/str), GOOGLE_*, ou chaves espelhadas do JSON;
+    2. Raiz: chaves planas `client_email` + `private_key`;
+    3. Raiz: `GOOGLE_SERVICE_ACCOUNT_JSON` ou `SERVICE_ACCOUNT_JSON` (dict/str);
+    4. Secções `google_service_account` / `gcp_service_account` / `service_account`.
     """
-    gc = _cliente_gspread(creds_dict)
-    sh = gc.open_by_key(spreadsheet_id)
-    gs = dict(google_sheets_extras or {})
     try:
-        _garantir_aba_valores_fixos(sh, gs)
-    except Exception:
-        pass
+        import streamlit as st
+    except ImportError:
+        return None
     try:
-        ws = sh.worksheet(worksheet_name)
-    except Exception:
-        ws = sh.add_worksheet(
-            title=worksheet_name,
-            rows=1000,
-            cols=max(len(cabecalho), 30),
-        )
+        info_gs = service_account_from_google_sheets_section(st)
+        if info_gs:
+            return info_gs
 
-    existing = ws.get_all_values()
-    if not existing or not any(str(cell).strip() for cell in existing[0]):
-        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
-    elif _cabecalho_planilha_desalinhado(list(existing[0]), cabecalho):
-        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
-    elif len(existing[0]) < len(cabecalho):
-        pad = list(existing[0]) + [""] * (len(cabecalho) - len(existing[0]))
-        for i, h in enumerate(cabecalho):
-            if i >= len(pad) or not str(pad[i] or "").strip():
-                pad[i] = h
-        ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
+        root_flat = _service_account_from_flat_streamlit_root(st)
+        if root_flat:
+            return root_flat
 
-    ws.append_row(linha, value_input_option="USER_ENTERED")
-    return len(ws.get_all_values())
+        if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+            raw = _secret_str(st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"])
+            if raw:
+                info = _parse_service_account_json_string(raw)
+                if info and _service_account_credenciais_preenchidas(info):
+                    return info
+
+        if "SERVICE_ACCOUNT_JSON" in st.secrets:
+            raw_root = st.secrets["SERVICE_ACCOUNT_JSON"]
+            if isinstance(raw_root, dict) and _service_account_credenciais_preenchidas(raw_root):
+                return raw_root
+            raw_s = _secret_str(raw_root)
+            if raw_s:
+                info = _parse_service_account_json_string(raw_s)
+                if info and _service_account_credenciais_preenchidas(info):
+                    return info
+
+        for key in ("google_service_account", "gcp_service_account", "service_account"):
+            if key in st.secrets:
+                sec = st.secrets[key]
+                if isinstance(sec, str) and sec.strip():
+                    if sec.strip().startswith("{"):
+                        info = _parse_service_account_json_string(sec)
+                        if info and _service_account_credenciais_preenchidas(info):
+                            return info
+                if hasattr(sec, "keys"):
+                    info = {str(k): sec[k] for k in sec.keys()}
+                    if _service_account_credenciais_preenchidas(info):
+                        return info
+    except Exception as e:
+        logger.warning("Secrets Streamlit (service account): %s", e)
+    return None
 
 
-def atualizar_status_envio_salesforce(
-    spreadsheet_id: str,
-    worksheet_name: str,
-    creds_dict: Dict[str, Any],
-    row_1based: int,
-    envio: str,
-    log_erro: str,
-    link: str,
-) -> None:
+def gspread_client_from_streamlit() -> Any | None:
+    try:
+        import gspread
+    except ImportError:
+        return None
+    info = service_account_info_from_streamlit_secrets()
+    if not info:
+        info = _service_account_info_from_env()
+    if not info:
+        return None
+    try:
+        return gspread.service_account_from_dict(info)
+    except Exception as e:
+        logger.warning("gspread (Streamlit): %s", e)
+        return None
+
+
+def _sa_fingerprint_for_cache() -> str:
+    """Muda quando as credenciais mudam — evita cache CSV quando a API passa a estar disponível."""
+    info = service_account_info_from_streamlit_secrets() or _service_account_info_from_env()
+    if not info:
+        return "no_sa"
+    em = str(info.get("client_email") or "").strip()
+    kid = str(info.get("private_key_id") or "").strip()
+    return f"{em}|{kid}" if em else "sa_no_email"
+
+
+def load_best_worksheet_gspread(
+    gc: Any, spreadsheet_id: str, role: str
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Preenche na linha indicada as colunas **Envio?**, **Log / erro** e **Link do contato**
-    (cabeçalhos definidos em corretor_campos.cabecalho_planilha).
+    Abre a planilha, percorre **todas** as abas e escolhe a melhor pontuação para o papel.
     """
-    gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
-    headers = ws.row_values(1)
-    mapping = {
-        "Envio?": envio,
-        "Log / erro": (log_erro or "")[:49000],
-        "Link do contato": link or "",
+    meta: dict[str, Any] = {
+        "spreadsheet_title": sh.title,
+        "spreadsheet_id": spreadsheet_id,
+        "role": role,
     }
-    for h, val in mapping.items():
-        if h not in headers:
+    best_df: pd.DataFrame | None = None
+    best_score = -1.0
+    best_sheet = ""
+    best_header_row = -1
+    errors: list[str] = []
+
+    for ws in sh.worksheets():
+        title = ws.title
+        if str(title).lower().startswith("graf") or "chart" in str(title).lower():
             continue
-        col = headers.index(h) + 1
-        cell = f"{_col_letter(col)}{row_1based}"
-        ws.update(cell, [[val]], value_input_option="USER_ENTERED")
+        try:
+            rows = ws.get_all_values()
+        except Exception as e:
+            errors.append(f"{title}: leitura {e}")
+            continue
+        try:
+            df, sc, hdr = _best_df_from_values(rows, role)
+        except Exception as e:
+            errors.append(f"{title}: {e}")
+            continue
+        if sc > best_score:
+            best_score = sc
+            best_df = normalize_dataframe_columns(df)
+            best_sheet = title
+            best_header_row = hdr
+
+    if best_df is None:
+        raise ValueError(
+            f"Nenhuma aba compatível com «{ROLE_LABELS.get(role, role)}» em «{sh.title}». "
+            f"Resumo: {'; '.join(errors[:8])}"
+        )
+    meta.update(
+        {
+            "worksheet_title": best_sheet,
+            "header_row_index": best_header_row,
+            "score": round(best_score, 2),
+            "method": "gspread",
+        }
+    )
+    return best_df, meta
 
 
-def listar_nomes_conta_aba_gerentes(
+def _fetch_csv_bytes_dual(sheet_id: str, gid: str) -> tuple[bytes | None, str]:
+    """
+    Tenta export oficial e, em seguida, endpoint gviz (útil quando o primeiro devolve 403/HTML).
+    Devolve (bytes, "") ou (None, motivo) para diagnóstico.
+    """
+    headers = {
+        "User-Agent": _CSV_FETCH_UA,
+        "Accept": "text/csv,text/plain,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    last_err = ""
+    for label, tmpl in (("export", EXPORT_URL), ("gviz", GVIZ_CSV_URL)):
+        url = tmpl.format(sid=sheet_id, gid=gid)
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+                head = data[:1200].lower()
+                if b"<html" in head or b"<!doctype html" in head:
+                    last_err = f"{label}:HTML({resp.status})"
+                    continue
+                if b"sign in" in head or b"accounts.google" in head:
+                    last_err = f"{label}:login({resp.status})"
+                    continue
+                if len(data) < 30:
+                    last_err = f"{label}:curto({resp.status})"
+                    continue
+                return data, ""
+        except urllib.error.HTTPError as e:
+            last_err = f"{label}:HTTP{e.code}"
+        except urllib.error.URLError as e:
+            last_err = f"{label}:URL({e.reason!s})"
+        except Exception as e:
+            last_err = f"{label}:{type(e).__name__}"
+    return None, last_err or "?"
+
+
+def load_best_worksheet_csv_public(
     spreadsheet_id: str,
-    creds_dict: Dict[str, Any],
-    worksheet_name: str = DEFAULT_GERENTES_WORKSHEET,
-    column_header: str = DEFAULT_COL_NOME_CONTA,
-) -> List[str]:
+    role: str,
+    gid_hints: list[str] | None = None,
+    max_gid_scan: int = 30,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Lê a planilha indicada, aba `worksheet_name`, e devolve valores únicos e não vazios
-    da coluna cujo cabeçalho (linha 1) coincide com `column_header` (ignora maiúsculas/minúsculas e espaços).
+    Sem API: tenta export CSV por gid (sugestões primeiro, depois 0..max_gid_scan).
     """
-    gc = _cliente_gspread(creds_dict)
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
-    rows = ws.get_all_values()
-    if not rows:
-        return []
-    headers = [str(h or "").strip() for h in rows[0]]
-    target = (column_header or "").strip().lower()
-    col_idx = None
-    for i, h in enumerate(headers):
-        if h.strip().lower() == target:
-            col_idx = i
-            break
-    if col_idx is None:
-        return []
+    tried: list[str] = []
+    gids_ordered: list[str] = []
+    if gid_hints:
+        gids_ordered.extend([g for g in gid_hints if g not in gids_ordered])
+    for g in range(max_gid_scan + 1):
+        s = str(g)
+        if s not in gids_ordered:
+            gids_ordered.append(s)
+
+    best_df: pd.DataFrame | None = None
+    best_score = -1.0
+    best_gid = ""
+    best_hdr = -1
+
+    for gid in gids_ordered:
+        raw, why = _fetch_csv_bytes_dual(spreadsheet_id, gid)
+        if raw is None:
+            tried.append(f"{gid}:{why}")
+            continue
+        tried.append(f"{gid}:ok")
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                buf = io.BytesIO(raw)
+                df0 = pd.read_csv(
+                    buf, encoding=enc, on_bad_lines="skip", low_memory=False
+                )
+                break
+            except Exception:
+                df0 = None
+        if df0 is None or df0.shape[1] < 2:
+            continue
+        rows = [df0.columns.tolist()] + df0.astype(str).values.tolist()
+        try:
+            df, sc, hdr = _best_df_from_values(rows, role)
+        except Exception:
+            continue
+        if sc > best_score:
+            best_score = sc
+            best_df = normalize_dataframe_columns(df)
+            best_gid = gid
+            best_hdr = hdr
+
+    if best_df is None:
+        raise ValueError(
+            f"CSV público: nenhum gid válido para {spreadsheet_id} "
+            f"(tentados: {', '.join(tried[:12])}…). "
+            "Em muitos ambientes na nuvem o Google bloqueia export CSV anónimo: use **API com conta de serviço** "
+            "(secrets `GOOGLE_SERVICE_ACCOUNT_JSON`) e partilhe cada livro com o e-mail `client_email` como **Leitor**, "
+            "com APIs **Google Sheets** e **Google Drive** ativas no projeto GCP."
+        )
+    meta = {
+        "spreadsheet_id": spreadsheet_id,
+        "role": role,
+        "gid": best_gid,
+        "header_row_index": best_hdr,
+        "score": round(best_score, 2),
+        "method": "csv_export",
+    }
+    return best_df, meta
+
+
+def load_role_dataframe(
+    gc: Any | None,
+    spreadsheet_id: str,
+    role: str,
+    csv_gid_hints: list[str] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if gc is not None:
+        return load_best_worksheet_gspread(gc, spreadsheet_id, role)
+    return load_best_worksheet_csv_public(spreadsheet_id, role, gid_hints=csv_gid_hints)
+
+# ----- inlined: report_html.py -----
+
+import html as html_lib
+import json
+import math
+from datetime import datetime
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+def _json_safe(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _numeric_series_for_corr_picker(df: pd.DataFrame, *, max_cols: int = 120) -> dict[str, list[float]]:
+    """Colunas numéricas alinhadas ao índice diário (para dispersão e correlação entre qualquer par na UI)."""
+    if df is None or len(df) == 0:
+        return {}
+    n = len(df)
+    cols: list[Any] = []
     seen: set[str] = set()
-    out: List[str] = []
-    for r in rows[1:]:
-        if col_idx >= len(r):
+    for c in df.select_dtypes(include=[np.number]).columns:
+        key = str(c).strip()
+        if not key or key in seen:
             continue
-        v = str(r[col_idx] or "").strip()
-        if not v or v in seen:
-            continue
-        seen.add(v)
-        out.append(v)
-    out.sort(key=lambda s: s.casefold())
+        seen.add(key)
+        cols.append(c)
+        if len(cols) >= max_cols:
+            break
+    out: dict[str, list[float]] = {}
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        vals: list[float] = []
+        for v in s.to_numpy():
+            try:
+                if pd.isna(v):
+                    vals.append(float("nan"))
+                else:
+                    fv = float(v)
+                    vals.append(fv if math.isfinite(fv) else float("nan"))
+            except (TypeError, ValueError):
+                vals.append(float("nan"))
+        if len(vals) == n:
+            out[str(c)] = vals
     return out
 
 
-def carimbo_brasilia_iso() -> str:
-    try:
-        from zoneinfo import ZoneInfo
+def _daily_pack_from_master(df: pd.DataFrame) -> dict[str, Any]:
+    """Séries agregadas para gráficos (HTML + Streamlit); evita expor matriz completa de features."""
+    if df is None or len(df) == 0:
+        z = [0.0] * 7
+        return {
+            "dates": [],
+            "vol_leads": [],
+            "vol_agend": [],
+            "vol_visit": [],
+            "vol_pastas": [],
+            "target_qtd": [],
+            "target_valor": [],
+            "dow_labels": ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"],
+            "dow_mean_qtd": z,
+            "dow_mean_valor": z,
+            "macro": {},
+            "corr_labels": [],
+            "corr_z": [],
+            "n_rows": 0,
+            "n_features": 0,
+            "numeric_series_for_picker": {},
+        }
+    idx = pd.DatetimeIndex(df.index)
+    dates = [d.strftime("%Y-%m-%d") for d in idx]
 
-        tz = ZoneInfo("America/Sao_Paulo")
-        return datetime.now(tz).isoformat(timespec="seconds")
-    except Exception:
-        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    def col(name: str) -> list[float]:
+        if name not in df.columns:
+            return [0.0] * len(df)
+        s = pd.to_numeric(df[name], errors="coerce").fillna(0.0)
+        return [float(x) if np.isfinite(x) else 0.0 for x in s]
 
-# =============================================================================
-# INTEGRADO: ficha_seguranca
-# =============================================================================
-_RL_JANELA_S = int(os.environ.get("FICHA_RL_JANELA_S", "600"))  # 10 min
-_RL_MAX_JANELA = int(os.environ.get("FICHA_RL_MAX_JANELA", "4"))
-_RL_MAX_DIA = int(os.environ.get("FICHA_RL_MAX_DIA", "12"))
-# Tempo mínimo (s) entre abrir o formulário e enviar (anti-script imediato)
-_TMIN_ENVIO_S = int(os.environ.get("FICHA_TMIN_ENVIO_S", "12"))
+    macro_cols = [c for c in df.columns if str(c).startswith("macro_")][:15]
+    macro_data: dict[str, list[float]] = {c: col(c) for c in macro_cols}
 
-_UA_BLOQUEIO_SUBSTR = (
-    "curl/",
-    "wget/",
-    "python-requests",
-    "scrapy",
-    "aiohttp",
-    "httpx",
-    "go-http-client",
-    "java/",
-    "libwww",
-    "httpclient",
-    "axios/",
-)
+    dff = df.copy()
+    dff["_dow"] = idx.dayofweek
+    dow_order = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+    gq = dff.groupby("_dow", sort=True)["target_qtd"].mean() if "target_qtd" in dff.columns else None
+    gv = dff.groupby("_dow", sort=True)["target_valor"].mean() if "target_valor" in dff.columns else None
+    dow_q = [float(gq.get(i, 0.0) or 0.0) for i in range(7)] if gq is not None else [0.0] * 7
+    dow_v = [float(gv.get(i, 0.0) or 0.0) for i in range(7)] if gv is not None else [0.0] * 7
 
-
-def _headers() -> dict[str, str]:
-    try:
-        ctx = getattr(st, "context", None)
-        if ctx is None:
-            return {}
-        hd = getattr(ctx, "headers", None)
-        if hd is None:
-            return {}
-        if isinstance(hd, dict):
-            return {str(k): str(v) for k, v in hd.items()}
-        return {str(k): str(v) for k, v in dict(hd).items()}
-    except Exception:
-        return {}
-
-
-def user_agent() -> str:
-    h = _headers()
-    return (h.get("User-Agent") or h.get("user-agent") or "").strip()
-
-
-def user_agent_bloqueado() -> bool:
-    if os.environ.get("FICHA_DISABLE_UA_CHECK", "").strip().lower() in ("1", "true", "yes", "on"):
-        return False
-    ua = user_agent().lower()
-    if not ua:
-        # Sem User-Agent (Streamlit sem context.headers ou proxy) — só bloqueia se forçado
-        return os.environ.get("FICHA_BLOCK_EMPTY_UA", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
+    num_cols = [
+        c
+        for c in df.select_dtypes(include=[np.number]).columns
+        if c
+        in (
+            "vol_leads",
+            "vol_agend",
+            "vol_visit",
+            "vol_pastas",
+            "target_qtd",
+            "target_valor",
         )
-    return any(s in ua for s in _UA_BLOQUEIO_SUBSTR)
+        or str(c).startswith("macro_")
+        or str(c).startswith("fb_vgv_")
+        or str(c).startswith("fb_qtd_")
+    ]
+    num_cols = num_cols[:40]
+    corr_labels: list[str] = []
+    corr_z: list[list[float]] = []
+    if len(num_cols) >= 2:
+        sub = df[num_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        if len(sub) > 1:
+            cm = sub.corr().fillna(0.0)
+            corr_labels = [str(c) for c in cm.columns]
+            corr_z = [[float(cm.iloc[i, j]) for j in range(len(corr_labels))] for i in range(len(corr_labels))]
+
+    return {
+        "dates": dates,
+        "vol_leads": col("vol_leads"),
+        "vol_agend": col("vol_agend"),
+        "vol_visit": col("vol_visit"),
+        "vol_pastas": col("vol_pastas"),
+        "target_qtd": col("target_qtd"),
+        "target_valor": col("target_valor"),
+        "dow_labels": dow_order,
+        "dow_mean_qtd": dow_q,
+        "dow_mean_valor": dow_v,
+        "macro": macro_data,
+        "corr_labels": corr_labels,
+        "corr_z": corr_z,
+        "n_rows": int(len(df)),
+        "n_features": int(df.shape[1]),
+        "numeric_series_for_picker": _numeric_series_for_corr_picker(df),
+    }
 
 
-def _agora() -> float:
-    return time.time()
-
-
-def iniciar_sessao_formulario() -> None:
-    """Marca o instante em que a sessão passou a usar o fluxo do formulário."""
-    ss = st.session_state
-    if ss.get("ficha_seg_t0") is None:
-        ss["ficha_seg_t0"] = _agora()
-
-
-def tempo_minimo_envio_ok() -> tuple[bool, str]:
-    if os.environ.get("FICHA_DISABLE_TMIN", "").strip().lower() in ("1", "true", "yes", "on"):
-        return True, ""
-    ss = st.session_state
-    t0 = ss.get("ficha_seg_t0")
-    if t0 is None:
-        iniciar_sessao_formulario()
-        t0 = ss.get("ficha_seg_t0")
+def _openai_key_and_model() -> tuple[str | None, str]:
+    key: str | None = None
+    model = "gpt-4o-mini"
     try:
-        t0f = float(t0)
+        import streamlit as st
+
+        if hasattr(st, "secrets"):
+            raw = st.secrets.get("OPENAI_API_KEY")
+            if raw:
+                key = str(raw).strip() or None
+            oa = st.secrets.get("openai")
+            if isinstance(oa, dict):
+                if not key and oa.get("api_key"):
+                    key = str(oa["api_key"]).strip() or None
+                if oa.get("model"):
+                    model = str(oa["model"]).strip() or model
+    except Exception:
+        pass
+    import os
+
+    if not key:
+        envk = os.environ.get("OPENAI_API_KEY", "").strip()
+        key = envk or None
+    env_m = os.environ.get("OPENAI_MODEL", "").strip()
+    if env_m:
+        model = env_m
+    return key, model
+
+
+def _openai_chat_completion(
+    messages: list[dict[str, str]],
+    *,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+    timeout: int = 75,
+) -> str | None:
+    import json
+    import urllib.error
+    import urllib.request
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 900,
+        "temperature": 0.35,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception:
+        return None
+
+
+def _pearson_r_vectors(a: list[Any], b: list[Any]) -> float | None:
+    if len(a) != len(b) or len(a) < 3:
+        return None
+    x = np.asarray(a, dtype=float)
+    y = np.asarray(b, dtype=float)
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+        return None
+    sx = float(np.std(x))
+    sy = float(np.std(y))
+    if sx < 1e-12 or sy < 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _pearson_pairwise_complete(x: list[Any], y: list[Any]) -> tuple[float | None, int]:
+    """Pearson em pares (xᵢ, yᵢ) com ambos finitos; ignora NaN. Devolve (r, n_válido)."""
+    if len(x) != len(y):
+        return None, 0
+    xs: list[float] = []
+    ys: list[float] = []
+    for a, b in zip(x, y):
+        try:
+            fa, fb = float(a), float(b)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fa) and math.isfinite(fb):
+            xs.append(fa)
+            ys.append(fb)
+    n = len(xs)
+    if n < 3:
+        return None, n
+    xa = np.asarray(xs, dtype=float)
+    ya = np.asarray(ys, dtype=float)
+    if float(np.std(xa)) < 1e-12 or float(np.std(ya)) < 1e-12:
+        return None, n
+    return float(np.corrcoef(xa, ya)[0, 1]), n
+
+
+def _corr_pairs_sorted(labels: list[str], z: list[list[float]]) -> list[tuple[str, str, float]]:
+    n = len(labels)
+    if n < 2 or len(z) != n or any(len(row) != n for row in z):
+        return []
+    out: list[tuple[str, str, float]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            r = z[i][j]
+            if isinstance(r, (int, float)) and math.isfinite(float(r)):
+                out.append((str(labels[i]), str(labels[j]), float(r)))
+    out.sort(key=lambda t: abs(t[2]), reverse=True)
+    return out
+
+
+def _interpret_text_funil_vendas(daily: dict[str, Any]) -> str:
+    tq = daily.get("target_qtd") or []
+    if len(tq) < 10:
+        return ""
+    n = len(tq)
+    k = max(1, min(n // 5, 90))
+    first = float(np.mean(np.asarray(tq[:k], dtype=float)))
+    last = float(np.mean(np.asarray(tq[-k:], dtype=float)))
+    if first < 1e-9:
+        return ""
+    chg = (last - first) / first * 100.0
+    return (
+        f"Em média, a quantidade vendida nos primeiros ~{k} dias da série foi {first:,.1f}; "
+        f"já nos últimos ~{k} dias, fixou-se em {last:,.1f}, o que representa {chg:+.1f}% face ao início. "
+        f"Assim, o gráfico permite confrontar, no tempo, os picos do funil com o comportamento das vendas e do VGV."
+    )
+
+
+def _interpret_text_rolagem_7d(daily: dict[str, Any]) -> str:
+    tq = daily.get("target_qtd") or []
+    if len(tq) < 14:
+        return ""
+    s = pd.to_numeric(pd.Series(tq), errors="coerce").fillna(0.0)
+    roll = s.rolling(7, min_periods=1).mean()
+    last = float(roll.iloc[-1])
+    if len(roll) >= 30:
+        prev = float(roll.iloc[-30])
+        d = last - prev
+        return (
+            f"A média móvel de 7 dias no último dia regista {last:,.1f} unidades; por comparação, há cerca de "
+            f"30 observações o valor situava-se em {prev:,.1f}, pelo que a variação é de {d:+,.1f}. "
+            f"Deste modo, a curva suavizada atenua o ruído de curto prazo sem ocultar a tendência."
+        )
+    return (
+        f"No último dia, a média móvel de 7 dias é de {last:,.1f} unidades; todavia, a série é curta demais "
+        f"para uma comparação fiável com janelas mais longas."
+    )
+
+
+def _interpret_text_leads_vendas(daily: dict[str, Any]) -> str:
+    x = daily.get("vol_leads") or []
+    y = daily.get("target_qtd") or []
+    r = _pearson_r_vectors(x, y)
+    if r is None:
+        return (
+            "No cruzamento leads × vendas (mesmo dia), a amostra é insuficiente ou apresenta variância nula; "
+            "por conseguinte, o coeficiente de Pearson não é estimável de forma robusta."
+        )
+    qual = "fraca"
+    if abs(r) >= 0.5:
+        qual = "moderada"
+    if abs(r) >= 0.75:
+        qual = "forte"
+    sinal = "positiva" if r > 0 else "negativa"
+    return (
+        f"A correlação de Pearson, no mesmo dia, é r = {r:+.2f}, o que corresponde a uma associação linear {qual} e {sinal}. "
+        f"Contudo, tal medida não implica relação causal: efeitos defasados, sazonalidade ou variáveis confundidoras "
+        f"podem explicar parte do padrão observado."
+    )
+
+
+def _interpret_text_dow(daily: dict[str, Any]) -> str:
+    dl = daily.get("dow_labels") or []
+    dq = daily.get("dow_mean_qtd") or []
+    dv = daily.get("dow_mean_valor") or []
+    if len(dl) != len(dq) or not dq:
+        return ""
+    dq_f = [float(x) for x in dq]
+    imax = int(np.argmax(dq_f))
+    imin = int(np.argmin(dq_f))
+    parts = [
+        f"No perfil semanal, a maior média de quantidade verifica-se à {dl[imax]} ({dq_f[imax]:,.1f}), "
+        f"ao passo que o menor nível médio ocorre à {dl[imin]} ({dq_f[imin]:,.1f})."
+    ]
+    if len(dv) == len(dl):
+        dv_f = [float(v) for v in dv]
+        jmax = int(np.argmax(dv_f))
+        parts.append(
+            f"Relativamente ao VGV, o maior valor médio ocorre à {dl[jmax]} (R$ {dv_f[jmax]/1e6:.2f} mi)."
+        )
+    return " ".join(parts)
+
+
+def _interpret_text_correlation_matrix(labels: list[str], z: list[list[float]]) -> str:
+    pairs = _corr_pairs_sorted(labels, z)
+    if not pairs:
+        return ""
+    strong = [p for p in pairs if abs(p[2]) >= 0.7][:8]
+    pos = sorted((p for p in pairs if p[2] > 0), key=lambda t: t[2], reverse=True)[:5]
+    neg = sorted((p for p in pairs if p[2] < 0), key=lambda t: t[2])[:5]
+    chunks: list[str] = []
+    if strong:
+        chunks.append(
+            "Registam-se associações lineares fortes (|r| ≥ 0,70), nomeadamente: "
+            + "; ".join(f"{a} ↔ {b} ({r:+.2f})" for a, b, r in strong)
+            + "."
+        )
+    pos_f = [p for p in pos if p[2] >= 0.25]
+    if pos_f:
+        chunks.append(
+            "Além disso, as correlações positivas mais marcadas são as seguintes: "
+            + "; ".join(f"{a}–{b}: {r:+.2f}" for a, b, r in pos_f)
+            + "."
+        )
+    neg_f = [p for p in neg if p[2] <= -0.25]
+    if neg_f:
+        chunks.append(
+            "Por outro lado, destacam-se estas associações negativas: "
+            + "; ".join(f"{a}–{b}: {r:+.2f}" for a, b, r in neg_f)
+            + "."
+        )
+    near = [p for p in pairs if abs(p[2]) < 0.15][:3]
+    if near and len(labels) > 4:
+        chunks.append(
+            "Há ainda pares com correlação quase nula (por exemplo, "
+            + ", ".join(f"{a}–{b} ({r:+.2f})" for a, b, r in near)
+            + "), o que sugere pouca ligação linear direta entre essas variáveis nesta amostra."
+        )
+    chunks.append(
+        "Em suma, o coeficiente de Pearson quantifica apenas a tendência linear simultânea; "
+        "não evidencia, por si só, relações causais nem efeitos com desfasamento temporal."
+    )
+    return " ".join(x for x in chunks if x)
+
+
+def _interpret_text_macro(macro: dict[str, Any]) -> str:
+    keys = [k for k in macro.keys() if isinstance(macro.get(k), list)][:12]
+    if len(keys) < 2:
+        return ""
+    lengths = [len(macro[k]) for k in keys]
+    m = min(lengths)
+    if m < 6:
+        return ""
+    mat = np.array([[float(macro[k][i] or 0.0) for k in keys] for i in range(m)], dtype=float)
+    cm = np.corrcoef(mat.T)
+    pair_list: list[tuple[str, str, float]] = []
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            r = float(cm[i, j])
+            if math.isfinite(r):
+                pair_list.append((str(keys[i]), str(keys[j]), r))
+    pair_list.sort(key=lambda t: abs(t[2]), reverse=True)
+    top = pair_list[:5]
+    if not top:
+        return ""
+    return (
+        "Entre os indicadores macro, calculadas sobre o mesmo período e nos níveis originais, "
+        "as correlações mais elevadas são: "
+        + "; ".join(f"{a} ↔ {b}: {r:+.2f}" for a, b, r in top)
+        + ". Observe que, no gráfico, as séries são normalizadas em z-score unicamente para facilitar "
+        "a comparação da forma temporal, sem alterar a estrutura de correlação acima referida."
+    )
+
+
+def _interpret_text_vif_rows(vifs: list[Any]) -> str:
+    if not vifs:
+        return ""
+    scored: list[tuple[str, float]] = []
+    for r in vifs:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("variavel", "")) or "?"
+        try:
+            vf = float(r.get("vif"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(vf) and vf >= 5.0:
+            scored.append((name, vf))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    if not scored:
+        return (
+            "Neste subconjunto, nenhuma variável apresenta VIF ≥ 5; assim, há pouca evidência estatística "
+            "de redundância linear acentuada entre as colunas consideradas."
+        )
+    top = scored[:8]
+    return (
+        "Identificam-se variáveis com VIF elevado (≥ 5), entre as quais: "
+        + "; ".join(f"{n} (~{v:.1f})" for n, v in top)
+        + ". Isto indica dependência linear relevante face a outras *features*; consequentemente, "
+        "convém interpretar importâncias e coeficientes com prudência, sobretudo em modelos lineares."
+    )
+
+
+def _facts_corr_vif_for_llm(
+    labels: list[str], z: list[list[float]], vifs: list[Any]
+) -> str:
+    chunks: list[str] = []
+    if len(labels) >= 2 and z:
+        t = _interpret_text_correlation_matrix(labels, z)
+        if t:
+            chunks.append(t)
+    tv = _interpret_text_vif_rows(vifs)
+    if tv:
+        chunks.append(tv)
+    return "\n".join(chunks)
+
+
+def _facts_eda_compact(daily: dict[str, Any]) -> str:
+    lines = [
+        _interpret_text_funil_vendas(daily),
+        _interpret_text_rolagem_7d(daily),
+        _interpret_text_leads_vendas(daily),
+        _interpret_text_dow(daily),
+    ]
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        lines.append(_interpret_text_correlation_matrix(cl, cz))
+    lines.append(_interpret_text_macro(daily.get("macro") or {}))
+    return "\n".join(x for x in lines if x)
+
+
+def _openai_eda_synopsis(facts: str) -> str | None:
+    key, model = _openai_key_and_model()
+    if not key or not facts.strip():
+        return None
+    sys_m = (
+        "Assume o papel de analista de dados sénior. Redige em português (Brasil), com 2 a 4 parágrafos curtos, "
+        "tom profissional e conectivos adequados (por exemplo: contudo, além disso, neste contexto, em suma, assim). "
+        "Utiliza exclusivamente os factos fornecidos; não inventes quantidades nem conclusões não suportadas. "
+        "Referencia explicitamente que correlação não implica causalidade e que as vendas podem reagir com defasagem "
+        "a variáveis explicativas."
+    )
+    return _openai_chat_completion(
+        [
+            {"role": "system", "content": sys_m},
+            {
+                "role": "user",
+                "content": "Elabore uma síntese profissional para gestão, com base nos indicadores abaixo. "
+                "Utilize conectivos adequados e estruture a resposta de forma lógica:\n\n" + facts.strip(),
+            },
+        ],
+        api_key=key,
+        model=model,
+    )
+
+
+def _html_eda_interpretacoes(daily: dict[str, Any]) -> str:
+    blocks: list[tuple[str, str]] = [
+        ("Funil e vendas", _interpret_text_funil_vendas(daily)),
+        ("Suavização 7 dias", _interpret_text_rolagem_7d(daily)),
+        ("Leads × vendas (dispersão)", _interpret_text_leads_vendas(daily)),
+        ("Dia da semana", _interpret_text_dow(daily)),
+    ]
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        blocks.append(("Matriz de correlação", _interpret_text_correlation_matrix(cl, cz)))
+    mx = _interpret_text_macro(daily.get("macro") or {})
+    if mx:
+        blocks.append(("Indicadores macro", mx))
+    parts: list[str] = []
+    for title, body in blocks:
+        if not body:
+            continue
+        parts.append(
+            f'<h5 class="font-semibold text-slate-800 text-sm mt-3 mb-1">{html_lib.escape(title)}</h5>'
+            f'<p class="text-sm text-slate-600 text-justify leading-relaxed">{html_lib.escape(body)}</p>'
+        )
+    if not parts:
+        return ""
+    foot = html_lib.escape(
+        "Nota metodológica: as interpretações são geradas automaticamente com base em regras e estatística descritiva; "
+        "o relatório HTML permanece autónomo, isto é, não recorre a serviços de API externos."
+    )
+    return (
+        '<div class="glass-card p-6 mb-6 border-l-4 border-sky-500">'
+        '<h4 class="text-lg font-black text-slate-900 mb-1">Interpretações automáticas</h4>'
+        + "".join(parts)
+        + f'<p class="text-xs text-slate-400 mt-3">{foot}</p></div>'
+    )
+
+
+def _st_interpretacao_grafico(titulo: str, texto: str) -> None:
+    if not texto:
+        return
+    st.markdown(
+        f'<div class="pv-interpret-wrap"><p class="pv-interpret-title">{html_lib.escape(titulo)}</p>'
+        f'<p class="pv-interpret-text">{html_lib.escape(texto)}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _cell_metric(
+    x: Any, *, prec: int = 4, scale_million: bool = False
+) -> str:
+    if x is None:
+        return "—"
+    try:
+        xf = float(x)
     except (TypeError, ValueError):
-        t0f = _agora()
-    dt = _agora() - t0f
-    if dt < _TMIN_ENVIO_S:
-        return False, (
-            f"Por segurança, aguarde alguns segundos antes de enviar "
-            f"(mínimo {_TMIN_ENVIO_S}s na página)."
+        return "—"
+    if math.isnan(xf) or math.isinf(xf):
+        return "—"
+    if scale_million:
+        xf /= 1e6
+    return f"{xf:.{prec}f}"
+
+
+def _appendix_for_horizon_target(
+    ba: dict[str, Any] | None,
+    h: int,
+    title: str,
+    slug: str,
+    vgv: bool,
+    full_period_train: bool,
+) -> tuple[str, str]:
+    """
+    Gera HTML do apêndice + script Plotly (ROC + barras MAE teste).
+    slug: 'qtd' | 'valor'
+    """
+    hold_lbl = "in-sample (100%)" if full_period_train else "holdout (30%)"
+    if not ba or not ba.get("rows"):
+        empty = (
+            f'<div class="glass-card p-5 mb-6"><h4 class="font-bold text-slate-800 mb-2">{title} — H={h}d</h4>'
+            f'<p class="text-sm text-amber-800">Benchmark indisponível para este alvo.</p></div>'
         )
-    return True, ""
+        return empty, ""
 
+    rows_raw = list(ba["rows"])
+    rows_raw.sort(key=lambda r: float(r.get("mae_val") or 9e99))
+    thr = ba.get("threshold_y")
+    thr_s = _cell_metric(thr, prec=2, scale_million=vgv)
+    if vgv and thr is not None and thr_s != "—":
+        thr_s = f"{thr_s} mi R$"
 
-def limite_taxa_ok() -> tuple[bool, str]:
-    """Limita tentativas de envio por sessão (mitiga abuso e scripts)."""
-    if os.environ.get("FICHA_DISABLE_RL", "").strip().lower() in ("1", "true", "yes", "on"):
-        return True, ""
-    ss = st.session_state
-    now = _agora()
-    ts: list[float] = ss.get("ficha_rl_envios_ts") or []
-    if not isinstance(ts, list):
-        ts = []
-    ts = [float(t) for t in ts if isinstance(t, (int, float))]
-    ts = [t for t in ts if now - t < 86400]
-    recentes = [t for t in ts if now - t < _RL_JANELA_S]
-    if len(recentes) >= _RL_MAX_JANELA:
-        return False, "Muitas tentativas de envio em pouco tempo. Aguarde e tente novamente."
-    if len(ts) >= _RL_MAX_DIA:
-        return False, "Limite diário de tentativas de envio atingido. Tente novamente mais tarde."
-    return True, ""
+    win = html_lib.escape(str(ba.get("winner_label") or "—"))
+    wnames = ba.get("winner_names") or []
+    wweights = ba.get("winner_weights") or []
+    wparts = []
+    for i, n in enumerate(wnames):
+        ww = wweights[i] if i < len(wweights) else None
+        wparts.append(
+            f"{html_lib.escape(str(n))}"
+            + (f" ({float(ww):.3f})" if ww is not None else "")
+        )
+    blend_txt = " · ".join(wparts) if wparts else "—"
 
-
-def registrar_tentativa_envio() -> None:
-    """Chamar ao processar um clique em Enviar (antes da validação de campos)."""
-    ss = st.session_state
-    now = _agora()
-    ts: list[float] = ss.get("ficha_rl_envios_ts") or []
-    if not isinstance(ts, list):
-        ts = []
-    ts = [float(t) for t in ts if isinstance(t, (int, float)) and now - t < 86400]
-    ts.append(now)
-    ss["ficha_rl_envios_ts"] = ts
-
-
-def honeypot_ok() -> bool:
-    """Campo oculto: se preenchido, trata como bot (não revelar ao cliente)."""
-    v = st.session_state.get("ficha_hp_website")
-    if v is None:
-        return True
-    if isinstance(v, str) and v.strip():
-        return False
-    return True
-
-
-def verificar_antes_envio() -> tuple[bool, str]:
-    """
-    Ordem: UA → tempo mínimo → honeypot (se existir campo) → taxa.
-    Ao passar, registra a tentativa na janela de rate limit.
-    """
-    if user_agent_bloqueado():
-        return False, "Acesso não autorizado a partir deste cliente."
-    ok, msg = tempo_minimo_envio_ok()
-    if not ok:
-        return False, msg
-    if not honeypot_ok():
-        return False, "Não foi possível concluir o envio. Atualize a página e tente novamente."
-    ok, msg = limite_taxa_ok()
-    if not ok:
-        return False, msg
-    registrar_tentativa_envio()
-    return True, ""
-
-
-def injetar_cliente_e_meta() -> None:
-    """
-    Injeta no documento pai (uma vez): meta robots, referrer, dissuasão leve a DevTools.
-    Desative com FICHA_DISABLE_CLIENT_HARDENING=1 (útil para debug acessível).
-    """
-    if os.environ.get("FICHA_DISABLE_CLIENT_HARDENING", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        return
-    try:
-        import streamlit.components.v1 as components
-    except ImportError:
-        return
-
-    noindex = os.environ.get("FICHA_NOINDEX", "1").strip().lower() not in ("0", "false", "no", "off")
-
-    meta_robots = (
-        "var m=document.createElement('meta');m.name='robots';m.content='noindex,nofollow';hd.appendChild(m);"
-        if noindex
-        else ""
+    reg_heads = (
+        "<tr class='bg-slate-100 text-left'>"
+        "<th class='p-2 border'>Modelo</th>"
+        "<th class='p-2 border'>MAE sel. (val)</th>"
+        "<th class='p-2 border'>MAE val</th>"
+        "<th class='p-2 border'>MAE teste</th>"
+        "<th class='p-2 border'>RMSE teste</th>"
+        "<th class='p-2 border'>R² teste</th>"
+        "<th class='p-2 border'>MedAE teste</th>"
+        "<th class='p-2 border'>Var.expl. teste</th>"
+        "<th class='p-2 border'>Erro máx. teste</th>"
+        "</tr>"
     )
-    ref = (
-        "var r=document.createElement('meta');r.name='referrer';r.content='strict-origin-when-cross-origin';hd.appendChild(r);"
-    )
+    reg_rows_html = [reg_heads]
+    for r in rows_raw:
+        nm = html_lib.escape(str(r.get("name", "")))
+        rv = r.get("reg_val") or {}
+        rt = r.get("reg_test") or {}
+        reg_rows_html.append(
+            "<tr>"
+            f"<td class='p-2 border font-medium text-slate-800'>{nm}</td>"
+            f"<td class='p-2 border'>{_cell_metric(r.get('mae_val'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rv.get('MAE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('MAE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('RMSE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('R2'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('MedAE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('ExplainedVar'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('MaxError'), prec=3, scale_million=vgv)}</td>"
+            "</tr>"
+        )
 
-    html = f"""
-<div style="display:none" aria-hidden="true">sec</div>
-<script>
-(function() {{
-  try {{
-    var p = window.parent;
-    if (!p || p.__fichaSegInit) return;
-    p.__fichaSegInit = true;
-    var doc = p.document;
-    var hd = doc.head;
-    if (!hd) return;
-    {meta_robots}
-    {ref}
-    doc.addEventListener('contextmenu', function(e) {{ e.preventDefault(); }}, true);
-    doc.addEventListener('keydown', function(e) {{
-      if (e.key === 'F12') {{ e.preventDefault(); return false; }}
-      if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) {{
-        e.preventDefault(); return false;
+    bin_heads = (
+        "<tr class='bg-slate-100'>"
+        "<th class='p-2 border' rowspan='2'>Modelo</th>"
+        "<th class='p-2 border text-center' colspan='5'>Validação (binária aux.)</th>"
+        "<th class='p-2 border text-center' colspan='5'>Teste (binária aux.)</th>"
+        "</tr>"
+        "<tr class='bg-slate-50 text-xs'>"
+        "<th class='p-2 border'>Acc</th><th class='p-2 border'>Prec</th><th class='p-2 border'>Rec</th>"
+        "<th class='p-2 border'>F1</th><th class='p-2 border'>AUC</th>"
+        "<th class='p-2 border'>Acc</th><th class='p-2 border'>Prec</th><th class='p-2 border'>Rec</th>"
+        "<th class='p-2 border'>F1</th><th class='p-2 border'>AUC</th>"
+        "</tr>"
+    )
+    bin_rows_html = [bin_heads]
+    for r in rows_raw:
+        nm = html_lib.escape(str(r.get("name", "")))
+        bv = r.get("bin_val") or {}
+        bt = r.get("bin_test") or {}
+        bin_rows_html.append(
+            "<tr>"
+            f"<td class='p-2 border font-medium'>{nm}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('Accuracy'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('Precision'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('Recall'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('F1'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('ROC_AUC'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('Accuracy'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('Precision'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('Recall'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('F1'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('ROC_AUC'), prec=3)}</td>"
+            "</tr>"
+        )
+
+    unit_note = (
+        "Valores de erro em milhões de R$ (VGV)."
+        if vgv
+        else "Valores de erro em unidades (quantidade)."
+    )
+    vgv_js = "true" if vgv else "false"
+
+    roc_traces = ba.get("roc_traces") or []
+    mae_bar: list[dict[str, Any]] = []
+    for r in rows_raw:
+        rt = r.get("reg_test") or {}
+        mae_bar.append(
+            {
+                "name": str(r.get("name", "")),
+                "mae": rt.get("MAE"),
+            }
+        )
+
+    roc_json = _json_safe(roc_traces)
+    mae_json = _json_safe(mae_bar)
+
+    html_frag = f"""
+    <div class="glass-card p-6 mb-8">
+      <h4 class="text-lg font-bold text-slate-900 mb-2">{html_lib.escape(title)} — horizonte {h} dias</h4>
+      <p class="text-xs text-slate-600 mb-3">
+        Vencedor do benchmark (menor MAE na validação interna): <b>{win}</b><br/>
+        Composição: {blend_txt}<br/>
+        Limiar da tarefa binária auxiliar (mediana de <code>y</code> só no treino interno do benchmark): <b>{thr_s}</b>.
+        Métricas de teste referem-se ao conjunto <b>{hold_lbl}</b>. {unit_note}
+      </p>
+      <div class="overflow-x-auto mb-4">
+        <p class="text-xs font-bold text-slate-500 uppercase mb-1">Regressão (validação / teste)</p>
+        <table class="text-xs border-collapse w-full min-w-[720px]">{"".join(reg_rows_html)}</table>
+      </div>
+      <div class="overflow-x-auto mb-4">
+        <p class="text-xs font-bold text-slate-500 uppercase mb-1">
+          Classificação auxiliar (real e predito &gt; limiar vs ≤ limiar; score ROC = valor predito contínuo)
+        </p>
+        <table class="text-xs border-collapse w-full min-w-[900px]">{"".join(bin_rows_html)}</table>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div>
+          <p class="text-xs font-bold text-slate-600 mb-1">Curvas ROC (teste — tarefa auxiliar)</p>
+          <div id="roc_{slug}_{h}" style="height:400px;width:100%;"></div>
+        </div>
+        <div>
+          <p class="text-xs font-bold text-slate-600 mb-1">MAE no teste — comparação entre modelos</p>
+          <div id="maebar_{slug}_{h}" style="height:400px;width:100%;"></div>
+        </div>
+      </div>
+    </div>
+    """
+
+    script = f"""
+    (function() {{
+      var roc = {roc_json};
+      var palette = ['#6366f1','#10b981','#f59e0b','#ec4899','#8b5cf6','#06b6d4','#84cc16','#f97316','#64748b','#0ea5e9'];
+      var traces = roc.map(function(t, i) {{
+        return {{
+          x: t.fpr || [], y: t.tpr || [], mode: 'lines',
+          name: (t.name || '') + (t.auc != null ? ' (AUC=' + Number(t.auc).toFixed(3) + ')' : ''),
+          line: {{ width: 1.5, color: palette[i % palette.length] }}
+        }};
+      }});
+      traces.push({{ x: [0,1], y: [0,1], mode: 'lines', name: 'aleatório', line: {{ dash: 'dot', color: '#94a3b8' }} }});
+      Plotly.newPlot('roc_{slug}_{h}', traces, {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {{ family: 'Plus Jakarta Sans', size: 11, color: '#475569' }},
+        margin: {{ t: 36, l: 48, r: 12, b: 48 }},
+        xaxis: {{ title: 'Taxa de falsos positivos', gridcolor: '#e2e8f0', zeroline: false }},
+        yaxis: {{ title: 'Taxa de verdadeiros positivos', gridcolor: '#e2e8f0', zeroline: false }},
+        showlegend: true, legend: {{ orientation: 'v', x: 1.02, y: 1 }}
+      }}, {{ responsive: true }});
+
+      var mb = {mae_json};
+      var vgv = {vgv_js};
+      var yv = mb.map(function(d) {{
+        var v = d.mae;
+        if (v == null || isNaN(v)) return 0;
+        return vgv ? v / 1e6 : v;
+      }});
+      var ytitle = vgv ? 'MAE teste (mi R$)' : 'MAE teste (unid.)';
+      Plotly.newPlot('maebar_{slug}_{h}', [{{
+        type: 'bar',
+        x: mb.map(function(d) {{ return d.name; }}),
+        y: yv,
+        marker: {{ color: '#4f46e5', opacity: 0.85 }}
+      }}], {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 28, l: 52, r: 12, b: 120 }},
+        xaxis: {{ tickangle: -55, automargin: true }},
+        yaxis: {{ title: ytitle, gridcolor: '#f1f5f9' }}
+      }}, {{ responsive: true }});
+    }})();
+    """
+    return html_frag, script
+
+
+def _methodology_appendix_block(
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    full_period_train: bool,
+    blend_top_k: int,
+    random_seed: int,
+    n_rows: int,
+    n_features: int,
+) -> str:
+    hz_txt = ", ".join(str(x) for x in horizontes)
+    modo = (
+        "<b>100% da série</b> no modelo final; ~8% finais só para pesos do ensemble (sem holdout nas métricas principais)."
+        if full_period_train
+        else "<b>70% / 30%</b> cronológicos; ~8% no fim do treino para escolher o ensemble. "
+        "MAE, RMSE, R² no <b>teste (30%)</b> salvo indicação em contrário."
+    )
+    params_blocks: list[str] = []
+    for h in horizontes:
+        pq = best_params_preview.get(h, {}).get("qtd", {})
+        ql = html_lib.escape(str(por_horizonte[h]["qtd"].get("model_label", "—")))
+        pj = html_lib.escape(json.dumps(pq, indent=2, ensure_ascii=False)[:12000])
+        params_blocks.append(
+            f'<div class="glass-card p-5 mb-5 border-t-4 border-slate-700">'
+            f'<h4 class="font-bold text-slate-900 mb-2">Horizonte {h} dias — quantidade</h4>'
+            f'<p class="text-sm text-slate-600 mb-2">Modelo: <b>{ql}</b></p>'
+            f'<p class="text-xs font-bold text-slate-500 uppercase mb-1">Metadados / parâmetros registados</p>'
+            f'<pre class="text-xs overflow-auto max-h-56 bg-slate-50 p-3 rounded-lg border">{pj}</pre></div>'
+        )
+    candidatos = (
+        "<b>XGBoost</b> (100 árvores, <code>learning_rate=0.05</code>, <code>max_depth=4</code>), "
+        "<b>Random Forest</b> (100, <code>max_depth=5</code>), "
+        "<b>Gradient Boosting</b> (100, <code>learning_rate=0.05</code>, <code>max_depth=4</code>), "
+        "<b>Ridge</b> (<code>alpha=1.0</code>) e <b>VotingRegressor</b> sobre estes quatro."
+    )
+    return f"""
+    <div class="glass-card p-8 mb-8 border-l-4 border-blue-600">
+      <h2 class="text-2xl font-black text-slate-900 mb-4">Metodologia</h2>
+      <div class="text-sm text-slate-700 space-y-3 leading-relaxed text-justify">
+        <p><b>Alvo.</b> Apenas <b>quantidade</b>: em cada <code>t</code>, soma de vendas (unidades) nos próximos <code>H</code> dias da série, <code>H</code> ∈ {{{hz_txt}}}. <code>X</code> só com dados até <code>t</code> (lags, calendário, STL, feriados, macro BCB, formulário defasado, etc.).</p>
+        <p><b>Engenharia preditiva.</b> Correlação com o alvo → top 30 variáveis → <code>PolynomialFeatures(degree=2)</code> sem bias; restantes colunas concatenadas (fluxo tipo relatório executivo).</p>
+        <p><b>Dados.</b> <b>{n_rows:,}</b> dias; <b>{n_features}</b> colunas após engenharia na matriz diária.</p>
+        <p><b>Validação.</b> {modo}</p>
+        <p><b>Modelos (fixos).</b> {candidatos} Competição por MAE no teste cronológico (30%); vencedor reajustado no histórico. Semente <b>{random_seed}</b>.</p>
+        <p><b>Métricas binárias (HTML).</b> Comparação à mediana de <code>y</code> no treino do benchmark.</p>
+      </div>
+    </div>
+    <h3 class="text-lg font-black text-slate-800 mb-3">Registo por horizonte (quantidade)</h3>
+    {"".join(params_blocks)}
+    """
+
+
+def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
+    daily_html = {k: v for k, v in daily.items() if k != "numeric_series_for_picker"}
+    dj = _json_safe(daily_html)
+    interp_block = _html_eda_interpretacoes(daily)
+    html_frag = """
+    <div class="glass-card p-6 mb-6">
+      <h3 class="text-xl font-black text-slate-900 mb-2">Séries diárias — funil e alvos</h3>
+      <p class="text-sm text-slate-600 mb-4 text-justify">Contagens do funil (empilhadas), vendas diárias em quantidade e VGV.</p>
+      <div id="an_combo" style="height:480px;width:100%;"></div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Média por dia da semana</h4>
+        <div id="an_dow" style="height:380px;width:100%;"></div>
+      </div>
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Correlação (variáveis-chave)</h4>
+        <div id="an_corr" style="height:380px;width:100%;"></div>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6" id="an_scatter_row">
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Dispersão: leads × qtd (mesmo dia)</h4>
+        <p class="text-sm text-slate-600 mb-3 text-justify">Complementa a matriz acima: cada ponto corresponde a um dia civil, com leads no eixo horizontal e vendas em quantidade no vertical.</p>
+        <div id="an_scatter_q" style="height:380px;width:100%;"></div>
+      </div>
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Dispersão: leads × VGV (mesmo dia)</h4>
+        <p class="text-sm text-slate-600 mb-3 text-justify">Mesmo eixo horizontal (leads); o VGV diário é apresentado em milhões de reais, de modo a alinhar a escala à leitura do funil.</p>
+        <div id="an_scatter_v" style="height:380px;width:100%;"></div>
+      </div>
+    </div>
+    <div class="glass-card p-6 mb-6" id="an_macro_wrap">
+      <h4 class="font-bold text-slate-800 mb-2">Indicadores macro (normalizados)</h4>
+      <div id="an_macro" style="height:360px;width:100%;"></div>
+    </div>
+    """
+    html_frag = html_frag + interp_block
+    script = f"""
+    (function() {{
+      var D = {dj};
+      var dates = D.dates || [];
+      function zscore(arr) {{
+        var m = arr.reduce(function(a,b){{return a+b;}},0) / (arr.length || 1);
+        var v = arr.reduce(function(a,b){{return a+Math.pow(b-m,2);}},0) / (arr.length || 1);
+        var s = Math.sqrt(v) || 1;
+        return arr.map(function(x) {{ return (x - m) / s; }});
       }}
-      if (e.ctrlKey && (e.key === 'u' || e.key === 'U')) {{ e.preventDefault(); return false; }}
-    }}, true);
-  }} catch (err) {{}}
-}})();
-</script>
-"""
-    components.html(html, height=0, scrolling=False)
+      function xAxisRangeFromDates(ds) {{
+        if (!ds || ds.length < 2) return {{}};
+        return {{ range: [ds[0], ds[ds.length - 1]] }};
+      }}
+      Plotly.newPlot('an_combo', [
+        {{ x: dates, y: D.vol_leads, name: 'Leads', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(15,23,42,0.35)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_agend, name: 'Agend.', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(59,130,246,0.4)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_visit, name: 'Visitas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(99,102,241,0.4)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_pastas, name: 'Pastas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(139,92,246,0.45)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_qtd, name: 'Vendas (linha)', yaxis: 'y2', line: {{ color: '#059669', width: 2.5 }}, type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_valor.map(function(v){{return v/1e6;}}), name: 'VGV (linha)', yaxis: 'y3', line: {{ color: '#ea580c', width: 2, dash: 'dot' }}, type: 'scatter', mode: 'lines' }}
+      ], {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 96, l: 52, r: 56, b: 56 }},
+        xaxis: Object.assign({{ title: 'Eixo X — data' }}, xAxisRangeFromDates(dates)),
+        yaxis: {{ title: 'Eixo Y₁ — funil empilhado', gridcolor: '#e5e7eb' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Eixo Y₂ — qtd (/ dia)', showgrid: false }},
+        yaxis3: {{ anchor: 'free', overlaying: 'y', side: 'right', position: 0.98, title: 'Eixo Y₃ — valor (mi R$ / dia)', showgrid: false }},
+        legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.06, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#cbd5e1', borderwidth: 1, font: {{ size: 10 }}, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
+      }}, {{ responsive: true }});
+
+      var dl = D.dow_labels || [];
+      Plotly.newPlot('an_dow', [
+        {{ x: dl, y: D.dow_mean_qtd || [], name: 'Barras — qtd', type: 'bar', marker: {{ color: '#334155' }} }},
+        {{ x: dl, y: (D.dow_mean_valor || []).map(function(v){{return v/1e6;}}), name: 'Barras — VGV', type: 'bar', marker: {{ color: '#0d9488' }}, yaxis: 'y2' }}
+      ], {{
+        barmode: 'group',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        xaxis: {{ title: 'Eixo X — dia da semana' }},
+        yaxis: {{ title: 'Eixo Y₁ — média qtd (/ dia)' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Eixo Y₂ — média VGV (mi R$ / dia)' }},
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 56, l: 48, r: 48, b: 48 }},
+        legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.04, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#e2e8f0', borderwidth: 1, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
+      }}, {{ responsive: true }});
+
+      var labs = D.corr_labels || [];
+      var z = D.corr_z || [];
+      if (labs.length > 1 && z.length) {{
+        Plotly.newPlot('an_corr', [{{
+          z: z, x: labs, y: labs, type: 'heatmap', colorscale: 'RdBu', zmid: 0,
+          hoverongaps: false
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 28, l: 120, r: 28, b: 120 }},
+          font: {{ size: 10 }}, xaxis: {{ tickangle: -45 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        document.getElementById('an_corr').innerHTML = '<p class="text-sm text-slate-500 p-4">Correlação indisponível.</p>';
+      }}
+
+      var vl = D.vol_leads || [];
+      var tqsc = D.target_qtd || [];
+      var tvmi = (D.target_valor || []).map(function(v){{ return v / 1e6; }});
+      var scatterOk = vl.length > 5 && vl.length === tqsc.length && vl.length === tvmi.length;
+      if (scatterOk) {{
+        Plotly.newPlot('an_scatter_q', [{{
+          x: vl, y: tqsc, type: 'scatter', mode: 'markers',
+          marker: {{ size: 7, opacity: 0.5, color: '#3b82f6', line: {{ width: 0.5, color: '#ffffff' }} }}
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          xaxis: {{ title: 'Eixo X — leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Eixo Y — qtd vendida', gridcolor: '#e5e7eb' }},
+          margin: {{ t: 20, l: 52, r: 28, b: 52 }},
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }}
+        }}, {{ responsive: true }});
+        Plotly.newPlot('an_scatter_v', [{{
+          x: vl, y: tvmi, type: 'scatter', mode: 'markers',
+          marker: {{ size: 7, opacity: 0.5, color: '#0d9488', line: {{ width: 0.5, color: '#ffffff' }} }}
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          xaxis: {{ title: 'Eixo X — leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Eixo Y — VGV (mi R$)', gridcolor: '#e5e7eb' }},
+          margin: {{ t: 20, l: 52, r: 28, b: 52 }},
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        var srow = document.getElementById('an_scatter_row');
+        if (srow) srow.style.display = 'none';
+      }}
+
+      var macro = D.macro || {{}};
+      var mk = Object.keys(macro);
+      if (mk.length) {{
+        var traces = mk.slice(0, 5).map(function(k) {{
+          return {{ x: dates, y: zscore(macro[k] || []), name: k, line: {{ width: 1.4 }} }};
+        }});
+        Plotly.newPlot('an_macro', traces, {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          title: 'Macro (z-score por série)',
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+          margin: {{ t: 72, l: 48, r: 28, b: 48 }},
+          xaxis: Object.assign({{ title: 'Eixo X — data' }}, xAxisRangeFromDates(dates)),
+          yaxis: {{ title: 'Eixo Y — z-score' }},
+          legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.05, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#cbd5e1', borderwidth: 1, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
+        }}, {{ responsive: true }});
+      }} else {{
+        document.getElementById('an_macro_wrap').style.display = 'none';
+      }}
+    }})();
+    """
+    return html_frag, script
 
 
-# =============================================================================
-# App Streamlit — Ficha Vendas RJ
-# =============================================================================
+def _build_appendix_html(
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    full_period_train: bool,
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    blend_top_k: int,
+    random_seed: int,
+    n_rows: int,
+    n_features: int,
+) -> tuple[str, str]:
+    parts: list[str] = []
+    scripts: list[str] = []
+    intro_meth = _methodology_appendix_block(
+        horizontes,
+        por_horizonte,
+        best_params_preview,
+        full_period_train,
+        blend_top_k,
+        random_seed,
+        n_rows,
+        n_features,
+    )
+    for h in horizontes:
+        ph = por_horizonte[h]
+        hq, sq = _appendix_for_horizon_target(
+            ph["qtd"].get("benchmark_appendix"),
+            h,
+            "Volume (quantidade)",
+            "qtd",
+            False,
+            full_period_train,
+        )
+        parts.append(
+            f'<div class="mb-4"><h3 class="text-xl font-black text-slate-800 mb-3">Horizonte {h} dias — benchmark</h3>{hq}</div>'
+        )
+        if sq:
+            scripts.append(sq)
+    bench_intro = """
+    <div class="glass-card p-6 mb-8 border-l-4 border-indigo-500">
+      <h2 class="text-xl font-black text-slate-900 mb-2">Benchmark</h2>
+      <p class="text-sm text-slate-600">Regressão (quantidade), tarefa binária auxiliar, ROC e MAE no teste — XGBoost, Random Forest, Gradient Boosting, Ridge e Voting.</p>
+    </div>
+    """
+    return intro_meth + bench_intro + "\n".join(parts), "\n".join(scripts)
+
+
+def render_dashboard(
+    stats_base: dict[str, float],
+    ticket_medio: float,
+    conversao_funil: float,
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    out_path: str | None = None,
+    full_period_train: bool = False,
+    daily_pack: dict[str, Any] | None = None,
+    blend_top_k: int = 6,
+    random_seed: int = 42,
+) -> str:
+    """
+    por_horizonte[h]['qtd']: resultados de previsão de quantidade (sem alvo valor/VGV).
+    """
+    funnel = [
+        {"etapa": "Leads", "valor": int(stats_base["leads"])},
+        {"etapa": "Agendamentos", "valor": int(stats_base["agend"])},
+        {"etapa": "Visitas", "valor": int(stats_base["visit"])},
+        {"etapa": "Pastas", "valor": int(stats_base["pastas"])},
+        {"etapa": "Vendas", "valor": int(stats_base["vendas"])},
+    ]
+    funnel_json = _json_safe(funnel)
+    hoje = datetime.now().strftime("%d/%m/%Y")
+    subtreino = (
+        "Modelo final no histórico completo; ~8% finais para pesos do ensemble. Previsão: H dias após a última data."
+        if full_period_train
+        else "Métricas no bloco final (30%); modelo operacional reajustado em todo o histórico."
+    )
+    lbl_mae_grande = "MAE in-sample (100%)" if full_period_train else "MAE teste (30%)"
+    lbl_r2_grande = "R² in-sample (100%)" if full_period_train else "R² teste (30%)"
+    lbl_val_box = (
+        "Seleção ensemble (~8% final do histórico)"
+        if full_period_train
+        else "Seleção ensemble (~8% do bloco de treino 70%)"
+    )
+    lbl_graf_series = (
+        "Real vs modelo — treino (~92%) | validação (~8%) · linha vertical na separação"
+        if full_period_train
+        else "Real vs modelo — treino (70%) | teste (30%) · linha vertical na separação"
+    )
+    lbl_chart_treino = "Treino (~92%)" if full_period_train else "Treino (70%)"
+    lbl_chart_hold = "Validação (~8%)" if full_period_train else "Teste (30%)"
+    lbl_tr_js = json.dumps(lbl_chart_treino, ensure_ascii=False)
+    lbl_te_js = json.dumps(lbl_chart_hold, ensure_ascii=False)
+    lbl_modelo_esc = (
+        "Modelo escolhido (MAE na fatia final — seleção de ensemble)"
+        if full_period_train
+        else "Modelo escolhido (MAE na validação interna do treino 70%)"
+    )
+
+    tabs_html = ""
+    for i, h in enumerate(horizontes):
+        cls = "active" if i == 0 else "text-slate-600 hover:bg-white/50"
+        tabs_html += (
+            f'<button type="button" onclick="openTab(\'horizon_{h}\', this)" '
+            f'class="tab-btn {cls} px-6 py-3 rounded-xl font-bold text-sm uppercase tracking-wide">'
+            f"{h} dias</button>"
+        )
+
+    blocks = ""
+    for i, h in enumerate(horizontes):
+        ph = por_horizonte[h]
+        q = ph["qtd"]
+        active = "active" if i == 0 else ""
+
+        y_tq = _json_safe(
+            [float(x) for x in (q.get("chart_y_real") or q["y_test"])]
+        )
+        y_pq = _json_safe(
+            [float(x) for x in (q.get("chart_y_pred") or q["pred_test"])]
+        )
+        x_dates = _json_safe(q.get("chart_dates") or q["dates_test"])
+        split_q = int(q.get("chart_split_index") or 0)
+        _inames = q.get("importance_names") or []
+        _ivals = q.get("importance_vals") or []
+        imp_n = _json_safe(_inames)
+        imp_v = _json_safe([float(x) for x in _ivals])
+        has_imp = len(_inames) > 0
+
+        mv_t = q["metrics_test"]
+        mv_v = q["metrics_val"]
+
+        params_q = best_params_preview.get(h, {}).get("qtd", {})
+        params_block = (
+            f"<p class='text-sm text-slate-600 mb-2'>{lbl_modelo_esc}: "
+            f"<b class='text-slate-900'>{q['model_label']}</b> (quantidade)</p>"
+            f"<pre class='text-xs overflow-auto max-h-48 bg-slate-50 p-3 rounded-lg border'>"
+            f"{json.dumps(params_q, indent=2, ensure_ascii=False)[:4000]}"
+            f"</pre>"
+        )
+
+        pred_q = float(q["pred_ultimo_dia"])
+
+        imp_html = ""
+        imp_js = ""
+        if has_imp:
+            imp_html = f"""
+                <div class="glass-card p-6 mb-6">
+                    <h4 class="text-lg font-bold text-slate-800 mb-4">Importância de features (referência)</h4>
+                    <div id="chart_i_{h}" style="height:400px;width:100%;"></div>
+                </div>"""
+            imp_js = f"""
+                    Plotly.newPlot('chart_i_{h}', [
+                        {{ x: {imp_v}, y: {imp_n}, type: 'bar', orientation: 'h', marker: {{color: '#6366f1'}} }}
+                    ], Object.assign({{}}, layoutBase, {{yaxis: {{automargin: true, tickfont: {{size: 10}}}}, margin: {{l: 200, t: 10, b: 40}}}}), {{responsive: true}});"""
+
+        blocks += f"""
+            <div id="horizon_{h}" class="tab-content {active}">
+                <div class="max-w-2xl mx-auto mb-8">
+                    <div class="bg-gradient-to-br from-blue-600 to-indigo-800 p-8 rounded-2xl shadow-xl text-white relative overflow-hidden">
+                        <p class="text-blue-100 text-sm font-semibold mb-1">Previsão — quantidade (próx. {h} dias na série)</p>
+                        <p class="text-5xl font-black">{pred_q:,.1f} <span class="text-xl font-medium text-blue-200">unid.</span></p>
+                        <p class="text-blue-200/80 text-xs mt-3">Modelagem exclusiva de volume (XGBoost, Random Forest, Gradient Boosting, Ridge, Voting). VGV não é previsto nesta versão.</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3 mb-6 max-w-2xl mx-auto">
+                    <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm">
+                        <div class="text-slate-400 text-xs font-bold uppercase">{lbl_mae_grande} — Qtd</div>
+                        <div class="text-xl font-black text-slate-800">{mv_t['MAE']:.2f}</div>
+                    </div>
+                    <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm">
+                        <div class="text-slate-400 text-xs font-bold uppercase">{lbl_r2_grande} — Qtd</div>
+                        <div class="text-xl font-black text-indigo-600">{(mv_t['R2']*100):.1f}%</div>
+                    </div>
+                </div>
+
+                <div class="max-w-2xl mx-auto mb-6">
+                    <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                        <div class="text-slate-500 text-xs font-bold uppercase mb-1">{lbl_val_box} — Volume</div>
+                        <div class="text-sm">MAE {mv_v['MAE']:.2f} · RMSE {mv_v['RMSE']:.2f} · sMAPE {mv_v['sMAPE']:.1f}% · MAPE {mv_v['MAPE']:.1f}%</div>
+                    </div>
+                </div>
+
+                <div class="glass-card p-6 mb-6">
+                    <h4 class="text-lg font-bold text-slate-800 mb-3">Parâmetros / registo do modelo (quantidade)</h4>
+                    {params_block}
+                </div>
+
+                <div class="glass-card p-6 mb-6">
+                    <h4 class="text-lg font-bold text-slate-800 mb-4">{lbl_graf_series} — Volume</h4>
+                    <div id="chart_q_{h}" style="height:380px;width:100%;"></div>
+                </div>
+                {imp_html}
+                <script>
+                (function() {{
+                    var layoutBase = {{
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                        font: {{family: 'Plus Jakarta Sans', color: '#64748b'}},
+                        margin: {{t:52,l:50,r:20,b:60}},
+                        xaxis: {{gridcolor: '#f1f5f9', zerolinecolor: '#e2e8f0'}},
+                        yaxis: {{gridcolor: '#f1f5f9', zerolinecolor: '#e2e8f0'}},
+                        legend: {{orientation: 'h', y: -0.2}}
+                    }};
+                    var xdt = {x_dates};
+                    var splitIdxQ = {split_q};
+                    var lblTr = {lbl_tr_js};
+                    var lblTe = {lbl_te_js};
+                    function layoutTrainTest(splitIdx) {{
+                        var lo = Object.assign({{}}, layoutBase, {{
+                            xaxis: Object.assign({{}}, layoutBase.xaxis, {{tickangle: -35}})
+                        }});
+                        if (xdt.length >= 2) {{
+                            lo.xaxis = Object.assign({{}}, lo.xaxis, {{
+                                range: [xdt[0], xdt[xdt.length - 1]]
+                            }});
+                        }}
+                        if (splitIdx > 0 && splitIdx < xdt.length) {{
+                            var sd = xdt[splitIdx];
+                            lo.shapes = [{{
+                                type: 'line', xref: 'x', yref: 'paper',
+                                x0: sd, x1: sd, y0: 0, y1: 1,
+                                line: {{ color: '#64748b', width: 2, dash: '4px,3px' }}
+                            }}];
+                            var imt = Math.max(0, Math.floor(splitIdx / 2));
+                            var ime = Math.min(xdt.length - 1, splitIdx + Math.floor((xdt.length - splitIdx) / 2));
+                            lo.annotations = [
+                                {{ x: xdt[imt], y: 1.07, xref: 'x', yref: 'paper', text: lblTr, showarrow: false,
+                                  font: {{size: 11, color: '#64748b'}}, xanchor: 'center' }},
+                                {{ x: xdt[ime], y: 1.07, xref: 'x', yref: 'paper', text: lblTe, showarrow: false,
+                                  font: {{size: 11, color: '#64748b'}}, xanchor: 'center' }}
+                            ];
+                        }}
+                        return lo;
+                    }}
+                    Plotly.newPlot('chart_q_{h}', [
+                        {{ x: xdt, y: {y_tq}, name: 'Real', mode: 'lines', line: {{color: '#94a3b8', width: 2}} }},
+                        {{ x: xdt, y: {y_pq}, name: 'Modelo', mode: 'lines', line: {{color: '#6366f1', width: 2}} }}
+                    ], Object.assign({{}}, layoutTrainTest(splitIdxQ)), {{responsive: true}});
+                    {imp_js}
+                }})();
+                </script>
+            </div>
+        """
+
+    dp = daily_pack if daily_pack is not None else {}
+    n_rows = int(dp.get("n_rows") or 0)
+    n_features = int(dp.get("n_features") or 0)
+    appendix_html, appendix_scripts = _build_appendix_html(
+        horizontes,
+        por_horizonte,
+        full_period_train,
+        best_params_preview,
+        blend_top_k,
+        random_seed,
+        n_rows,
+        n_features,
+    )
+    analises_html, analises_scripts = _build_analises_pane_html(dp)
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Previsão de vendas — ML</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {{ font-family: 'Plus Jakarta Sans', sans-serif; }}
+    body {{ background: #e2e8f0; color: #0f172a; }}
+    .glass-card {{
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 1rem;
+      box-shadow: 0 4px 6px -1px rgba(15,23,42,0.08), 0 10px 24px -8px rgba(15,23,42,0.1);
+    }}
+    .tab-content {{ display: none; opacity: 0; transition: opacity 0.25s ease; }}
+    .tab-content.active {{ display: block; opacity: 1; }}
+    .tab-btn.active {{
+      background: #2563eb; color: white;
+      box-shadow: 0 4px 14px rgba(37,99,235,0.35);
+    }}
+    .section-pane {{ display: none; }}
+    .section-pane.active {{ display: block; }}
+    .sec-main-btn {{ background: #e2e8f0; color: #475569; transition: all 0.2s; }}
+    .sec-main-btn.active {{
+      background: #0f172a; color: white;
+      box-shadow: 0 4px 14px rgba(15,23,42,0.2);
+    }}
+  </style>
+</head>
+<body class="p-3 md:p-5">
+  <div class="max-w-7xl mx-auto px-1 sm:px-2">
+    <header class="glass-card p-6 mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+      <div>
+        <h1 class="text-2xl md:text-3xl font-extrabold text-slate-900">Previsão de vendas</h1>
+        <p class="text-slate-500 mt-1">{subtreino}</p>
+      </div>
+      <span class="text-sm font-semibold text-slate-600 bg-slate-100 px-4 py-2 rounded-full">{hoje}</span>
+    </header>
+
+    <div class="flex flex-wrap gap-2 mb-6 justify-center">
+      <button type="button" class="sec-main-btn active px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide"
+        data-sec="analises" onclick="openSection('analises', this)">Análises</button>
+      <button type="button" class="sec-main-btn px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide text-slate-600"
+        data-sec="previsoes" onclick="openSection('previsoes', this)">Previsão</button>
+      <button type="button" class="sec-main-btn px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide text-slate-600"
+        data-sec="apendice" onclick="openSection('apendice', this)">Apêndice</button>
+    </div>
+
+    <div id="sec-analises" class="section-pane active">
+    {analises_html}
+    </div>
+
+    <div id="sec-previsoes" class="section-pane">
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div class="glass-card p-5 border-t-4 border-slate-800">
+        <p class="text-xs font-bold text-slate-400 uppercase">Leads</p>
+        <p class="text-2xl font-black">{stats_base["leads"]:,.0f}</p>
+      </div>
+      <div class="glass-card p-5 border-t-4 border-blue-500">
+        <p class="text-xs font-bold text-slate-400 uppercase">Conversão (vendas/leads)</p>
+        <p class="text-2xl font-black">{conversao_funil:.2f}%</p>
+      </div>
+      <div class="glass-card p-5 border-t-4 border-emerald-500">
+        <p class="text-xs font-bold text-slate-400 uppercase">VGV histórico</p>
+        <p class="text-2xl font-black">R$ {stats_base["vgv"]/1e6:.1f}M</p>
+      </div>
+      <div class="glass-card p-5 border-t-4 border-amber-500">
+        <p class="text-xs font-bold text-slate-400 uppercase">Ticket médio</p>
+        <p class="text-2xl font-black">R$ {ticket_medio/1e3:,.0f}k</p>
+      </div>
+    </div>
+
+    <div class="flex justify-center mb-8">
+      <div class="inline-flex flex-wrap gap-2 bg-white border border-slate-200 p-2 rounded-2xl shadow-sm">
+        <span class="self-center text-xs font-bold text-slate-500 px-2">Horizonte:</span>
+        {tabs_html}
+      </div>
+    </div>
+
+    <div class="glass-card p-6 mb-8">
+      <h3 class="text-lg font-bold text-slate-800 mb-3">Funil agregado (volume de registros)</h3>
+      <div id="global_funnel" style="height:320px;width:100%;"></div>
+    </div>
+
+    {blocks}
+    </div>
+
+    <div id="sec-apendice" class="section-pane">
+    {appendix_html}
+    </div>
+  </div>
+
+  <script>
+    function openSection(secId, btn) {{
+      document.querySelectorAll('.section-pane').forEach(function(p) {{
+        p.classList.toggle('active', p.id === 'sec-' + secId);
+      }});
+      document.querySelectorAll('.sec-main-btn').forEach(function(b) {{
+        var on = b.getAttribute('data-sec') === secId;
+        b.classList.toggle('active', on);
+        b.classList.toggle('text-slate-600', !on);
+      }});
+      window.dispatchEvent(new Event('resize'));
+      if (typeof Plotly !== 'undefined') {{
+        setTimeout(function() {{
+          var sel = secId === 'apendice' ? '#sec-apendice' : (secId === 'analises' ? '#sec-analises' : '#sec-previsoes');
+          document.querySelectorAll(sel + ' .js-plotly-plot').forEach(function(gd) {{
+            try {{ Plotly.Plots.resize(gd); }} catch (e) {{}}
+          }});
+        }}, 120);
+      }}
+    }}
+    function openTab(tabId, el) {{
+      document.querySelectorAll('.tab-content').forEach(function(c) {{ c.classList.remove('active'); }});
+      document.querySelectorAll('.tab-btn').forEach(function(b) {{
+        b.classList.remove('active');
+        b.classList.add('text-slate-600', 'hover:bg-white/50');
+      }});
+      document.getElementById(tabId).classList.add('active');
+      el.classList.add('active');
+      el.classList.remove('text-slate-600', 'hover:bg-white/50');
+      window.dispatchEvent(new Event('resize'));
+    }}
+    var dataFunnel = {funnel_json};
+    Plotly.newPlot('global_funnel', [{{
+      type: 'funnel', y: dataFunnel.map(function(d) {{ return d.etapa; }}), x: dataFunnel.map(function(d) {{ return d.valor; }}),
+      textinfo: 'value+percent initial',
+      marker: {{ color: ['#0f172a','#3b82f6','#6366f1','#8b5cf6','#10b981'] }}
+    }}], {{
+      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+      font: {{ family: 'Plus Jakarta Sans', color: '#475569' }},
+      margin: {{ l: 120, r: 20, t: 10, b: 10 }}
+    }}, {{ responsive: true }});
+    {analises_scripts}
+    {appendix_scripts}
+  </script>
+</body>
+</html>"""
+
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+    return html
+
+
+_ROOT = Path(__file__).resolve().parent
+
+import base64
+import html
+import os
+import streamlit as st
+
+# --- Identidade visual (paridade com ficha de credenciamento Vendas RJ — aplicar_estilo) ---
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
-COR_FUNDO = "#04428f"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
 COR_TEXTO_MUTED = "#64748b"
-# Rótulos de campos (texto neutro; vermelho só no * via .ficha-star-req)
 COR_TEXTO_LABEL = "#1e293b"
-# Tom mais escuro do vermelho (gradiente do botão primário)
 COR_VERMELHO_ESCURO = "#9e0828"
+
+LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
+FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
+URL_LOGO_DIRECIONAL_FALLBACK = (
+    "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
+)
+
+BG_HERO_URL = (
+    "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab"
+    "?auto=format&fit=crop&w=1920&q=80"
+)
 
 
 def _hex_rgb_triplet(hex_color: str) -> str:
@@ -2976,2430 +4239,4199 @@ def _hex_rgb_triplet(hex_color: str) -> str:
 RGB_AZUL_CSS = _hex_rgb_triplet(COR_AZUL_ESC)
 RGB_VERMELHO_CSS = _hex_rgb_triplet(COR_VERMELHO)
 
-URL_LOGO_DIRECIONAL_EMAIL = (
-    "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
+# Cores secundárias para gráficos Plotly (identidade Direcional)
+PLOT_AZUL = COR_AZUL_ESC
+PLOT_VERMELHO = COR_VERMELHO
+PLOT_ACCENT = "#0e7490"
+PLOT_MUTED = "#64748b"
+PLOT_GRID = "#e2e8f0"
+# Fundo dos gráficos: transparente para fundir com o cartão (.block-container) no Streamlit e glass-card no HTML
+PLOTLY_PAPER_BG = "rgba(0,0,0,0)"
+PLOTLY_PLOT_BG = "rgba(0,0,0,0)"
+
+# Legenda horizontal por baixo da área de plotagem, acima do rótulo/título do eixo X
+def _plotly_legend_bottom() -> dict[str, Any]:
+    return dict(
+        orientation="h",
+        yanchor="top",
+        y=-0.11,
+        x=0.5,
+        xanchor="center",
+        font=dict(size=10),
+        bgcolor="rgba(248,250,252,0.94)",
+        bordercolor="#cbd5e1",
+        borderwidth=1,
+        title=dict(text="Séries", font=dict(size=10, color="#64748b")),
+    )
+
+
+def _plotly_layout_direcional(
+    title: str | None = None,
+    height: int | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Layout base Plotly: paleta e tipografia alinhadas à marca."""
+    lo: dict[str, Any] = {
+        "template": "plotly_white",
+        "paper_bgcolor": PLOTLY_PAPER_BG,
+        "plot_bgcolor": PLOTLY_PLOT_BG,
+        "font": dict(
+            family="Montserrat, Inter, sans-serif",
+            size=12,
+            color="#1e293b",
+        ),
+        "xaxis": dict(
+            gridcolor=PLOT_GRID,
+            zerolinecolor="#cbd5e1",
+            showline=True,
+            linecolor="#cbd5e1",
+            tickfont=dict(size=11),
+        ),
+        "yaxis": dict(
+            gridcolor=PLOT_GRID,
+            zerolinecolor="#cbd5e1",
+            showline=True,
+            linecolor="#cbd5e1",
+            tickfont=dict(size=11),
+        ),
+        "hoverlabel": dict(
+            bgcolor="#ffffff",
+            font_size=12,
+            font_family="Montserrat, Inter, sans-serif",
+            bordercolor=PLOT_GRID,
+        ),
+        "hovermode": "x unified",
+        "legend": dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.11,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
+        "margin": dict(t=56, l=56, r=52, b=118),
+    }
+    if title:
+        lo["title"] = dict(
+            text=title,
+            font=dict(size=17, color=PLOT_AZUL, family="Montserrat, sans-serif"),
+            x=0.5,
+            xanchor="center",
+        )
+    if height is not None:
+        lo["height"] = height
+    lo.update(extra)
+    return lo
+
+
+def _plotly_xaxis_range_from_dates(dates: Any) -> list[Any] | None:
+    """Intervalo [mín, máx] das datas da série para o eixo X (sem folga além do necessário)."""
+    if not dates:
+        return None
+    try:
+        s = pd.to_datetime(pd.Series(list(dates)), errors="coerce").dropna()
+        if s.empty:
+            return None
+        t0, t1 = s.min(), s.max()
+        if t0 == t1:
+            t0 = t0 - pd.Timedelta(days=1)
+            t1 = t1 + pd.Timedelta(days=1)
+        return [t0, t1]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _formulario_df_from_state() -> pd.DataFrame | None:
+    """Prioridade: *snapshot* explícito (botão na aba Formulário) → resultado ML → análises exploratórias."""
+    fs = st.session_state.get("formulario_snapshot")
+    if isinstance(fs, pd.DataFrame) and not fs.empty:
+        return fs.copy()
+    r = st.session_state.get("resultado")
+    if isinstance(r, dict):
+        df = r.get("df_formulario")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df.copy()
+    dex = st.session_state.get("dados_exploratorios")
+    if isinstance(dex, dict):
+        df = dex.get("df_formulario")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df.copy()
+    return None
+
+
+def _formulario_nf_pair_cols(fn: pd.DataFrame) -> tuple[str | None, str | None]:
+    hits = [
+        c
+        for c in fn.columns
+        if "normal" in str(c).lower() and "facilitada" in str(c).lower()
+    ]
+    prev_c = next((c for c in hits if "real" not in str(c).lower()), hits[0] if hits else None)
+    real_c = next((c for c in hits if "real" in str(c).lower()), None)
+    return prev_c, real_c
+
+
+def _formulario_map_columns(fn: pd.DataFrame) -> dict[str, Any]:
+    m: dict[str, Any] = {}
+    m["ref"] = find_column_any(
+        fn,
+        [
+            ["data", "referencia", "sabado"],
+            ["referencia", "sabado"],
+            ["data", "referencia"],
+        ],
+    )
+    m["empreendimento"] = find_column_any(
+        fn,
+        [["empreendimento", "previsto"], ["empreendimento"], ["previsto", "ter", "venda"]],
+    )
+    m["regional"] = find_column_any(fn, [["regional", "imob"], ["regional"]])
+    m["canal"] = find_column(fn, ["canal"])
+    m["regiao"] = find_column(fn, ["regiao"])
+    m["imobiliaria"] = find_column(fn, ["imobiliaria"])
+    m["gerente"] = find_column(fn, ["gerente"])
+    m["erro"] = find_column(fn, ["erro", "previs"])
+    m["vendas_prev"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if (
+            "vendas" in lc
+            and ("previs" in lc or "previst" in lc)
+            and "real" not in lc
+            and "qtd" not in lc
+            and "vgv" not in lc
+        ):
+            m["vendas_prev"] = c
+            break
+    m["vendas_real"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vendas" in lc and "real" in lc and "qtd" not in lc and "vgv" not in lc:
+            m["vendas_real"] = c
+            break
+    m["vgv_prev"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vgv" in lc and ("previs" in lc or "previst" in lc) and "real" not in lc:
+            m["vgv_prev"] = c
+            break
+    m["vgv_real"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vgv" in lc and "real" in lc:
+            m["vgv_real"] = c
+            break
+    used_q: set[str] = set()
+    m["q_fac_p"] = _find_formulario_qtd_col(
+        fn, [["facilitadas", "previstas"], ["facilitada", "prevista"]], used=used_q
+    )
+    m["q_fac_r"] = _find_formulario_qtd_col(
+        fn,
+        [["facilitadas", "reais"], ["facilitadas", "real"], ["facilitada", "real"]],
+        used=used_q,
+    )
+    m["q_norm_p"] = _find_formulario_qtd_col(
+        fn, [["normais", "previstas"], ["normal", "prevista"]], used=used_q
+    )
+    m["q_norm_r"] = _find_formulario_qtd_col(
+        fn, [["normais", "reais"], ["normais", "real"], ["normal", "real"]], used=used_q
+    )
+    m["nf_prev"], m["nf_real"] = _formulario_nf_pair_cols(fn)
+    m["visitas"] = find_column_any(fn, [["visitas", "totais", "esperadas"], ["visitas"]])
+    return m
+
+
+def _formulario_canon_canal(x: Any) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "(vazio)"
+    s = str(x).strip().lower()
+    if not s or s == "nan":
+        return "(vazio)"
+    if "imob" in s:
+        return "IMOB"
+    if "dv" in s:
+        return "DV RJ" if "rj" in s else "DV"
+    return str(x).strip()[:32]
+
+
+def _formulario_num_series(df: pd.DataFrame, col: str | None) -> pd.Series:
+    if not col or col not in df.columns:
+        return pd.Series(0.0, index=df.index, dtype=float)
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+
+def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
+    """Limiares de divisão no eixo da *feature* 0 (ilustração 1D de árvore de decisão)."""
+    try:
+        tr = tree_reg.tree_
+        out: list[float] = []
+        stack = [0]
+        while stack:
+            node = int(stack.pop())
+            left = int(tr.children_left[node])
+            if left == -1:
+                continue
+            if int(tr.feature[node]) == 0:
+                th = float(tr.threshold[node])
+                if np.isfinite(th):
+                    out.append(th)
+            stack.append(int(tr.children_right[node]))
+            stack.append(left)
+        return sorted(set(out))
+    except Exception:
+        return []
+
+
+# --- Decisões automáticas (sem input do utilizador) ---
+# Top-K legado (relatório HTML / apêndice); o treino de quantidade é só prevhtml (competição fixa).
+BLEND_TOP_K_FIXO = 6
+RANDOM_SEED = 42
+# Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
+TRAIN_FRAC_FIXO = 0.7
+# Holdout final nas métricas do relatório (mais fiável que 100% in-sample).
+FULL_PERIOD_TRAIN_FIXO = False
+# tqdm nas etapas longas (build master, STL). Desative com PREVISAO_HIDE_TQDM=1.
+SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in (
+    "1",
+    "true",
+    "yes",
 )
 
-# Logos na raiz (mesma pasta deste .py ou raiz do repositório) — upload manual
-LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
-FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
+# Horizontes H (soma nos próximos H dias no índice) disponíveis na UI.
+HORIZONTES_PREVISAO_DISPONIVEIS: tuple[int, int, int] = (3, 7, 30)
+
+
+def normalize_horizontes_previsao(selecionados: list[int]) -> list[int]:
+    """Valida e ordena subconjunto de {3, 7, 30}; exige pelo menos um valor."""
+    allow = {3, 7, 30}
+    out = sorted({int(x) for x in selecionados if int(x) in allow})
+    if not out:
+        raise ValueError(
+            "Selecione pelo menos um horizonte entre 3, 7 e 30 dias."
+        )
+    return out
+
+
+def _chaves_horizonte_em_por_h(por_h: dict[Any, Any]) -> list[int]:
+    """Chaves inteiras de `por_h` (exclui 'custom' e similares)."""
+    return sorted(k for k in por_h if isinstance(k, int))
+
+
+def _configure_streamlit_progress() -> None:
+    """Reduz bufferização da saída e força flush nas barras tqdm (Streamlit / terminal)."""
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+    try:
+        import tqdm.std as _tqdm_std
+
+        if getattr(_tqdm_std.tqdm, "_pv_flush_patched", False):
+            return
+        _orig_update = _tqdm_std.tqdm.update
+
+        def _update_flush(self: Any, n: int = 1) -> Any:
+            r = _orig_update(self, n)
+            try:
+                fp = getattr(self, "fp", None)
+                if fp is not None and hasattr(fp, "flush"):
+                    fp.flush()
+            except Exception:
+                pass
+            return r
+
+        _tqdm_std.tqdm.update = _update_flush  # type: ignore[method-assign]
+        _tqdm_std.tqdm._pv_flush_patched = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+DEFAULT_SPREADSHEET_IDS: dict[str, str] = {
+    "formulario_previsao": "1lBliB3AjR5vJyRy9SoDi6DQOA9x5LC5wYfNNo5cz0bE",
+    "vendas": "1jb6bYBAlslele2V1CTUVHPNR55SJEiRojN1jGX3gJ4w",
+    "pastas": "1GC6GQytaDhjVslJ7seNBRfuE9QKulOU8dCeZsDPy0_g",
+    "leads": "1w-htBl8UxwqgFU1bspweBLW54-mzJwFBkcYC0Qib5Wk",
+    "agendamentos": "1TE0J29jxASqd3MbgV6Frwn3kAzlCDf5gzX3I_tmVy1Y",
+}
+
+CSV_GID_HINTS: dict[str, list[str]] = {
+    "formulario_previsao": ["155389951", "0"],
+    "agendamentos": ["1490757093", "0"],
+    "vendas": ["0"],
+    "pastas": ["0"],
+    "leads": ["0"],
+}
 
 
 def _resolver_png_raiz(nome: str) -> Path | None:
-    """Procura o PNG na pasta do app e na pasta pai (raiz do repo no Streamlit Cloud)."""
-    for base in (_DIR_APP, _DIR_APP.parent):
+    for base in (_ROOT, _ROOT.parent):
         p = base / nome
+        if p.is_file():
+            return p
+    for name in ("logo_direcional.png", "logo.png"):
+        p = _ROOT / "assets" / name
         if p.is_file():
             return p
     return None
 
 
-BASE_URL_CONTACT_VIEW = "https://direcional.lightning.force.com/lightning/r/Contact"
-
-# Recursos exibidos no popup pós-cadastro (corretor)
-URL_LINKTREE_MARKETING = "https://linktr.ee/comercialdirecionalrj"
-URL_FORM_SIMULADOR = "https://forms.gle/NLibApxbaimEbdBEA"
-URL_YOUTUBE_SIMULADOR = "https://youtu.be/dE42s0g7K-c"
-URL_YOUTUBE_SIMULADOR_EMBED = "https://www.youtube.com/embed/dE42s0g7K-c"
-URL_DIRI_ACADEMY = "https://diriacademy.skore.io/login"
-URL_SALESFORCE_VENDAS = "https://direcional.my.site.com/vendas"
-URL_WHATSAPP_EQUIPE = "https://chat.whatsapp.com/KnZg4Zax3Z20viB7XEWvmo"
-
-# Mesmos links do popup — reutilizados no e-mail automático de boas-vindas.
-LINKS_POS_CADASTRO: list[tuple[str, str]] = [
-    ("Materiais de marketing (Linktree)", URL_LINKTREE_MARKETING),
-    ("Pedir acesso ao simulador de negociação", URL_FORM_SIMULADOR),
-    ("Vídeo — como usar o simulador (YouTube)", URL_YOUTUBE_SIMULADOR),
-    ("Treinamentos — Diri Academy", URL_DIRI_ACADEMY),
-    ("Salesforce (portal de vendas)", URL_SALESFORCE_VENDAS),
-    ("Entrar no grupo — WhatsApp", URL_WHATSAPP_EQUIPE),
-]
-
-# Texto institucional do e-mail automático (apresentação + materiais de vendas).
-_APRESENTACAO_DIRECIONAL_PLAIN = (
-    "A Direcional Engenharia é uma das principais empresas de incorporação e construção do Brasil, "
-    "com histórico de entregas, foco em qualidade e relacionamento transparente com clientes e parceiros. "
-    "Na operação Direcional Vendas Rio de Janeiro, você integra nossa rede comercial com acesso a "
-    "materiais, treinamentos e ferramentas para atuar com nossos empreendimentos."
-)
-
-# Popup pós-cadastro: mesma altura do minimapa e do iframe do YouTube (largura 100% do diálogo)
-POPUP_MAPA_ALTURA_PX = 320
-
-TAB_LABELS: dict[str, str] = {
-    "Informações para contato": "Informações de contato",
-    "Dados Pessoais": "Pessoais",
-    "Dados de Usuário": "Usuário",
-    "Dados para Contato": "Contato",
-    "Dados Familiares": "Família",
-    "Dados Bancários Pessoa Física": "Bancário PF",
-    "CRECI/TTI": "CRECI",
-    "Dados Integração": "Integração",
-    "Preferência de contato": "Preferências",
-}
-
-
-def _tab_label(sec: str) -> str:
-    return TAB_LABELS.get(sec, sec[:28])
-
-
-def _url_contact(cid: str) -> str:
-    return f"{BASE_URL_CONTACT_VIEW}/{cid}/view"
-
-
-def _somente_digitos(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
-
-
-def _aplicar_secrets_sf():
+def _logo_url_secrets() -> str | None:
     try:
-        if hasattr(st, "secrets") and "salesforce" in st.secrets:
-            sec = st.secrets["salesforce"]
-            if sec.get("USER"):
-                os.environ["SALESFORCE_USER"] = str(sec["USER"]).strip()
-            if sec.get("PASSWORD"):
-                os.environ["SALESFORCE_PASSWORD"] = str(sec["PASSWORD"]).strip()
-            if sec.get("TOKEN"):
-                os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"]).strip()
-            os.environ.pop("SF_RECORD_TYPE_ID", None)
-            for rt_key in ("RECORD_TYPE_ID", "record_type_id", "RECORD_TYPE_CORRETOR"):
-                rt = str(sec.get(rt_key) or "").strip()
-                if rt and rt.lower() not in ("omit", "none", "false", "-", "0"):
-                    os.environ["SF_RECORD_TYPE_ID"] = rt
-                    break
+        b = st.secrets.get("branding")
+        if isinstance(b, dict):
+            u = (b.get("LOGO_URL") or "").strip()
+            if u:
+                return u
     except Exception:
         pass
+    return None
 
 
-def _credenciais_salesforce_ok() -> bool:
-    u = (os.environ.get("SALESFORCE_USER") or "").strip()
-    p = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
-    t = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
-    return bool(u and p and t)
+def _exibir_logo_topo() -> None:
+    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
+    url = _logo_url_secrets()
+    try:
+        if path:
+            ext = path.suffix.lower().lstrip(".")
+            mime = "image/png" if ext == "png" else "image/jpeg"
+            b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+            src = f"data:{mime};base64,{b64}"
+        elif url:
+            src = html.escape(url)
+        else:
+            src = html.escape(URL_LOGO_DIRECIONAL_FALLBACK)
+        st.markdown(
+            f'<div class="pv-logo-wrap"><img src="{src}" alt="Direcional Engenharia" /></div>',
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        st.markdown(
+            f'<div class="pv-logo-wrap"><img src="{html.escape(URL_LOGO_DIRECIONAL_FALLBACK)}" alt="Direcional" /></div>',
+            unsafe_allow_html=True,
+        )
 
 
-def aplicar_estilo():
-    bg_url = (
-        "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab"
-        "?auto=format&fit=crop&w=1920&q=80"
-    )
+def inject_css() -> None:
+    """CSS alinhado à ficha Vendas RJ (`aplicar_estilo`): gradiente global, cartão vidro, tipografia Montserrat+Inter."""
     st.markdown(
         f"""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&family=Inter:wght@400;500;600;700&display=swap');
-        @keyframes fichaFadeIn {{
-            from {{ opacity: 0; transform: translateY(18px); }}
-            to {{ opacity: 1; transform: translateY(0); }}
-        }}
-        @keyframes fichaShimmer {{
-            0% {{ background-position: 0% 50%; }}
-            100% {{ background-position: 200% 50%; }}
-        }}
-        html, body {{
-            font-family: 'Inter', sans-serif;
-            color: {COR_TEXTO_LABEL};
-            background: transparent !important;
-            background-color: transparent !important;
-        }}
-        /* Degradê + imagem no app inteiro: o header fica acima do stAppViewContainer; se só o container
-           tiver fundo, o topo fica branco. Com fundo no stApp, o header 100% transparente mostra o mesmo visual. */
-        .stApp,
-        [data-testid="stApp"] {{
-            background:
-                linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
-                url("{bg_url}") center / cover no-repeat !important;
-            background-attachment: scroll !important;
-            background-color: transparent !important;
-        }}
-        [data-testid="stAppViewContainer"] {{
-            background: transparent !important;
-            background-color: transparent !important;
-        }}
-        /* Cabeçalho e barra (share, GitHub, estrela, lápis): totalmente transparentes — sem tarja branca do tema */
-        header[data-testid="stHeader"],
-        [data-testid="stHeader"] {{
-            background: transparent !important;
-            background-color: transparent !important;
-            background-image: none !important;
-            border: none !important;
-            box-shadow: none !important;
-            backdrop-filter: none !important;
-            -webkit-backdrop-filter: none !important;
-        }}
-        [data-testid="stHeader"] > div,
-        [data-testid="stHeader"] header {{
-            background: transparent !important;
-            background-color: transparent !important;
-            background-image: none !important;
-            box-shadow: none !important;
-        }}
-        [data-testid="stDecoration"] {{
-            background: transparent !important;
-            background-color: transparent !important;
-        }}
-        [data-testid="stSidebar"] {{ display: none !important; }}
-        [data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
-        [data-testid="stToolbar"] {{
-            background: transparent !important;
-            background-color: transparent !important;
-            background-image: none !important;
-            border: none !important;
-            border-radius: 0 !important;
-            box-shadow: none !important;
-            color: rgba(255, 255, 255, 0.92) !important;
-        }}
-        [data-testid="stToolbar"] button,
-        [data-testid="stToolbar"] a {{
-            color: rgba(255, 255, 255, 0.92) !important;
-            background: transparent !important;
-            background-color: transparent !important;
-        }}
-        [data-testid="stHeader"] button {{
-            background: transparent !important;
-            background-color: transparent !important;
-        }}
-        [data-testid="stToolbar"] svg {{
-            fill: currentColor !important;
-            color: inherit !important;
-        }}
-        [data-testid="stToolbar"] svg path[stroke] {{
-            stroke: currentColor !important;
-        }}
-        [data-testid="stToolbar"] button:hover,
-        [data-testid="stToolbar"] a:hover,
-        [data-testid="stHeader"] button:hover {{
-            background: rgba(255, 255, 255, 0.12) !important;
-        }}
-        /* Área principal: topo/base mais compactos para a box não “flutuar” com margem excessiva */
-        [data-testid="stMain"] {{
-            padding-left: clamp(14px, 5vw, 56px) !important;
-            padding-right: clamp(14px, 5vw, 56px) !important;
-            padding-top: clamp(12px, 3.5vh, 40px) !important;
-            padding-bottom: clamp(14px, 4vh, 44px) !important;
-            box-sizing: border-box !important;
-        }}
-        section.main > div {{
-            padding-top: 0.25rem !important;
-            padding-bottom: 0.35rem !important;
-        }}
-        .block-container {{
-            max-width: 920px !important;
-            margin-left: auto !important;
-            margin-right: auto !important;
-            margin-top: clamp(4px, 1vh, 14px) !important;
-            margin-bottom: clamp(4px, 1vh, 14px) !important;
-            padding: 1.45rem 2.25rem 1.55rem 2.25rem !important;
-            background: rgba(255, 255, 255, 0.97) !important;
-            backdrop-filter: blur(14px) saturate(1.2);
-            -webkit-backdrop-filter: blur(14px) saturate(1.2);
-            border-radius: 24px !important;
-            border: 1px solid rgba(255, 255, 255, 0.85) !important;
-            box-shadow:
-                0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
-                0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.22),
-                inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
-            animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
-        }}
-        h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
-        .ficha-logo-wrap {{
-            text-align: center;
-            padding: 0.1rem 0 0.45rem 0;
-        }}
-        .ficha-logo-wrap img {{
-            max-height: 72px;
-            width: auto;
-            max-width: min(280px, 85vw);
-            height: auto;
-            object-fit: contain;
-            display: inline-block;
-            vertical-align: middle;
-        }}
-        .ficha-hero-stack {{
-            width: 100%;
-            max-width: 100%;
-            margin-bottom: 0.35rem;
-            box-sizing: border-box;
-        }}
-        .ficha-hero {{
-            text-align: center;
-            padding: 0.5rem 0 0 0;
-            margin: 0 auto 0 auto;
-            max-width: 640px;
-            animation: fichaFadeIn 0.85s cubic-bezier(0.22, 1, 0.36, 1) 0.1s both;
-        }}
-        .ficha-hero .ficha-title {{
-            font-family: 'Montserrat', sans-serif;
-            font-size: clamp(1.35rem, 3.5vw, 1.75rem);
-            font-weight: 900;
-            color: {COR_AZUL_ESC};
-            margin: 0;
-            line-height: 1.25;
-            letter-spacing: -0.02em;
-        }}
-        .ficha-hero .ficha-sub {{
-            color: #475569;
-            font-size: 0.95rem;
-            margin: 0.45rem 0 0 0;
-            line-height: 1.45;
-        }}
-        /* Linha animada: largura total; margem igual acima/abaixo para ficar ao centro entre subtítulo e texto introdutório. */
-        .ficha-hero-bar-wrap {{
-            width: 100%;
-            max-width: 100%;
-            margin: clamp(0.85rem, 2.4vw, 1.2rem) 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        .ficha-intro {{
-            width: 100%;
-            max-width: 100%;
-            margin: 0 0 0.35rem 0;
-            padding: 0 0 0.35rem 0;
-            box-sizing: border-box;
-            text-align: justify;
-            text-justify: inter-word;
-            hyphens: auto;
-            -webkit-hyphens: auto;
-            color: #334155;
-            font-size: 0.95rem;
-            line-height: 1.55;
-        }}
-        .ficha-intro strong {{
-            font-weight: 600;
-            color: #1e293b;
-        }}
-        /* Rótulos de campo: texto neutro; só o * em vermelho (.ficha-star-req) */
-        .ficha-input-label {{
-            font-size: 0.875rem;
-            font-weight: 600;
-            color: {COR_TEXTO_LABEL};
-            margin: 0 0 0.35rem 0;
-            line-height: 1.45;
-        }}
-        .ficha-star-req {{
-            color: {COR_VERMELHO} !important;
-            font-weight: 800;
-            margin-left: 0.12em;
-        }}
-        /* Widgets Streamlit: rótulos visíveis não herdam azul da marca */
-        [data-testid="stWidgetLabel"] label,
-        [data-testid="stWidgetLabel"] p,
-        [data-testid="stWidgetLabel"] {{
-            color: {COR_TEXTO_LABEL} !important;
-        }}
-        div[data-testid="stTextInput"] label,
-        div[data-testid="stTextArea"] label,
-        div[data-testid="stSelectbox"] label,
-        div[data-testid="stMultiSelect"] label,
-        div[data-testid="stCheckbox"] label {{
-            color: {COR_TEXTO_LABEL} !important;
-        }}
-        /* Honeypot: campo após #ficha-hp-anchor (não preencher) */
-        #ficha-hp-anchor ~ div [data-testid="stTextInput"] {{
-            position: absolute !important;
-            left: -9999px !important;
-            width: 1px !important;
-            height: 1px !important;
-            overflow: hidden !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-        }}
-        .ficha-hero-bar {{
-            height: 4px;
-            width: 100%;
-            margin: 0;
-            border-radius: 999px;
-            background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
-            background-size: 200% 100%;
-            animation: fichaShimmer 4s ease-in-out infinite alternate;
-        }}
-        /* Barra de etapas do formulário: vermelho → azul Direcional (substitui st.progress). */
-        .ficha-etapas-progress {{
-            width: 100%;
-            margin: 0 0 0.65rem 0;
-        }}
-        .ficha-etapas-progress-track {{
-            height: 8px;
-            background: rgba(226, 232, 240, 0.95);
-            border-radius: 999px;
-            overflow: hidden;
-            border: 1px solid rgba({RGB_AZUL_CSS}, 0.08);
-        }}
-        .ficha-etapas-progress-fill {{
-            height: 100%;
-            min-width: 0;
-            border-radius: 999px;
-            background: linear-gradient(90deg, {COR_VERMELHO} 0%, {COR_AZUL_ESC} 100%);
-            transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);
-            box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.12);
-        }}
-        /* Container com borda (st.container(border=True)) — reforço visual opcional */
-        [data-testid="stVerticalBlockBorderWrapper"] {{
-            border-radius: 16px !important;
-        }}
-        .section-card {{
-            border: 1px solid rgba(226, 232, 240, 0.95);
-            background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
-            border-radius: 16px;
-            padding: 1.1rem 1.35rem 1rem 1.35rem;
-            margin-bottom: 1.15rem;
-            box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.06);
-            transition: box-shadow 0.35s ease, transform 0.35s ease;
-            animation: fichaFadeIn 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
-        }}
-        .section-card:hover {{
-            box-shadow: 0 8px 24px -6px rgba({RGB_AZUL_CSS}, 0.12);
-            transform: translateY(-1px);
-        }}
-        .section-head {{
-            font-family: 'Montserrat', sans-serif;
-            font-size: 0.78rem;
-            color: {COR_AZUL_ESC};
-            text-align: center;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            font-weight: 800;
-            margin-bottom: 0.85rem;
-            padding-bottom: 0.55rem;
-            border-bottom: 2px solid #e8eef5;
-        }}
-        div[data-baseweb="input"] {{
-            border-radius: 10px !important;
-            border: 1px solid #e2e8f0 !important;
-            background-color: {COR_INPUT_BG} !important;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
-        }}
-        div[data-baseweb="input"]:focus-within {{
-            border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
-            box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
-        }}
-        .stButton > button {{
-            border-radius: 12px !important;
-            transition: transform 0.2s ease, box-shadow 0.2s ease !important;
-        }}
-        .stButton > button:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px -6px rgba({RGB_AZUL_CSS}, 0.25) !important;
-        }}
-        .stButton button[kind="primary"] {{
-            background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
-            color: #ffffff !important;
-            border: none !important;
-            font-weight: 700 !important;
-        }}
-        /* Link botão — WhatsApp (verde marca #25D366) */
-        a[href*="whatsapp.com"],
-        a[href*="wa.me"] {{
-            background-color: #25D366 !important;
-            color: #ffffff !important;
-            border: 1px solid #1ebe57 !important;
-            border-radius: 12px !important;
-            font-weight: 600 !important;
-            text-decoration: none !important;
-            box-shadow: 0 2px 8px rgba(37, 211, 102, 0.35) !important;
-        }}
-        a[href*="whatsapp.com"]:hover,
-        a[href*="wa.me"]:hover {{
-            background-color: #20bd5a !important;
-            border-color: #1aa34a !important;
-            color: #ffffff !important;
-            box-shadow: 0 4px 14px rgba(37, 211, 102, 0.45) !important;
-        }}
-        /* Alertas nativos Streamlit: forçar paleta Direcional (sem verde/azul claro/vermelho pastel) */
-        div[data-testid="stAlert"] {{
-            border-radius: 14px !important;
-            border: 2px solid {COR_AZUL_ESC} !important;
-            background: #ffffff !important;
-            box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1) !important;
-        }}
-        div[data-testid="stAlert"] p,
-        div[data-testid="stAlert"] span,
-        div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"],
-        div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] * {{
-            color: {COR_AZUL_ESC} !important;
-        }}
-        div[data-testid="stAlert"] svg {{
-            fill: {COR_AZUL_ESC} !important;
-            color: {COR_AZUL_ESC} !important;
-        }}
-        /* Alertas customizados (substituem st.success/warning/info na maior parte do app) */
-        .ficha-alert {{
-            border-radius: 14px;
-            padding: 14px 16px;
-            margin: 0 0 12px 0;
-            font-size: 0.95rem;
-            line-height: 1.55;
-            box-sizing: border-box;
-        }}
-        .ficha-alert--azul {{
-            border: 2px solid {COR_AZUL_ESC};
-            background: #ffffff;
-            color: {COR_AZUL_ESC};
-            box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1);
-        }}
-        .ficha-alert--azul strong {{
-            color: {COR_AZUL_ESC};
-        }}
-        .ficha-alert--vermelho {{
-            border: 2px solid {COR_VERMELHO};
-            background: #ffffff;
-            color: {COR_AZUL_ESC};
-            box-shadow: 0 2px 12px rgba({RGB_VERMELHO_CSS}, 0.12);
-        }}
-        .ficha-alert--vermelho strong {{
-            color: {COR_VERMELHO};
-        }}
-        .ficha-alert a {{
-            color: {COR_AZUL_ESC} !important;
-            font-weight: 600;
-        }}
-        .ficha-final-status-row {{
-            display: flex;
-            align-items: flex-start;
-            gap: 1.1rem;
-            margin: 0 0 1.1rem 0;
-        }}
-        .ficha-final-badge {{
-            flex-shrink: 0;
-            width: 52px;
-            height: 52px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.5rem;
-            font-weight: 800;
-            color: #ffffff;
-            line-height: 1;
-            font-family: 'Montserrat', sans-serif;
-        }}
-        .ficha-final-badge--ok {{
-            background: #16a34a;
-            box-shadow: 0 4px 16px rgba(22, 163, 74, 0.35);
-        }}
-        .ficha-final-badge--erro {{
-            background: {COR_VERMELHO};
-            box-shadow: 0 4px 16px rgba({RGB_VERMELHO_CSS}, 0.35);
-        }}
-        .ficha-final-text {{
-            flex: 1;
-            min-width: 0;
-            padding-top: 0.15rem;
-        }}
-        .ficha-final-title {{
-            font-family: 'Montserrat', sans-serif;
-            font-size: 1.35rem;
-            font-weight: 800;
-            color: #0f172a;
-            margin: 0;
-            line-height: 1.25;
-        }}
-        .ficha-final-msg {{
-            margin: 0.55rem 0 0 0;
-            font-size: 0.98rem;
-            line-height: 1.55;
-            color: #334155;
-        }}
-        .ficha-final-detalhe {{
-            margin: 0.75rem 0 0 0;
-            font-size: 0.88rem;
-            line-height: 1.45;
-            color: #64748b;
-            word-break: break-word;
-        }}
-        .footer {{
-            text-align: center;
-            padding: 0.85rem 0 0.35rem 0;
-            color: #64748b;
-            font-size: 0.82rem;
-        }}
-        div[data-testid="stMarkdown"] p {{ color: #334155; line-height: 1.55; }}
-        /* Player YouTube: mesma largura do mapa (100% do diálogo); altura definida inline = POPUP_MAPA_ALTURA_PX */
-        .ficha-popup-video-wrap {{
-            width: 100%;
-            max-width: 100%;
-            margin: 0.5rem 0 1rem 0;
-            border-radius: 12px;
-            overflow: hidden;
-            border: 1px solid #e2e8f0;
-            background: #0f172a;
-            box-shadow: 0 4px 14px rgba({RGB_AZUL_CSS}, 0.12);
-            box-sizing: border-box;
-        }}
-        iframe.ficha-popup-video {{
-            width: 100%;
-            height: 100%;
-            min-height: 0;
-            border: none;
-            display: block;
-        }}
-        </style>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&family=Inter:wght@400;500;600;700&display=swap');
+@keyframes fichaFadeIn {{
+  from {{ opacity: 0; transform: translateY(18px); }}
+  to {{ opacity: 1; transform: translateY(0); }}
+}}
+@keyframes fichaShimmer {{
+  0% {{ background-position: 0% 50%; }}
+  100% {{ background-position: 200% 50%; }}
+}}
+:root {{
+  --pv-content-max: min(1320px, 98vw);
+}}
+html, body {{
+  font-family: 'Inter', sans-serif;
+  color: {COR_TEXTO_LABEL};
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+.stApp,
+[data-testid="stApp"] {{
+  background:
+    linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
+    url("{BG_HERO_URL}") center / cover no-repeat !important;
+  background-attachment: scroll !important;
+  background-color: transparent !important;
+}}
+[data-testid="stAppViewContainer"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+header[data-testid="stHeader"],
+[data-testid="stHeader"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}}
+[data-testid="stHeader"] > div,
+[data-testid="stHeader"] header {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}}
+[data-testid="stDecoration"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stSidebar"] {{ display: none !important; }}
+[data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
+[data-testid="stToolbar"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  color: rgba(255, 255, 255, 0.92) !important;
+}}
+[data-testid="stToolbar"] button,
+[data-testid="stToolbar"] a {{
+  color: rgba(255, 255, 255, 0.92) !important;
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stHeader"] button {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stToolbar"] svg {{
+  fill: currentColor !important;
+  color: inherit !important;
+}}
+[data-testid="stToolbar"] svg path[stroke] {{
+  stroke: currentColor !important;
+}}
+[data-testid="stToolbar"] button:hover,
+[data-testid="stToolbar"] a:hover,
+[data-testid="stHeader"] button:hover {{
+  background: rgba(255, 255, 255, 0.12) !important;
+}}
+/* Tabelas HTML (ex.: Introdução): ocupam toda a largura útil do cartão */
+.pv-fullbleed-table-wrap {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 0 1rem 0 !important;
+  box-sizing: border-box;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}}
+.pv-fullbleed-table-wrap table {{
+  width: 100% !important;
+  border-collapse: collapse;
+  table-layout: auto;
+}}
+.pv-fullbleed-table-wrap th,
+.pv-fullbleed-table-wrap td {{
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}}
+/* Dataframes Streamlit: mesma largura útil (evita coluna estreita no cartão largo) */
+div[data-testid="stDataFrame"],
+div[data-testid="stDataFrame"] > div,
+div[data-testid="stDataFrameResizable"] {{
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+}}
+[data-testid="stMain"] {{
+  padding-left: clamp(2px, 0.9vw, 14px) !important;
+  padding-right: clamp(2px, 0.9vw, 14px) !important;
+  padding-top: clamp(12px, 3.5vh, 40px) !important;
+  padding-bottom: clamp(14px, 4vh, 44px) !important;
+  box-sizing: border-box !important;
+  background: transparent !important;
+}}
+section.main > div {{
+  padding-top: 0.25rem !important;
+  padding-bottom: 0.35rem !important;
+}}
+.block-container {{
+  max-width: var(--pv-content-max) !important;
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  margin-top: clamp(4px, 1vh, 14px) !important;
+  margin-bottom: clamp(4px, 1vh, 14px) !important;
+  padding: 1rem clamp(0.5rem, 1.6vw, 1.1rem) 1.1rem clamp(0.5rem, 1.6vw, 1.1rem) !important;
+  background: rgba(255, 255, 255, 0.97) !important;
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border-radius: 18px !important;
+  border: 1px solid rgba(255, 255, 255, 0.85) !important;
+  box-shadow:
+    0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
+    0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+  animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}}
+div[data-testid="stHorizontalBlock"] {{
+  width: 100% !important;
+}}
+h1, h2, h3 {{
+  font-family: 'Montserrat', sans-serif !important;
+  color: {COR_AZUL_ESC} !important;
+  text-align: center;
+}}
+h4, h5, h6 {{
+  font-family: 'Montserrat', sans-serif !important;
+  color: {COR_AZUL_ESC} !important;
+  text-align: center !important;
+}}
+.katex-display {{
+  margin-left: auto !important;
+  margin-right: auto !important;
+}}
+.pv-section-title {{
+  text-align: center !important;
+  display: block;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 800;
+  color: {COR_AZUL_ESC};
+  font-size: 1.05rem;
+  margin-top: 0.85rem;
+  margin-bottom: 0.5rem;
+  text-justify: auto !important;
+  hyphens: none !important;
+}}
+.pv-interpret-wrap {{
+  max-width: 100%;
+  margin: 0.35rem auto 0.85rem auto;
+  padding: 0 0.15rem;
+  box-sizing: border-box;
+  text-align: center;
+}}
+.pv-interpret-title {{
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 700;
+  font-size: 0.92rem;
+  color: {COR_AZUL_ESC};
+  margin: 0.4rem 0 0.25rem 0;
+  text-align: center !important;
+}}
+.pv-interpret-text {{
+  font-size: 0.86rem;
+  color: #475569 !important;
+  line-height: 1.5;
+  margin: 0 0 0.5rem 0;
+  text-align: center !important;
+  text-justify: none !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"] p.pv-interpret-title,
+[data-testid="stMarkdownContainer"] p.pv-interpret-text {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+div[data-testid="stTabs"] {{
+  margin-top: 0.4rem;
+  margin-bottom: 0.65rem;
+}}
+div[data-testid="stTabs"] [data-baseweb="tab-list"] {{
+  gap: 8px;
+  background: transparent;
+  border-bottom: 2px solid #e2e8f0;
+  padding-bottom: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+}}
+div[data-testid="stTabs"] button[data-baseweb="tab"] {{
+  border-radius: 12px 12px 0 0 !important;
+  font-family: 'Montserrat', sans-serif !important;
+  font-weight: 600 !important;
+  font-size: 0.9rem !important;
+  color: {COR_TEXTO_MUTED} !important;
+  background: #f1f5f9 !important;
+  border: 1px solid #e2e8f0 !important;
+  padding: 0.45rem 0.85rem !important;
+}}
+div[data-testid="stTabs"] [aria-selected="true"] {{
+  color: #ffffff !important;
+  background: linear-gradient(180deg, {COR_AZUL_ESC} 0%, #063572 100%) !important;
+  border-color: rgba({RGB_AZUL_CSS}, 0.45) !important;
+}}
+[data-testid="stDialog"] {{
+  border-radius: 20px !important;
+  border: 2px solid rgba({RGB_AZUL_CSS}, 0.2) !important;
+}}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li {{
+  color: #334155 !important;
+  line-height: 1.55;
+  text-align: justify;
+  text-justify: inter-word;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+}}
+[data-testid="stMarkdownContainer"] p.pv-section-title,
+[data-testid="stMarkdownContainer"] p.pv-hero-title,
+[data-testid="stMarkdownContainer"] p.pv-hero-sub,
+[data-testid="stMarkdownContainer"] p.pv-foot,
+[data-testid="stMarkdownContainer"] .pv-hero-block,
+[data-testid="stMarkdownContainer"] .pv-foot-wrap {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"]:has(.pv-hero-block),
+[data-testid="stMarkdownContainer"]:has(.pv-foot-wrap) {{
+  text-align: center !important;
+  width: 100% !important;
+  max-width: 100% !important;
+}}
+[data-testid="stMarkdownContainer"] h1,
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3,
+[data-testid="stMarkdownContainer"] h4,
+[data-testid="stMarkdownContainer"] h5,
+[data-testid="stMarkdownContainer"] h6 {{
+  text-align: center !important;
+}}
+[data-testid="stMetric"] {{
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  text-align: center !important;
+}}
+[data-testid="stMetric"] [data-testid="stMarkdownContainer"] p {{
+  text-align: center !important;
+  text-justify: auto !important;
+}}
+[data-testid="stMetric"] label,
+[data-testid="stMetric"] [data-testid="stMetricLabel"] {{
+  text-align: center !important;
+  justify-content: center !important;
+}}
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] p {{
+  text-align: justify;
+  text-justify: inter-word;
+}}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] * {{
+  color: #475569 !important;
+}}
+/* Legenda sob métricas (Análises): matriz diária — centrada */
+[data-testid="stMarkdownContainer"] p.pv-caption-center {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+  color: #475569 !important;
+  font-size: 0.875rem !important;
+  line-height: 1.5 !important;
+  margin: 0.35rem auto 0.85rem auto !important;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}}
+[data-testid="stMarkdownContainer"]:has(p.pv-caption-center) {{
+  text-align: center !important;
+  width: 100% !important;
+  max-width: 100% !important;
+}}
+[data-testid="stWidgetLabel"] label,
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] {{
+  color: {COR_TEXTO_LABEL} !important;
+}}
+div[data-testid="stTextInput"] label,
+div[data-testid="stTextArea"] label,
+div[data-testid="stSelectbox"] label,
+div[data-testid="stMultiSelect"] label,
+div[data-testid="stCheckbox"] label {{
+  color: {COR_TEXTO_LABEL} !important;
+}}
+div[data-testid="stExpander"] {{
+  background: rgba(255, 255, 255, 0.98) !important;
+  border: 1px solid #e2e8f0 !important;
+  border-radius: 16px !important;
+}}
+div[data-testid="stExpander"] summary {{
+  color: #0f172a !important;
+}}
+div[data-testid="stAlert"] {{
+  border-radius: 14px !important;
+  border: 2px solid {COR_AZUL_ESC} !important;
+  background: #ffffff !important;
+  box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1) !important;
+}}
+div[data-testid="stAlert"] p,
+div[data-testid="stAlert"] span,
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"],
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] * {{
+  color: {COR_AZUL_ESC} !important;
+}}
+div[data-testid="stAlert"] svg {{
+  fill: {COR_AZUL_ESC} !important;
+  color: {COR_AZUL_ESC} !important;
+}}
+[data-testid="stVerticalBlockBorderWrapper"] {{
+  border-radius: 16px !important;
+}}
+[data-testid="stDataFrame"],
+[data-testid="stDataFrame"] > div {{
+  background: #ffffff !important;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid {COR_BORDA};
+}}
+[data-testid="stPlotlyChart"],
+[data-testid="stPlotlyChart"] > div,
+[data-testid="stPlotlyChart"] .js-plotly-plot,
+[data-testid="stPlotlyChart"] .plot-container {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+div[data-baseweb="input"] {{
+  border-radius: 10px !important;
+  border: 1px solid #e2e8f0 !important;
+  background-color: {COR_INPUT_BG} !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}}
+div[data-baseweb="input"]:focus-within {{
+  border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
+  box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
+}}
+.stButton > button,
+div[data-testid="stButton"] > button {{
+  border-radius: 12px !important;
+  transition: transform 0.2s ease, box-shadow 0.2s ease !important;
+}}
+.stButton > button:hover,
+div[data-testid="stButton"] > button:hover {{
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px -6px rgba({RGB_AZUL_CSS}, 0.25) !important;
+}}
+/* Botão primário (vermelho): texto e filhos em branco (Streamlit usa p/span e baseButton-primary). */
+.stButton > button[kind="primary"],
+.stButton > button[data-testid="baseButton-primary"],
+div[data-testid="stButton"] > button[kind="primary"],
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] {{
+  background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
+  color: #ffffff !important;
+  border: none !important;
+  font-weight: 700 !important;
+  font-family: 'Montserrat', sans-serif !important;
+  border-radius: 12px !important;
+  padding: 0.65rem 2rem !important;
+  min-height: 3rem !important;
+  font-size: 1rem !important;
+  letter-spacing: 0.02em;
+}}
+.stButton > button[kind="primary"] p,
+.stButton > button[kind="primary"] span,
+.stButton > button[data-testid="baseButton-primary"] p,
+.stButton > button[data-testid="baseButton-primary"] span,
+div[data-testid="stButton"] > button[kind="primary"] p,
+div[data-testid="stButton"] > button[kind="primary"] span,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] p,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] span {{
+  color: #ffffff !important;
+}}
+.stButton > button[kind="primary"]:hover,
+.stButton > button[kind="primary"]:focus,
+.stButton > button[kind="primary"]:focus-visible,
+.stButton > button[kind="primary"]:active,
+.stButton > button[data-testid="baseButton-primary"]:hover,
+.stButton > button[data-testid="baseButton-primary"]:focus,
+.stButton > button[data-testid="baseButton-primary"]:focus-visible,
+.stButton > button[data-testid="baseButton-primary"]:active,
+div[data-testid="stButton"] > button[kind="primary"]:hover,
+div[data-testid="stButton"] > button[kind="primary"]:focus,
+div[data-testid="stButton"] > button[kind="primary"]:focus-visible,
+div[data-testid="stButton"] > button[kind="primary"]:active,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:focus,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:focus-visible,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:active {{
+  color: #ffffff !important;
+  box-shadow: 0 8px 22px -6px rgba({RGB_VERMELHO_CSS}, 0.45) !important;
+}}
+.stButton > button[kind="primary"]:hover p,
+.stButton > button[kind="primary"]:hover span,
+.stButton > button[data-testid="baseButton-primary"]:hover p,
+.stButton > button[data-testid="baseButton-primary"]:hover span,
+div[data-testid="stButton"] > button[kind="primary"]:hover p,
+div[data-testid="stButton"] > button[kind="primary"]:hover span,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover p,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover span {{
+  color: #ffffff !important;
+}}
+a[href*="whatsapp.com"],
+a[href*="wa.me"] {{
+  background-color: #25D366 !important;
+  color: #ffffff !important;
+  border: 1px solid #1ebe57 !important;
+  border-radius: 12px !important;
+  font-weight: 600 !important;
+}}
+.ficha-alert {{
+  border-radius: 14px;
+  padding: 14px 16px;
+  margin: 0 0 12px 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  box-sizing: border-box;
+}}
+.ficha-alert--azul {{
+  border: 2px solid {COR_AZUL_ESC};
+  background: #ffffff;
+  color: {COR_AZUL_ESC};
+  box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1);
+}}
+.ficha-alert--vermelho {{
+  border: 2px solid {COR_VERMELHO};
+  background: #ffffff;
+  color: {COR_AZUL_ESC};
+  box-shadow: 0 2px 12px rgba({RGB_VERMELHO_CSS}, 0.12);
+}}
+/* Bloco do título principal: ocupa a largura e centra texto (evita herdar alinhamento do Streamlit) */
+.pv-hero-block {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+  box-sizing: border-box !important;
+  text-align: center !important;
+  display: block !important;
+}}
+.pv-hero-block p {{
+  text-align: center !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}}
+[data-testid="element-container"]:has(.pv-hero-block),
+[data-testid="stVerticalBlock"] [data-testid="stMarkdownContainer"]:has(.pv-hero-block) {{
+  width: 100% !important;
+  max-width: 100% !important;
+}}
+.pv-logo-wrap, .ficha-logo-wrap {{
+  text-align: center;
+  padding: 0.1rem 0 0.45rem 0;
+}}
+.pv-logo-wrap img, .ficha-logo-wrap img {{
+  max-height: 72px;
+  width: auto;
+  max-width: min(280px, 85vw);
+  height: auto;
+  object-fit: contain;
+  display: inline-block;
+  vertical-align: middle;
+}}
+.pv-hero-title, .ficha-title {{
+  font-family: 'Montserrat', sans-serif;
+  font-size: clamp(1.35rem, 3.5vw, 1.75rem);
+  font-weight: 900;
+  color: {COR_AZUL_ESC};
+  text-align: center;
+  margin: 0;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}}
+.pv-hero-sub, .ficha-sub {{
+  text-align: center;
+  color: #475569;
+  font-size: 0.95rem;
+  margin: 0.45rem 0 0 0;
+  line-height: 1.45;
+}}
+.pv-bar-wrap, .ficha-hero-bar-wrap {{
+  width: 100%;
+  max-width: 100%;
+  margin: clamp(0.85rem, 2.4vw, 1.2rem) 0;
+  padding: 0;
+  box-sizing: border-box;
+}}
+.pv-bar, .ficha-hero-bar {{
+  height: 4px;
+  width: 100%;
+  margin: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
+  background-size: 200% 100%;
+  animation: fichaShimmer 4s ease-in-out infinite alternate;
+}}
+.pv-status-pill {{
+  display: inline-block;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 0.85rem;
+}}
+.pv-status-ok {{ background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }}
+.pv-status-warn {{ background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }}
+div.metric-card {{
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+  border-radius: 16px;
+  padding: 1.1rem 1.35rem 1rem 1.35rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.06);
+  border-left: 3px solid {COR_AZUL_ESC};
+  transition: box-shadow 0.35s ease, transform 0.35s ease;
+  animation: fichaFadeIn 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+  text-align: center;
+}}
+div.metric-card:hover {{
+  box-shadow: 0 8px 24px -6px rgba({RGB_AZUL_CSS}, 0.12);
+  transform: translateY(-1px);
+}}
+div.metric-card h4 {{
+  font-family: 'Montserrat', sans-serif;
+  color: {COR_TEXTO_MUTED};
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 800;
+  margin: 0 0 0.35rem 0;
+  text-align: center;
+}}
+div.metric-card .val {{
+  color: #0f172a;
+  font-size: 1.28rem;
+  font-weight: 800;
+  font-family: 'Montserrat', sans-serif;
+  text-align: center;
+}}
+.stDownloadButton > button {{
+  border-radius: 12px !important;
+  border: 2px solid {COR_AZUL_ESC} !important;
+  color: {COR_AZUL_ESC} !important;
+  font-weight: 600 !important;
+}}
+.pv-foot-wrap {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 auto !important;
+  text-align: center !important;
+  display: block !important;
+  box-sizing: border-box !important;
+}}
+.pv-foot, .footer {{
+  text-align: center !important;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.85rem 0 0.35rem 0;
+  color: {COR_TEXTO_MUTED};
+  font-size: 0.82rem;
+  margin: 1rem auto 0 auto;
+  border-top: 1px solid {COR_BORDA};
+}}
+</style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _md_bold_to_html(s: str) -> str:
-    """Converte trechos **texto** em <strong>; o restante é escapado para HTML."""
-    if "**" not in s:
-        return html.escape(s)
-    parts: list[str] = []
-    i = 0
-    while i < len(s):
-        j = s.find("**", i)
-        if j == -1:
-            parts.append(html.escape(s[i:]))
-            break
-        parts.append(html.escape(s[i:j]))
-        k = s.find("**", j + 2)
-        if k == -1:
-            parts.append(html.escape(s[j:]))
-            break
-        parts.append(f"<strong>{html.escape(s[j + 2 : k])}</strong>")
-        i = k + 2
-    return "".join(parts)
-
-
-def _alert_azul(msg: str) -> None:
-    """Aviso informativo — borda e ênfase azul Direcional (COR_AZUL_ESC)."""
-    st.markdown(
-        f'<div class="ficha-alert ficha-alert--azul">{_md_bold_to_html(msg)}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def _alert_vermelho(msg: str) -> None:
-    """Alerta de atenção — borda vermelha Direcional (COR_VERMELHO), texto azul escuro."""
-    st.markdown(
-        f'<div class="ficha-alert ficha-alert--vermelho">{_md_bold_to_html(msg)}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def _alert_vermelho_html(inner_html: str) -> None:
-    """Como _alert_vermelho, com HTML já montado (trechos dinâmicos escapados pelo chamador)."""
-    st.markdown(
-        f'<div class="ficha-alert ficha-alert--vermelho">{inner_html}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def _render_status_final_tela(*, sucesso: bool, mensagem: str, detalhe_html: str = "") -> None:
-    """Bolinha verde ✓ + «Sucesso» ou bolinha vermelha ✕ + «Erro», com texto abaixo."""
-    if sucesso:
-        badge = (
-            '<span class="ficha-final-badge ficha-final-badge--ok" title="Sucesso" aria-hidden="true">✓</span>'
-        )
-        titulo = "Sucesso"
-    else:
-        badge = (
-            '<span class="ficha-final-badge ficha-final-badge--erro" title="Erro" aria-hidden="true">✕</span>'
-        )
-        titulo = "Erro"
-    msg_esc = html.escape(mensagem)
-    extra = f'<div class="ficha-final-detalhe">{detalhe_html}</div>' if detalhe_html else ""
-    st.markdown(
-        f'<div class="ficha-final-status-row">{badge}'
-        f'<div class="ficha-final-text">'
-        f'<p class="ficha-final-title">{html.escape(titulo)}</p>'
-        f'<p class="ficha-final-msg">{msg_esc}</p>{extra}'
-        f"</div></div>",
-        unsafe_allow_html=True,
-    )
-
-
-def _logo_arquivo_local() -> str | None:
-    p_topo = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
-    if p_topo:
-        return str(p_topo)
-    for name in ("logo_direcional.png", "logo_direcional.jpg", "logo_direcional.jpeg", "logo.png"):
-        p = _DIR_APP / "assets" / name
-        if p.is_file():
-            return str(p)
-    return None
-
-
-def _logo_url_secrets() -> str | None:
+def _merge_spreadsheet_config_from_google_sheets(
+    ids: dict[str, str], hints: dict[str, list[str]]
+) -> None:
+    """IDs e *hints* opcionais dentro de `[google_sheets]` (mesmo padrão da Ficha: uma secção só)."""
     try:
-        if hasattr(st, "secrets"):
-            b = st.secrets.get("branding")
-            if isinstance(b, dict):
-                u = (b.get("LOGO_URL") or "").strip()
-                if u:
-                    return u
+        gs = st.secrets.get("google_sheets")
+    except Exception:
+        return
+    if not isinstance(gs, dict):
+        return
+    for k, v in gs.items():
+        kl = str(k).strip().lower()
+        if kl in _GOOGLE_SHEETS_RESERVED_LOWER:
+            continue
+        if k in ids and str(v).strip():
+            ids[k] = str(v).strip()
+    sid_map = gs.get("spreadsheet_ids")
+    if isinstance(sid_map, dict):
+        for k, v in dict(sid_map).items():
+            if k in ids:
+                ids[k] = str(v).strip()
+    sh_map = gs.get("sheets")
+    if isinstance(sh_map, dict):
+        for k, v in dict(sh_map).items():
+            if k not in ids:
+                continue
+            if isinstance(v, (list, tuple)) and len(v) >= 1:
+                ids[k] = str(v[0]).strip()
+                if len(v) >= 2:
+                    g = str(v[1]).strip()
+                    cur = hints.get(k, [])
+                    hints[k] = [g] + [x for x in cur if x != g]
+    gh = gs.get("csv_gid_hints")
+    if isinstance(gh, dict):
+        for k, v in dict(gh).items():
+            if k in hints and isinstance(v, list):
+                hints[k] = [str(x) for x in v]
+
+
+def _data_source_config() -> tuple[dict[str, str], dict[str, list[str]]]:
+    ids = dict(DEFAULT_SPREADSHEET_IDS)
+    hints = {k: list(v) for k, v in CSV_GID_HINTS.items()}
+    try:
+        _merge_spreadsheet_config_from_google_sheets(ids, hints)
+        if "spreadsheet_ids" in st.secrets:
+            for k, v in dict(st.secrets["spreadsheet_ids"]).items():
+                if k in ids:
+                    ids[k] = str(v).strip()
+        if "sheets" in st.secrets:
+            for k, v in dict(st.secrets["sheets"]).items():
+                if k not in ids:
+                    continue
+                if isinstance(v, (list, tuple)) and len(v) >= 1:
+                    ids[k] = str(v[0]).strip()
+                    if len(v) >= 2:
+                        g = str(v[1]).strip()
+                        cur = hints.get(k, [])
+                        hints[k] = [g] + [x for x in cur if x != g]
+        if "csv_gid_hints" in st.secrets:
+            for k, v in dict(st.secrets["csv_gid_hints"]).items():
+                if k in hints and isinstance(v, list):
+                    hints[k] = [str(x) for x in v]
     except Exception:
         pass
-    return None
+    return ids, hints
 
 
-def _logo_url_drive_por_id_arquivo() -> str | None:
-    """URL de visualização pública a partir do ID do arquivo no Drive (variável de ambiente)."""
-    fid = (os.environ.get("DIRECIONAL_LOGO_FILE_ID") or "").strip()
-    if len(fid) < 10:
-        return None
-    return f"https://drive.google.com/uc?export=view&id={fid}"
-
-
-def _exibir_logo_topo() -> None:
-    """Logo centralizada no topo: arquivo em assets/, ou LOGO_URL, ou ID do arquivo no Drive."""
-    path = _logo_arquivo_local()
-    url = _logo_url_secrets() or _logo_url_drive_por_id_arquivo()
-    try:
-        if path:
-            ext = Path(path).suffix.lower().lstrip(".")
-            mime = "image/png" if ext == "png" else "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
-            with open(path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            st.markdown(
-                f'<div class="ficha-logo-wrap"><img src="data:{mime};base64,{b64}" alt="Direcional" /></div>',
-                unsafe_allow_html=True,
-            )
-            return
-        if url:
-            st.markdown(
-                f'<div class="ficha-logo-wrap"><img src="{html.escape(url)}" alt="Direcional" /></div>',
-                unsafe_allow_html=True,
-            )
-    except Exception:
-        pass
-
-
-def _cabecalho_pagina(*, com_intro_formulario: bool = False) -> None:
-    _exibir_logo_topo()
-    intro = ""
-    if com_intro_formulario:
-        intro = (
-            '<p class="ficha-intro" lang="pt-BR">Você está a poucos passos de dar sequência ao seu credenciamento com a gente. '
-            "<strong>Reserve alguns minutos</strong>, tenha seus documentos à mão e vá preenchendo com tranquilidade — "
-            "use <strong>Avançar</strong> e <strong>Voltar</strong> para navegar. Na última etapa, confirme os dados e envie.</p>"
-        )
-    st.markdown(
-        f'<div class="ficha-hero-stack">'
-        f'<div class="ficha-hero">'
-        f'<p class="ficha-title">Seja bem-vindo à Direcional Vendas RJ</p>'
-        f'<p class="ficha-sub">Seu próximo passo começa aqui — '
-        f'<strong>vamos conhecer você melhor</strong> para seguir com o credenciamento.</p>'
-        f"</div>"
-        f'<div class="ficha-hero-bar-wrap" aria-hidden="true">'
-        f'<div class="ficha-hero-bar"></div>'
-        f"</div>"
-        f"{intro}"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _nomes_conta_coluna_gerentes_cached(
+@st.cache_data(ttl=180, show_spinner=False)
+def _load_one_role_cached(
+    sa_fp: str,
     spreadsheet_id: str,
-    worksheet_gerentes: str,
-    coluna_nome_conta: str,
-    creds_json: str,
-) -> tuple[str, ...]:
-    """Cache por planilha/aba/coluna/credencial (JSON estável) — evita ler a aba a cada rerun."""
-    try:
-        creds = json.loads(creds_json)
-        nomes = listar_nomes_conta_aba_gerentes(
-            spreadsheet_id,
-            creds,
-            worksheet_name=worksheet_gerentes,
-            column_header=coluna_nome_conta,
-        )
-        return tuple(nomes)
-    except Exception:
-        return tuple()
+    role_key: str,
+    hints_tuple: tuple[str, ...],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    # Sempre tenta API se as credenciais existirem (não depender de use_sa calculado fora do cache).
+    gc = gspread_client_from_streamlit()
+    return load_role_dataframe(
+        gc,
+        spreadsheet_id,
+        role_key,
+        csv_gid_hints=list(hints_tuple) if hints_tuple else None,
+    )
 
 
-def _opcoes_nome_conta() -> list[str]:
-    """
-    Opções do select «Nome da conta»: valores únicos da coluna **Nome da Conta** na aba **Gerentes**
-    da mesma planilha Google (Secrets [google_sheets]). Se a leitura falhar ou vier vazia,
-    usa [ficha_defaults] account_names / account_name ou NOMES_CONTA_FIXOS.
-    """
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
-    if creds:
-        gs: dict[str, Any] = {}
-        if hasattr(st, "secrets"):
-            try:
-                gs = dict(st.secrets.get("google_sheets", {}))
-            except Exception:
-                gs = {}
-        sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)).strip()
-        ws_g = str(
-            gs.get("GERENTES_WORKSHEET")
-            or gs.get("gerentes_worksheet")
-            or DEFAULT_GERENTES_WORKSHEET
-        ).strip() or DEFAULT_GERENTES_WORKSHEET
-        col_nc = str(
-            gs.get("NOME_CONTA_COLUMN")
-            or gs.get("nome_conta_column")
-            or DEFAULT_COL_NOME_CONTA
-        ).strip() or DEFAULT_COL_NOME_CONTA
+def build_data_bundle() -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, Any]], bool]:
+
+    ids, hints = _data_source_config()
+    gc = gspread_client_from_streamlit()
+    use_sa = gc is not None
+    sa_fp = _sa_fingerprint_for_cache()
+    json_ok = (
+        service_account_info_from_streamlit_secrets() is not None
+        or _service_account_info_from_env() is not None
+    )
+
+    out: dict[str, pd.DataFrame] = {}
+    metas: dict[str, dict[str, Any]] = {}
+    mapping = [
+        ("leads", "leads"),
+        ("agendamentos", "agendamentos"),
+        ("pastas", "pastas"),
+        ("vendas", "vendas"),
+        ("formulario_previsao", "formulario_previsao"),
+    ]
+    errors: list[str] = []
+    for key, cfg_key in mapping:
+        human = ROLE_LABELS.get(cfg_key, cfg_key)
+        sid = ids[cfg_key]
+        htuple = tuple(hints.get(cfg_key, []))
         try:
-            creds_json = json.dumps(creds, sort_keys=True)
-        except (TypeError, ValueError):
-            creds_json = "{}"
-        tupla = _nomes_conta_coluna_gerentes_cached(sid, ws_g, col_nc, creds_json)
-        if tupla:
-            return list(tupla)
-
-    fd = _ficha_defaults_de_secrets()
-    raw = fd.get("account_names")
-    if isinstance(raw, list) and raw:
-        return [str(x).strip() for x in raw if str(x).strip()]
-    one = str(fd.get("account_name", "")).strip()
-    if one:
-        return [one]
-    return list(NOMES_CONTA_FIXOS)
-
-
-def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
-    """Se o rótulo termina com ' *', devolve texto sem o asterisco e True."""
-    s = (label or "").rstrip()
-    if s.endswith(" *"):
-        return s[:-2].rstrip(), True
-    return label, False
-
-
-def _coerce_date_widget_value(val: Any) -> Optional[date]:
-    """Converte valor do session_state para `date` compatível com st.date_input."""
-    if val is None:
-        return None
-    if isinstance(val, datetime):
-        return val.date()
-    if isinstance(val, date):
-        return val
-    iso = parse_data_br(val)
-    if not iso:
-        return None
-    try:
-        return datetime.strptime(iso, "%Y-%m-%d").date()
-    except ValueError:
-        return None
-
-
-def _widget_campo(c: dict):
-    k = c["key"]
-    sk = f"fld_{k}"
-    label = c["label"]
-    help_txt = c.get("help")
-    tipo = c["tipo"]
-
-    plain, obrig = _label_obrigatorio_partes(label)
-    lv = "collapsed" if obrig else "visible"
-    if obrig:
-        st.markdown(
-            f'<div class="ficha-input-label">{html.escape(plain)} '
-            f'<span class="ficha-star-req" aria-hidden="true">*</span></div>',
-            unsafe_allow_html=True,
-        )
-        widget_label = f"{plain} (campo obrigatório)"
-    else:
-        widget_label = label
-
-    if tipo == "text":
-        if k == "naturalidade":
-            uf_sel = _norm_picklist(st.session_state.get("fld_uf_naturalidade"))
-            cap = _naturalidade_capital_por_uf(uf_sel) if uf_sel else ""
-            if cap:
-                st.session_state[sk] = cap
-            elif sk in st.session_state:
-                cur = str(st.session_state.get(sk) or "").strip()
-                if cur in CAPITAL_POR_UF_BR.values():
-                    st.session_state[sk] = ""
-            return st.text_input(
-                widget_label,
-                key=sk,
-                help=help_txt
-                or "Definida pela UF Naturalidade (capital do estado).",
-                label_visibility=lv,
-                disabled=bool(cap),
+            df, meta = _load_one_role_cached(sa_fp, sid, cfg_key, htuple)
+            out[key] = df
+            metas[cfg_key] = meta
+        except Exception as e:
+            errors.append(f"**{human}** (`{sid[:12]}…`): {e}")
+    if errors:
+        if json_ok and not use_sa:
+            modo = (
+                "**Conta de serviço:** o JSON foi reconhecido nas secrets, mas o cliente **gspread não iniciou** "
+                "(chave privada inválida, JSON truncado ou formato incorreto). Valide o ficheiro no Google Cloud Console.\n\n"
+                "Se o cliente iniciar mas a leitura falhar: ative as APIs **Google Sheets** e **Google Drive** no projeto, "
+                "e partilhe **cada** planilha com o e-mail `client_email` do JSON como **Leitor**."
             )
-        if k == "email":
-            st.markdown(
-                '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:15px;'
-                'font-weight:400;color:#334155;line-height:1.55;">'
-                'Use o e-mail corporativo: <span style="font-style:italic;color:#04428f;">'
-                "nomesobrenome.direcionalvendas@gmail.com</span></p>",
-                unsafe_allow_html=True,
-            )
-        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
-    if tipo == "textarea":
-        return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
-    if tipo == "date":
-        atual = _coerce_date_widget_value(st.session_state.get(sk))
-        if sk in st.session_state:
-            st.session_state[sk] = atual
-        if k == "birthdate":
-            # DD-MM-YYYY: ordem dia/mês/ano (BR) sem o bug visual do formato com barras (DD/MM/YYYY).
-            return st.date_input(
-                widget_label,
-                key=sk,
-                value=atual,
-                help=help_txt
-                or "Use o calendário (ícone à direita) ou digite a data em dia-mês-ano.",
-                label_visibility=lv,
-                min_value=date(1920, 1, 1),
-                max_value=date.today(),
-                format="DD-MM-YYYY",
-            )
-        return st.date_input(
-            widget_label, key=sk, value=atual, help=help_txt, label_visibility=lv
-        )
-    if tipo == "number":
-        return st.text_input(
-            widget_label,
-            key=sk,
-            help=help_txt or "Use ponto ou vírgula decimal.",
-            label_visibility=lv,
-        )
-    if tipo == "id":
-        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
-    if tipo == "select":
-        opts = c.get("opcoes") or [""]
-        if k == "account_name":
-            opts = _opcoes_nome_conta()
-            if not opts:
-                opts = list(NOMES_CONTA_FIXOS)
-        elif k == "atividade":
-            opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
-        if k == "possui_creci":
-            opts = ["Sim", "Não"]
-            return st.selectbox(
-                widget_label,
-                options=opts,
-                index=None,
-                placeholder="Selecione se possui CRECI",
-                key=sk,
-                help=help_txt,
-                label_visibility=lv,
-            )
-        cur = st.session_state.get(sk)
-        if cur is not None and cur not in opts:
-            st.session_state[sk] = opts[0]
-        return st.selectbox(widget_label, options=opts, key=sk, help=help_txt, label_visibility=lv)
-    if tipo == "multiselect":
-        opts = c.get("opcoes") or []
-        return st.multiselect(
-            widget_label, options=opts, default=[], key=sk, help=help_txt, label_visibility=lv
-        )
-    return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
-
-
-def _coletar_dados_formulario() -> dict[str, Any]:
-    """Somente chaves presentes no session_state (etapa atual + campos sem widget)."""
-    out: dict[str, Any] = {}
-    for c in CAMPOS:
-        sk = f"fld_{c['key']}"
-        out[c["key"]] = st.session_state.get(sk)
-    return out
-
-
-def _coletar_dados_formulario_completo() -> dict[str, Any]:
-    """
-    Mescla snapshot das etapas já confirmadas (ficha_snap_campos) com o session_state.
-    Necessário porque só a etapa corrente monta widgets — ao avançar, o Streamlit pode
-    remover valores das etapas anteriores do state.
-    """
-    ss = st.session_state
-    snap = dict(ss.get("ficha_snap_campos") or {})
-    out: dict[str, Any] = {}
-    for c in CAMPOS:
-        k = c["key"]
-        sk = f"fld_{k}"
-        if sk in ss:
-            out[k] = ss[sk]
-        else:
-            out[k] = snap.get(k)
-    return out
-
-
-def _snapshot_mesclar_todos_fld_do_session_state() -> None:
-    """
-    Copia todo `fld_*` ainda presente no session_state para `ficha_snap_campos`.
-    Necessário no «Enviar»: a última etapa acabou de dar submit no form; outras chaves
-    podem já ter sido removidas pelo Streamlit quando o widget desmontou — essas ficam só no snapshot
-    das etapas anteriores (já mesclado antes de apagar).
-    """
-    ss = st.session_state
-    snap = dict(ss.get("ficha_snap_campos") or {})
-    for c in CAMPOS:
-        if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
-            continue
-        sk = f"fld_{c['key']}"
-        if sk in ss:
-            snap[c["key"]] = ss[sk]
-    ss["ficha_snap_campos"] = snap
-
-
-def _snapshot_persistir_secao_atual(sec: str) -> None:
-    """Grava no snapshot os campos visíveis da etapa atual (chamar após validar «Avançar»)."""
-    ss = st.session_state
-    snap = dict(ss.get("ficha_snap_campos") or {})
-    dados = _coletar_dados_formulario_completo()
-    for c in campos_por_secao_visiveis(sec, dados):
-        k = c["key"]
-        sk = f"fld_{k}"
-        if sk in ss:
-            snap[k] = ss[sk]
-    # Renderizados fora do st.form: garantir cópia explícita no «Avançar» (mesmo critério do loop).
-    if sec == "Informações para contato" and "fld_unidade_negocio" in ss:
-        snap["unidade_negocio"] = ss["fld_unidade_negocio"]
-    if sec == "Informações para contato" and "fld_account_name_nao_sei" in ss:
-        snap["account_name_nao_sei"] = ss["fld_account_name_nao_sei"]
-    if sec == "CRECI/TTI" and "fld_possui_creci" in ss:
-        snap["possui_creci"] = ss["fld_possui_creci"]
-    ss["ficha_snap_campos"] = snap
-
-
-def _garantir_campos_secao_de_snapshot(sec: str) -> None:
-    """Ao voltar ou reabrir uma etapa, repõe fld_* a partir do snapshot se a chave sumiu."""
-    ss = st.session_state
-    snap = ss.get("ficha_snap_campos") or {}
-    dados = _coletar_dados_formulario_completo()
-    for c in campos_por_secao_visiveis(sec, dados):
-        k = c["key"]
-        sk = f"fld_{k}"
-        if sk not in ss and k in snap:
-            if k == "birthdate":
-                d = _coerce_date_widget_value(snap[k])
-                ss[sk] = d if d is not None else snap[k]
-            else:
-                ss[sk] = snap[k]
-    if sec == "Informações para contato":
-        if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
-            ss["fld_unidade_negocio"] = snap["unidade_negocio"]
-        if "fld_account_name_nao_sei" not in ss and "account_name_nao_sei" in snap:
-            ss["fld_account_name_nao_sei"] = snap["account_name_nao_sei"]
-
-
-def _ficha_defaults_de_secrets() -> dict[str, Any]:
-    """Valores fixos não exibidos no formulário — seção [ficha_defaults] nos Secrets."""
-    try:
-        d = st.secrets.get("ficha_defaults", {})
-        return dict(d) if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
-def _merge_defaults_ficha_em_dict(dados: Dict[str, Any]) -> Dict[str, Any]:
-    """Preenche campos ocultos (não exportados na aba do corretor) a partir de [ficha_defaults]."""
-    out = dict(dados)
-    fd = _ficha_defaults_de_secrets()
-    if not str(out.get("regional") or "").strip():
-        out["regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
-    if not str(out.get("status_corretor") or "").strip():
-        out["status_corretor"] = (
-            str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
-        )
-    if not str(out.get("origem") or "").strip():
-        out["origem"] = str(fd.get("origem", "RH")).strip() or "RH"
-    if not str(out.get("account_id") or "").strip():
-        out["account_id"] = str(fd.get("account_id", "")).strip()
-    if not str(out.get("owner_id") or "").strip():
-        out["owner_id"] = str(fd.get("owner_id", "")).strip()
-    return out
-
-
-def _init_defaults():
-    """Padrões Vendas RJ; regional/origem/status/ids vêm de [ficha_defaults] nos Secrets."""
-    fd = _ficha_defaults_de_secrets()
-    if "fld_regional" not in st.session_state:
-        st.session_state["fld_regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
-    if "fld_status_corretor" not in st.session_state:
-        st.session_state["fld_status_corretor"] = (
-            str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
-        )
-    if "fld_origem" not in st.session_state:
-        st.session_state["fld_origem"] = str(fd.get("origem", "RH")).strip() or "RH"
-    if "fld_account_id" not in st.session_state:
-        st.session_state["fld_account_id"] = str(fd.get("account_id", "")).strip()
-    if "fld_owner_id" not in st.session_state:
-        st.session_state["fld_owner_id"] = str(fd.get("owner_id", "")).strip()
-
-
-def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> list[str]:
-    avisos: list[str] = []
-    if payload.get("MobilePhone"):
-        return avisos
-    m = _somente_digitos(str(dados.get("mobile") or ""))
-    if len(m) >= 10:
-        payload["MobilePhone"] = m[:11]
-        return avisos
-    tipo = (dados.get("tipo_pix") or "").strip()
-    dp = str(dados.get("dados_pix") or "")
-    if tipo == "Telefone":
-        mt = _somente_digitos(dp)
-        if len(mt) >= 10:
-            payload["MobilePhone"] = mt[:11]
-            return avisos
-    return avisos
-
-
-def _nome_candidato_ficha(dados: dict[str, Any]) -> str:
-    nome = (dados.get("nome_completo") or "").strip()
-    return nome or "Candidato"
-
-
-def montar_html_email_ficha_pdf(dados: dict[str, Any]) -> str:
-    """Corpo HTML do e-mail (estilo Direcional: azul COR_AZUL_ESC, vermelho COR_VERMELHO)."""
-    nome = html.escape(_nome_candidato_ficha(dados))
-    cpf = html.escape(str(dados.get("cpf") or ""))
-    emitido = html.escape(datetime.now().strftime("%d/%m/%Y %H:%M"))
-    logo = html.escape(URL_LOGO_DIRECIONAL_EMAIL)
-    azul = COR_AZUL_ESC
-    verm = COR_VERMELHO
-    borda = COR_BORDA
-
-    linhas: list[str] = []
-    for c in CAMPOS:
-        k = c["key"]
-        val = dados.get(k)
-        if val is None or (isinstance(val, list) and len(val) == 0):
-            continue
-        if isinstance(val, str) and not val.strip():
-            continue
-        label = html.escape(c["label"])
-        if isinstance(val, list):
-            vtxt = html.escape("; ".join(str(x) for x in val))
-        else:
-            vtxt = html.escape(str(val))
-        linhas.append(
-            "<tr>"
-            f"<td style=\"padding:10px 12px;border:1px solid {borda};background:{COR_INPUT_BG};"
-            f"font-weight:600;color:{azul};font-size:13px;width:38%;\">{label}</td>"
-            f"<td style=\"padding:10px 12px;border:1px solid {borda};color:#334155;font-size:13px;\">{vtxt}</td>"
-            "</tr>"
-        )
-    if not linhas:
-        linhas.append(
-            f"<tr><td colspan=\"2\" style=\"padding:14px;color:{COR_TEXTO_MUTED};font-size:13px;\">"
-            "Nenhum dado preenchido.</td></tr>"
-        )
-    tbody = "\n".join(linhas)
-
-    return f"""<!DOCTYPE html>
-<html lang="pt-BR">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body style="margin:0;padding:24px;background:#f1f5f9;font-family:'Segoe UI',Inter,Arial,sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;">
-<tr><td align="center">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;
-box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
-<tr>
-<td align="center" style="background:{azul};padding:22px 20px;border-bottom:4px solid {verm};">
-<img src="{logo}" alt="Direcional Engenharia" width="168" style="display:block;max-width:100%;height:auto;">
-</td>
-</tr>
-<tr>
-<td style="padding:28px 24px 8px 24px;">
-<p style="margin:0 0 8px 0;font-size:18px;font-weight:700;color:{azul};text-align:center;">Ficha cadastral recebida</p>
-<p style="margin:0;font-size:14px;line-height:1.55;color:#475569;text-align:center;">
-Olá, <strong>{nome}</strong> — segue o resumo dos dados enviados. O PDF completo está em <strong>anexo</strong>.
-</p>
-<p style="margin:12px 0 0 0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">Emitido em {emitido}</p>
-</td>
-</tr>
-<tr><td style="padding:0 24px 12px 24px;">
-<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
-<tr style="background:{azul};color:#ffffff;">
-<th colspan="2" align="left" style="padding:10px 12px;font-weight:700;">Identificação</th>
-</tr>
-<tr><td style="padding:10px 12px;border:1px solid {borda};color:{azul};font-weight:600;">Nome</td>
-<td style="padding:10px 12px;border:1px solid {borda};">{nome}</td></tr>
-<tr><td style="padding:10px 12px;border:1px solid {borda};color:{azul};font-weight:600;">CPF</td>
-<td style="padding:10px 12px;border:1px solid {borda};">{cpf}</td></tr>
-</table>
-</td></tr>
-<tr><td style="padding:8px 24px 24px 24px;">
-<p style="margin:0 0 10px 0;font-size:12px;font-weight:700;color:{azul};text-transform:uppercase;letter-spacing:0.06em;">
-Dados do formulário</p>
-<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-{tbody}
-</table>
-</td></tr>
-<tr><td style="padding:16px 20px;background:{azul};text-align:center;">
-<p style="margin:0;font-size:11px;color:rgba(255,255,255,0.88);">Direcional Engenharia · Vendas Rio de Janeiro</p>
-</td></tr>
-</table>
-</td></tr>
-</table>
-</body>
-</html>"""
-
-
-def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
-    try:
-        from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-        from reportlab.lib.units import cm
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    except ImportError as e:
-        raise ImportError(
-            "Pacote 'reportlab' não encontrado. Execute: python -m pip install reportlab"
-        ) from e
-
-    def _registrar_fonte_pdf() -> str:
-        """Registra TTF com suporte a UTF-8 (acentos PT-BR). Sem TTF, usa Helvetica + cp1252 em _cell_txt."""
-        candidatos: list[str] = []
-        sysname = platform.system()
-        if sysname == "Windows":
-            w = os.environ.get("WINDIR", r"C:\Windows")
-            candidatos.extend(
-                [
-                    os.path.join(w, "Fonts", "arialuni.ttf"),
-                    os.path.join(w, "Fonts", "arial.ttf"),
-                    os.path.join(w, "Fonts", "Arial.ttf"),
-                ]
-            )
-        elif sysname == "Darwin":
-            candidatos.extend(
-                [
-                    "/Library/Fonts/Arial Unicode.ttf",
-                    "/System/Library/Fonts/Supplemental/Arial.ttf",
-                    "/Library/Fonts/Arial.ttf",
-                ]
+        elif use_sa:
+            modo = (
+                "**Conta de serviço ativa:** confirme partilha **Leitor** com o e-mail `client_email` em **todas** as planilhas "
+                "e que o ID na configuração corresponde ao livro correto."
             )
         else:
-            # Linux (Streamlit Cloud, Docker): caminhos usuais de pacotes de fontes
-            for root in ("/usr/share/fonts", "/usr/local/share/fonts"):
-                if not os.path.isdir(root):
-                    continue
-                for sub, nome in (
-                    ("truetype/dejavu", "DejaVuSans.ttf"),
-                    ("TTF", "DejaVuSans.ttf"),
-                    ("truetype/liberation", "LiberationSans-Regular.ttf"),
-                    ("truetype/noto", "NotoSans-Regular.ttf"),
-                    ("truetype/freefont", "FreeSans.ttf"),
-                ):
-                    p = os.path.join(root, sub, nome)
-                    if os.path.isfile(p):
-                        candidatos.append(p)
-        # Fonte junto ao app (deploy: copiar DejaVuSans.ttf para assets/fonts/)
-        _font_app = _DIR_APP / "assets" / "fonts" / "DejaVuSans.ttf"
-        if _font_app.is_file():
-            candidatos.insert(0, str(_font_app))
+            modo = (
+                "**Sem API:** configure `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz das secrets **ou** dentro de `[google_sheets]` "
+                "(string com o JSON completo da conta de serviço). O export CSV anónimo costuma **falhar em servidores na nuvem** "
+                "(respostas HTTP 403 ou HTML); a API é o método suportado em produção."
+            )
+        st.error("Não foi possível carregar todas as fontes.\n\n" + modo + "\n\n" + "\n\n".join(errors))
+        st.stop()
+    return out, metas, use_sa
 
-        for path in candidatos:
-            if os.path.isfile(path):
+
+def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
+    """
+    Agregados para o dossiê ML: descritivas, outliers (IQR), correlação, VIF, balanceamento.
+    Evita guardar a matriz completa no session_state.
+    """
+    if df_master is None or len(df_master) < 5:
+        return {"erro": "Série insuficiente para o dossiê estatístico."}
+    dm = df_master
+    idx = pd.DatetimeIndex(pd.to_datetime(dm.index).normalize())
+
+    core = [
+        c
+        for c in (
+            "vol_leads",
+            "vol_agend",
+            "vol_visit",
+            "vol_pastas",
+            "target_qtd",
+            "target_valor",
+        )
+        if c in dm.columns
+    ]
+    num = dm.select_dtypes(include=[np.number])
+    fb_cols = [
+        c
+        for c in num.columns
+        if str(c).startswith("fb_vgv_") or str(c).startswith("fb_qtd_")
+    ]
+    seen = set(core) | set(fb_cols)
+    cols_extra = [c for c in num.columns if c not in seen][:30]
+    focus_cols = core + fb_cols + cols_extra
+
+    rows_stats: list[dict[str, Any]] = []
+    outliers_iqr: list[dict[str, Any]] = []
+    for c in focus_cols:
+        s = pd.to_numeric(dm[c], errors="coerce").dropna()
+        if len(s) < 5:
+            continue
+        q1_f = float(s.quantile(0.25))
+        q3_f = float(s.quantile(0.75))
+        iqr = q3_f - q1_f
+        lo, hi = q1_f - 1.5 * iqr, q3_f + 1.5 * iqr
+        n_out = int(((s < lo) | (s > hi)).sum())
+        mode_v = s.mode()
+        mode_f = float(mode_v.iloc[0]) if len(mode_v) else float("nan")
+        rows_stats.append(
+            {
+                "variavel": c,
+                "n": int(len(s)),
+                "media": float(s.mean()),
+                "mediana": float(s.median()),
+                "moda": mode_f,
+                "desvio_padrao": float(s.std()),
+                "variancia": float(s.var()),
+                "min": float(s.min()),
+                "p01": float(s.quantile(0.01)),
+                "p05": float(s.quantile(0.05)),
+                "q1": q1_f,
+                "q2": float(s.quantile(0.50)),
+                "q3": q3_f,
+                "p95": float(s.quantile(0.95)),
+                "p99": float(s.quantile(0.99)),
+                "max": float(s.max()),
+                "assimetria": float(s.skew()),
+                "curtose_excesso": float(s.kurtosis()),
+            }
+        )
+        outliers_iqr.append(
+            {
+                "variavel": c,
+                "n_outliers_iqr": n_out,
+                "pct_outliers": float(100.0 * n_out / len(s)),
+            }
+        )
+
+    sub = dm[focus_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    corr_labels: list[str] = []
+    corr_z: list[list[float]] = []
+    pares_mc: list[dict[str, Any]] = []
+    if len(sub) > 2 and sub.shape[1] >= 2:
+        cm = sub.corr().fillna(0.0)
+        corr_labels = [str(x) for x in cm.columns]
+        corr_z = [
+            [float(cm.iloc[i, j]) for j in range(len(corr_labels))]
+            for i in range(len(corr_labels))
+        ]
+        for i in range(len(cm.columns)):
+            for j in range(i + 1, len(cm.columns)):
+                v = float(cm.iloc[i, j])
+                if abs(v) >= 0.85:
+                    pares_mc.append(
+                        {
+                            "a": str(cm.columns[i]),
+                            "b": str(cm.columns[j]),
+                            "r_pearson": v,
+                        }
+                    )
+        pares_mc.sort(key=lambda x: -abs(float(x["r_pearson"])))
+
+    vif_rows: list[dict[str, Any]] = []
+    try:
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        from statsmodels.tools.tools import add_constant
+
+        vif_cols = focus_cols[: min(16, len(focus_cols))]
+        Xv = dm[vif_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        Xv = Xv.loc[:, Xv.std() > 1e-12]
+        if Xv.shape[1] >= 2 and len(Xv) > Xv.shape[1] + 2:
+            Xc = add_constant(Xv.values, has_constant="add")
+            for i in range(1, Xc.shape[1]):
                 try:
-                    pdfmetrics.registerFont(TTFont("FichaPdfFont", path))
-                    return "FichaPdfFont"
+                    vi = float(variance_inflation_factor(Xc, i))
                 except Exception:
-                    continue
-        return "Helvetica"
-
-    font = _registrar_fonte_pdf()
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        rightMargin=2 * cm,
-        leftMargin=2 * cm,
-        topMargin=2 * cm,
-        bottomMargin=2 * cm,
-    )
-    styles = getSampleStyleSheet()
-    azul = colors.HexColor(COR_AZUL_ESC)
-    verm = colors.HexColor(COR_VERMELHO)
-    st_banner = ParagraphStyle(
-        name="Banner",
-        parent=styles["Normal"],
-        fontName=font,
-        fontSize=11,
-        leading=14,
-        textColor=colors.white,
-        alignment=TA_CENTER,
-        spaceAfter=0,
-    )
-    st_sub = ParagraphStyle(
-        name="Sub",
-        parent=styles["Normal"],
-        fontName=font,
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor(COR_TEXTO_MUTED),
-        alignment=TA_CENTER,
-        spaceAfter=10,
-    )
-    st_body = ParagraphStyle(name="Corpo", parent=styles["Normal"], fontName=font, fontSize=9, leading=12)
-
-    def _cell_txt(x: Any) -> str:
-        """Texto seguro para Paragraph: TTF aceita Unicode; Helvetica usa WinAnsi (cp1252) para PT-BR."""
-        s = str(x) if x is not None else ""
-        if font != "Helvetica":
-            return s
-        # Helvetica no ReportLab = WinAnsiEncoding (~cp1252): português completo, sem «?» nos acentos.
-        try:
-            return s.encode("cp1252", "replace").decode("cp1252")
-        except Exception:
-            return s
-
-    def _para_celula(s: str) -> Paragraph:
-        """Células da tabela como Paragraph (Unicode + acentos) com escape XML mínimo."""
-        t = _xml_escape_para_pdf(_cell_txt(s)).replace("\n", "<br/>")
-        return Paragraph(t, st_body)
-
-    largura = 17 * cm
-    story: list = []
-    # Cabeçalho marca (faixa azul + linha vermelha)
-    head_tbl = Table(
-        [[Paragraph(_cell_txt("FICHA CADASTRAL | DIRECIONAL VENDAS RJ"), st_banner)]],
-        colWidths=[largura],
-    )
-    head_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), azul),
-                ("TOPPADDING", (0, 0), (-1, -1), 11),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
-                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
-    story.append(head_tbl)
-    red_bar = Table([[""]], colWidths=[largura], rowHeights=[0.14 * cm])
-    red_bar.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), verm)]))
-    story.append(red_bar)
-    story.append(Spacer(1, 0.35 * cm))
-    story.append(
-        Paragraph(
-            _cell_txt(f"Emitido em: {datetime.now().strftime('%d/%m/%Y %H:%M')}"),
-            st_sub,
-        )
-    )
-    story.append(Spacer(1, 0.2 * cm))
-
-    linhas_tab: list[list[str]] = []
-    for c in CAMPOS:
-        k = c["key"]
-        val = dados.get(k)
-        if val is None or (isinstance(val, list) and len(val) == 0):
-            continue
-        if isinstance(val, str) and not val.strip():
-            continue
-        label = c["label"]
-        if isinstance(val, list):
-            vtxt = "; ".join(str(x) for x in val)
-        else:
-            vtxt = str(val)
-        linhas_tab.append([_para_celula(label), _para_celula(vtxt)])
-
-    if linhas_tab:
-        hdr_bg = colors.HexColor("#e8eef5")
-        t = Table(
-            [[_para_celula("Campo"), _para_celula("Resposta")]] + linhas_tab,
-            colWidths=[6 * cm, 11 * cm],
-        )
-        t.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), hdr_bg),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), azul),
-                    ("FONTNAME", (0, 0), (-1, -1), font),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ("FONTSIZE", (0, 0), (-1, 0), 9),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor(COR_BORDA)),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor(COR_INPUT_BG)]),
-                ]
-            )
-        )
-        story.append(t)
-    else:
-        story.append(Paragraph(_cell_txt("(Nenhum dado preenchido)"), st_body))
-
-    doc.build(story)
-    return buf.getvalue()
-
-
-def montar_corpo_email_boas_vindas(
-    dados: dict[str, Any],
-    link_contato_sf: str | None,
-    *,
-    tem_pdf_anexo: bool,
-) -> tuple[str, str]:
-    """Corpo do e-mail automático: apresentação Direcional, cadastro, materiais de vendas e PDF."""
-    nome = _nome_candidato_ficha(dados)
-    nome_esc = html.escape(nome)
-    logo = html.escape(URL_LOGO_DIRECIONAL_EMAIL)
-    azul = COR_AZUL_ESC
-    verm = COR_VERMELHO
-    borda = COR_BORDA
-
-    linhas_txt: list[str] = []
-    itens_html: list[str] = []
-    for label, url in LINKS_POS_CADASTRO:
-        linhas_txt.append(f"- {label}: {url}")
-        itens_html.append(
-            f'<li style="margin:10px 0;line-height:1.45;">'
-            f'<a href="{html.escape(url)}" style="color:{azul};font-weight:600;text-decoration:none;">'
-            f"{html.escape(label)}</a>"
-            f'<br><span style="font-size:12px;color:{COR_TEXTO_MUTED};word-break:break-all;">{html.escape(url)}</span>'
-            f"</li>"
-        )
-    if link_contato_sf:
-        linhas_txt.append(f"- Seu cadastro no Salesforce: {link_contato_sf}")
-        itens_html.append(
-            f'<li style="margin:10px 0;line-height:1.45;">'
-            f'<a href="{html.escape(link_contato_sf)}" '
-            f'style="color:{azul};font-weight:600;text-decoration:none;">'
-            f"Abrir seu cadastro no Salesforce</a></li>"
-        )
-
-    bloco_pdf_plain = (
-        "Anexamos neste e-mail o PDF da sua ficha cadastral (cópia do que você enviou pelo formulário).\n\n"
-        if tem_pdf_anexo
-        else "Não foi possível gerar o PDF automaticamente neste envio; use o popup do formulário "
-        "(após o cadastro) para baixar a cópia ou solicitar reenvio.\n\n"
-    )
-    bloco_pdf_html = (
-        f'<p style="margin:0 0 16px 0;padding:14px 16px;background:{COR_INPUT_BG};border-radius:10px;'
-        f'border-left:4px solid {verm};font-size:14px;line-height:1.55;color:#334155;">'
-        f"<strong>PDF em anexo:</strong> segue a cópia em PDF da sua ficha cadastral.</p>"
-        if tem_pdf_anexo
-        else f'<p style="margin:0 0 16px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">'
-        f"Se o PDF não estiver disponível neste e-mail, abra o <strong>popup de boas-vindas</strong> no "
-        f"formulário para baixar ou reenviar a cópia.</p>"
-    )
-
-    plain = (
-        f"Olá, {nome},\n\n"
-        "Bem-vindo(a) à Direcional Vendas Rio de Janeiro.\n\n"
-        "Recebemos o seu cadastro com sucesso. Você já está registrado(a) em nossa base — "
-        "agradecemos a confiança e o tempo dedicado.\n\n"
-        "--- A Direcional ---\n"
-        f"{_APRESENTACAO_DIRECIONAL_PLAIN}\n\n"
-        "--- Materiais e canais para sua atuação ---\n"
-        + "\n".join(linhas_txt)
-        + "\n\n"
-        + bloco_pdf_plain
-        + "No popup do formulário você também encontra o mapa de empreendimentos e o vídeo do simulador.\n\n"
-        "Direcional Engenharia · Vendas Rio de Janeiro"
-    )
-
-    apresent_esc = html.escape(_APRESENTACAO_DIRECIONAL_PLAIN)
-
-    html_body = f"""<!DOCTYPE html>
-<html lang="pt-BR">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body style="margin:0;padding:24px;background:#f1f5f9;font-family:'Segoe UI',Inter,Arial,sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;">
-<tr><td align="center">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;
-box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
-<tr>
-<td align="center" style="background:{azul};padding:22px 20px;border-bottom:4px solid {verm};">
-<img src="{logo}" alt="Direcional Engenharia" width="168" style="display:block;max-width:100%;height:auto;">
-</td>
-</tr>
-<tr>
-<td style="padding:28px 24px 8px 24px;">
-<p style="margin:0 0 8px 0;font-size:20px;font-weight:700;color:{azul};text-align:center;">
-Bem-vindo(a) à Direcional Vendas RJ</p>
-<p style="margin:0;font-size:15px;line-height:1.65;color:#475569;text-align:center;">
-Olá, <strong>{nome_esc}</strong> — <strong>seu cadastro foi recebido</strong> e você já integra nossa operação comercial.
-Obrigado(a) por escolher seguir conosco.
-</p>
-</td>
-</tr>
-<tr><td style="padding:16px 28px 8px 28px;">
-<p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">A Direcional</p>
-<p style="margin:0;font-size:14px;line-height:1.65;color:#475569;">{apresent_esc}</p>
-</td></tr>
-<tr><td style="padding:16px 28px 8px 28px;">
-<p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">Materiais e canais para vendas</p>
-<p style="margin:0 0 12px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe — os mesmos recursos do formulário.
-</p>
-<ul style="margin:0;padding-left:18px;color:#334155;font-size:14px;">
-{"".join(itens_html)}
-</ul>
-</td></tr>
-<tr><td style="padding:8px 28px 8px 28px;">
-{bloco_pdf_html}
-<p style="margin:0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-No <strong>popup de boas-vindas</strong> do formulário há também o <strong>mapa de empreendimentos</strong> e o
-<strong>vídeo</strong> do simulador (mesma experiência visual do cadastro).
-</p>
-</td></tr>
-<tr><td style="padding:20px 24px 28px 24px;border-top:1px solid {borda};">
-<p style="margin:0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">
-Direcional Engenharia · Vendas Rio de Janeiro
-</p>
-</td></tr>
-</table>
-</td></tr>
-</table>
-</body>
-</html>"""
-
-    return plain, html_body
-
-
-def _smtp_erro_amigavel(exc: BaseException) -> str:
-    """Evita exibir dict/tuple cru do Gmail (ex.: destinatário «K» inválido)."""
-    if isinstance(exc, smtplib.SMTPRecipientsRefused):
-        partes: list[str] = []
-        rec = getattr(exc, "recipients", None) or {}
-        for addr, tup in rec.items():
-            if isinstance(tup, tuple) and len(tup) >= 2:
-                cod, raw = tup[0], tup[1]
-                msg = (
-                    raw.decode("utf-8", "replace")
-                    if isinstance(raw, (bytes, bytearray))
-                    else str(raw)
-                )
-                partes.append(f"{addr}: código {cod} — {msg[:280]}")
-            else:
-                partes.append(f"{addr}: {tup}")
-        if partes:
-            return (
-                "O servidor recusou o destinatário. Confira se o **E-mail** no formulário está completo "
-                "(ex.: nome@empresa.com.br). Detalhe: " + " | ".join(partes[:2])
-            )
-    return str(exc)
-
-
-def enviar_email_boas_vindas_candidato(
-    dados: dict[str, Any],
-    pdf_bytes: bytes | None,
-    link_contato_sf: str | None,
-) -> tuple[bool, str]:
-    """Envia ao e-mail do formulário o agradecimento + links (e PDF se houver)."""
-    cfg = _get_smtp_from_secrets()
-    if not cfg or not cfg["host"] or not cfg["user"]:
-        return False, "SMTP não configurado ([ficha_email] nos Secrets)."
-
-    dest = (dados.get("email") or "").strip()
-    if not dest:
-        return False, "E-mail do candidato não informado no formulário."
-    if not email_contato_formato_valido(dest):
-        return False, "E-mail do cadastro inválido — use formato nome@dominio.com (evite abreviações como uma única letra)."
-
-    nome = _nome_candidato_ficha(dados)
-    tem_pdf = bool(pdf_bytes)
-    plain, html_body = montar_corpo_email_boas_vindas(
-        dados, link_contato_sf, tem_pdf_anexo=tem_pdf
-    )
-
-    msg = MIMEMultipart()
-    msg["Subject"] = (
-        f"Bem-vindo(a) — Direcional Vendas RJ | Ficha e materiais — {nome}"
-        if tem_pdf
-        else f"Bem-vindo(a) — Direcional Vendas RJ | Cadastro recebido — {nome}"
-    )
-    msg["From"] = cfg["from_addr"]
-    msg["To"] = dest
-
-    alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(plain, "plain", "utf-8"))
-    alt.attach(MIMEText(html_body, "html", "utf-8"))
-    msg.attach(alt)
-
-    if pdf_bytes:
-        part = MIMEApplication(pdf_bytes, _subtype="pdf")
-        part.add_header(
-            "Content-Disposition",
-            "attachment",
-            filename="ficha_cadastral_direcional_vendas_rj.pdf",
-        )
-        msg.attach(part)
-
-    try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-            server.starttls()
-            server.login(cfg["user"], cfg["password"])
-            server.sendmail(cfg["from_addr"], [dest], msg.as_string())
-        return True, "E-mail enviado (apresentação, materiais e PDF, se gerado) para o e-mail do cadastro."
-    except Exception as e:
-        return False, _smtp_erro_amigavel(e)
-
-
-def _tentar_enviar_email_boas_vindas(dados: dict[str, Any], contact_id: str | None) -> None:
-    """Dispara o e-mail automático; não interrompe o fluxo se falhar."""
-    ss = st.session_state
-    pdf_bytes: bytes | None = None
-    try:
-        pdf_bytes = gerar_pdf_ficha(dados)
+                    vi = float("nan")
+                vif_rows.append({"variavel": str(Xv.columns[i - 1]), "vif": vi})
     except Exception:
         pass
-    link = _url_contact(contact_id) if contact_id else None
-    ok, msg = enviar_email_boas_vindas_candidato(dados, pdf_bytes, link)
-    ss["ficha_email_boas_vindas_ok"] = ok
-    ss["ficha_email_boas_vindas_msg"] = msg
 
-
-def _get_smtp_from_secrets():
-    """
-    Lê [ficha_email] nos Secrets. Chaves esperadas:
-      smtp_server, smtp_port (padrão 587), sender_email, sender_password
-    Compatibilidade: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, TO_EMAIL, FROM_EMAIL.
-    Destinatário fixo opcional: to_email ou TO_EMAIL (senão use o campo na tela).
-    """
-    try:
-        s = st.secrets.get("ficha_email", {})
-        host = (s.get("smtp_server") or s.get("SMTP_HOST") or "").strip()
-        port_raw = s.get("smtp_port", s.get("SMTP_PORT", 587))
-        port = int(port_raw) if port_raw not in (None, "") else 587
-        user = (s.get("sender_email") or s.get("SMTP_USER") or "").strip()
-        password = (s.get("sender_password") or s.get("SMTP_PASSWORD") or "").strip()
-        to_fixed = (s.get("to_email") or s.get("TO_EMAIL") or "").strip()
-        if to_fixed and not email_contato_formato_valido(to_fixed):
-            to_fixed = ""
-        return {
-            "host": host,
-            "port": port,
-            "user": user,
-            "password": password,
-            "to": to_fixed,
-            "from_addr": user or (s.get("FROM_EMAIL") or "").strip(),
+    balance: dict[str, Any] = {}
+    hist_qtd: dict[str, Any] = {}
+    hist_vgv: dict[str, Any] = {}
+    if "target_qtd" in dm.columns:
+        tq = pd.to_numeric(dm["target_qtd"], errors="coerce").fillna(0.0)
+        med = float(tq.median())
+        above = int((tq > med).sum())
+        below = int((tq <= med).sum())
+        balance = {
+            "mediana_referencia": med,
+            "dias_acima_mediana": above,
+            "dias_abaixo_igual_mediana": below,
+            "proporcao_classe_minoritaria": float(min(above, below) / max(len(tq), 1)),
         }
-    except Exception:
-        return None
+        counts, edges = np.histogram(tq.to_numpy(dtype=float), bins=min(32, max(8, len(tq) // 5)))
+        hist_qtd = {
+            "counts": [int(x) for x in counts],
+            "edges": [float(x) for x in edges],
+        }
+    if "target_valor" in dm.columns:
+        tv = pd.to_numeric(dm["target_valor"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if len(tv) > 5 and np.nanmax(tv) > 0:
+            counts, edges = np.histogram(tv, bins=min(28, max(8, len(tv) // 6)))
+            hist_vgv = {
+                "counts": [int(x) for x in counts],
+                "edges": [float(x) for x in edges],
+            }
+
+    return {
+        "descritivas": rows_stats,
+        "outliers_iqr": outliers_iqr,
+        "correlation_labels": corr_labels,
+        "correlation_matrix": corr_z,
+        "pares_multicolinearidade": pares_mc[:45],
+        "vif": vif_rows,
+        "balanceamento_qtd": balance,
+        "hist_target_qtd": hist_qtd,
+        "hist_target_valor": hist_vgv,
+        "n_linhas": int(len(dm)),
+        "n_colunas": int(dm.shape[1]),
+        "primeira_data": idx.min().strftime("%Y-%m-%d"),
+        "ultima_data": idx.max().strftime("%Y-%m-%d"),
+    }
 
 
-def _email_destino_documento_identidade(st_secrets: Any) -> str:
-    """Sobrescreva em [ficha_email] IDENTIDADE_DEST_EMAIL (ou identidade_dest_email)."""
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            fe = st_secrets.get("ficha_email", {})
-            if isinstance(fe, dict):
-                for key in (
-                    "IDENTIDADE_DEST_EMAIL",
-                    "identidade_dest_email",
-                    "DOCUMENTO_IDENTIDADE_DESTINO",
-                    "documento_identidade_destino",
-                ):
-                    v = str(fe.get(key) or "").strip()
-                    if v and email_contato_formato_valido(v):
-                        return v
-    except Exception:
-        pass
-    return IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO
+def run_training_pipeline(
+    dfs: dict[str, pd.DataFrame],
+    custom_previsao: dict[str, Any] | None = None,
+    horizontes: list[int] | None = None,
+) -> tuple[
+    dict[str, float],
+    float,
+    float,
+    dict[Any, dict[str, Any]],
+    dict[Any, dict[str, dict[str, Any]]],
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
+    df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
+    dossie_ml = _build_ml_dossie_pack(df_master)
 
+    stats_base = {
+        "leads": float(df_master["vol_leads"].sum()),
+        "agend": float(df_master["vol_agend"].sum()),
+        "visit": float(df_master["vol_visit"].sum()),
+        "pastas": float(df_master["vol_pastas"].sum()),
+        "vendas": float(df_master["target_qtd"].sum()),
+        "vgv": float(df_master["target_valor"].sum()),
+    }
+    ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
+    conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
 
-def enviar_documento_identidade_por_email(
-    uploaded: Any, dados: Dict[str, Any], destinatario: str
-) -> Tuple[bool, str]:
-    """
-    Fallback: envia o documento de identidade por e-mail ([ficha_email] SMTP) quando o upload ao Drive falha.
-    """
-    cfg = _get_smtp_from_secrets()
-    if not cfg or not cfg["host"] or not cfg["user"]:
-        return False, (
-            "SMTP não configurado — adicione [ficha_email] com smtp_server, sender_email e sender_password nos Secrets."
-        )
-    to = (destinatario or "").strip()
-    if not email_contato_formato_valido(to):
-        return False, f"E-mail de destino inválido ({to!r})."
-
-    raw = uploaded.getvalue()
-    if not raw:
-        return False, "Arquivo vazio."
-
-    nome_arq = _drive_nome_arquivo_identidade(dados, getattr(uploaded, "name", "") or "")
-    mime = (getattr(uploaded, "type", None) or "").strip().lower() or "application/octet-stream"
-    if mime == "application/pdf" or nome_arq.lower().endswith(".pdf"):
-        sub = "pdf"
-    elif mime in ("image/jpeg", "image/jpg") or nome_arq.lower().endswith((".jpg", ".jpeg")):
-        sub = "jpeg"
-    elif mime == "image/png" or nome_arq.lower().endswith(".png"):
-        sub = "png"
+    if horizontes is None:
+        horizontes = list(HORIZONTES_PREVISAO_DISPONIVEIS)
     else:
-        sub = "octet-stream"
+        horizontes = normalize_horizontes_previsao(horizontes)
+    por_horizonte: dict[Any, dict[str, Any]] = {}
+    best_params_preview: dict[Any, dict[str, dict[str, Any]]] = {}
 
-    nome_cand = _nome_candidato_ficha(dados)
-    msg = MIMEMultipart()
-    msg["Subject"] = f"[Vendas RJ] Documento de identidade — {nome_cand}"
-    msg["From"] = cfg["from_addr"]
-    msg["To"] = to
+    def pack(r: Any, pred_last: float) -> dict[str, Any]:
+        return {
+            "metrics_val": r.metrics_val,
+            "metrics_test": r.metrics_test,
+            "importance_names": r.importance.index.tolist() if len(r.importance) else [],
+            "importance_vals": r.importance.values.tolist() if len(r.importance) else [],
+            "y_test": r.y_test.tolist(),
+            "pred_test": r.y_test_pred.tolist(),
+            "dates_test": [d.strftime("%Y-%m-%d") for d in r.dates_test],
+            "pred_ultimo_dia": pred_last,
+            "model_label": r.model_label,
+            "full_period_train": r.full_period_train,
+            "chart_dates": r.chart_dates,
+            "chart_y_real": r.chart_y_real,
+            "chart_y_pred": r.chart_y_pred,
+            "chart_split_index": r.chart_split_index,
+            "benchmark_appendix": r.benchmark_appendix,
+        }
 
-    corpo = (
-        "Documento de identidade enviado pelo formulário de credenciamento (Direcional Vendas RJ).\n\n"
-        f"Nome: {nome_cand}\n"
-        f"CPF: {dados.get('cpf', '')}\n"
-        f"E-mail no cadastro: {dados.get('email', '')}\n"
-        f"Celular: {dados.get('mobile', '')}\n"
+    cvals: list[Any] = []
+    if isinstance(custom_previsao, dict) and str(custom_previsao.get("mode")) != "range":
+        cvals = list(custom_previsao.get("values") or [])
+    range_mode = (
+        isinstance(custom_previsao, dict) and str(custom_previsao.get("mode")) == "range"
     )
-    msg.attach(MIMEText(corpo, "plain", "utf-8"))
+    ds_raw = (custom_previsao or {}).get("date_start") if range_mode else None
+    de_raw = (custom_previsao or {}).get("date_end") if range_mode else None
+    range_ok = range_mode and bool(ds_raw) and bool(de_raw)
+    vals_ok = isinstance(custom_previsao, dict) and not range_mode and bool(cvals)
+    have_custom = range_ok or vals_ok
+    extra_custom = 1 if have_custom else 0
+    progress = st.progress(0, text="A preparar modelos…")
+    total_steps = len(horizontes) + extra_custom
+    step = 0
 
-    part = MIMEApplication(raw, _subtype=sub)
-    part.add_header("Content-Disposition", "attachment", filename=nome_arq)
-    msg.attach(part)
+    for h in horizontes:
+        Xq, yq = build_xy_for_horizon(df_master, "target_qtd", h)
 
-    try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-            server.starttls()
-            server.login(cfg["user"], cfg["password"])
-            server.sendmail(cfg["from_addr"], [to], msg.as_string())
-        return True, ""
-    except Exception as e:
-        return False, _smtp_erro_amigavel(e)
-
-
-def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra: str | None) -> tuple[bool, str]:
-    cfg = _get_smtp_from_secrets()
-    if not cfg or not cfg["host"] or not cfg["user"]:
-        return False, (
-            "E-mail não configurado (adicione [ficha_email] com smtp_server e sender_email nos Secrets)."
+        progress.progress(
+            (step + 0.5) / total_steps,
+            text=f"Volume — {h} dias…",
         )
+        rq = train_one_target(
+            Xq,
+            yq,
+            horizon=h,
+            target_name="qtd",
+            random_state=RANDOM_SEED,
+            show_progress=SHOW_ML_PROGRESS,
+            full_period_train=FULL_PERIOD_TRAIN_FIXO,
+            train_frac=TRAIN_FRAC_FIXO,
+        )
+        step += 1
+        progress.progress(step / total_steps, text=f"Concluído H={h}d")
 
-    to_list = [cfg["to"]] if cfg["to"] else []
-    if destinatario_extra and destinatario_extra.strip():
-        to_list.append(destinatario_extra.strip())
-    if not to_list:
-        return False, "Informe um e-mail de destino no campo abaixo (ou to_email em [ficha_email], opcional)."
-    for addr in to_list:
-        if not email_contato_formato_valido(addr):
-            return False, (
-                f"E-mail de destino inválido ({addr!r}) — use formato completo nome@dominio.com."
+        pred_q = predict_last_row(df_master, rq.pipeline, h)
+
+        por_horizonte[h] = {"qtd": pack(rq, pred_q)}
+        best_params_preview[h] = {"qtd": rq.best_params}
+
+    por_custom: dict[str, Any] | None = None
+    if have_custom:
+        if range_ok:
+            d_lo = pd.Timestamp(ds_raw).normalize()
+            d_hi = pd.Timestamp(de_raw).normalize()
+            if d_hi < d_lo:
+                d_lo, d_hi = d_hi, d_lo
+            span = int((d_hi - d_lo).days) + 1
+            hz_eff = max(14, min(120, span * 2))
+            lbl = (
+                f"Soma no intervalo [{d_lo.date()} → {d_hi.date()}] "
+                "(dias da série estritamente após t)"
             )
+            Xqc, yqc = build_xy_custom_date_range(df_master, "target_qtd", d_lo, d_hi)
+            mode = "range"
+            vals: list[Any] = []
+        else:
+            mode = str((custom_previsao or {}).get("mode") or "offsets")
+            vals = list(cvals)
+            if mode == "offsets":
+                hz_eff = max(vals)
+                Xqc, yqc = build_xy_custom_offsets(df_master, "target_qtd", vals)
+                lbl = "Soma nas defasagens t+k (dias): " + ", ".join(str(v) for v in vals)
+            else:
+                hz_eff = 18
+                Xqc, yqc = build_xy_custom_dom(df_master, "target_qtd", vals)
+                lbl = "Soma nos dias do mês (estritamente após o dia corrente): " + ", ".join(
+                    str(v) for v in vals
+                )
 
-    nome = _nome_candidato_ficha(dados)
-    msg = MIMEMultipart()
-    msg["Subject"] = f"Ficha Cadastral — Direcional Vendas RJ — {nome}"
-    msg["From"] = cfg["from_addr"]
-    msg["To"] = ", ".join(to_list)
+        if len(Xqc) < 22:
+            dossie_ml["aviso_previsao_custom"] = (
+                "Cenário personalizado ignorado: menos de 22 observações válidas após alinhar o alvo."
+            )
+        else:
+            progress.progress(
+                max(0.01, (step + 0.5) / total_steps),
+                text="Cenário personalizado — volume…",
+            )
+            rqc = train_one_target(
+                Xqc,
+                yqc,
+                horizon=hz_eff,
+                target_name="qtd",
+                random_state=RANDOM_SEED,
+                show_progress=SHOW_ML_PROGRESS,
+                full_period_train=FULL_PERIOD_TRAIN_FIXO,
+                train_frac=TRAIN_FRAC_FIXO,
+            )
+            step += 1
+            progress.progress(step / total_steps, text="Cenário personalizado concluído")
+            if mode == "range":
+                pqc = predict_last_row_custom_date_range(
+                    df_master, rqc.pipeline, d_lo, d_hi
+                )
+            elif mode == "offsets":
+                pqc = predict_last_row_custom_offsets(df_master, rqc.pipeline, vals)
+            else:
+                pqc = predict_last_row_custom_dom(df_master, rqc.pipeline, vals)
+            por_custom = {
+                "label": lbl,
+                "mode": mode,
+                "values": vals,
+                "horizon_effective": hz_eff,
+                "qtd": pack(rqc, pqc),
+            }
+            if mode == "range":
+                por_custom["date_start"] = str(d_lo.date())
+                por_custom["date_end"] = str(d_hi.date())
+            best_params_preview["custom"] = {
+                "qtd": rqc.best_params,
+            }
 
-    corpo_txt = (
-        "Segue em anexo a cópia da ficha cadastral enviada pelo formulário "
-        "Ficha Cadastral | Direcional Vendas RJ.\n\n"
-        f"Nome: {nome}\n"
-        f"CPF: {dados.get('cpf', '')}\n"
+    daily_pack = _daily_pack_from_master(df_master)
+    progress.progress(1.0, text="A gerar relatório…")
+    html_out = render_dashboard(
+        stats_base,
+        ticket,
+        conv,
+        horizontes,
+        por_horizonte,
+        best_params_preview,
+        out_path=None,
+        full_period_train=FULL_PERIOD_TRAIN_FIXO,
+        daily_pack=daily_pack,
+        blend_top_k=BLEND_TOP_K_FIXO,
+        random_seed=RANDOM_SEED,
     )
-    corpo_html = montar_html_email_ficha_pdf(dados)
-    alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(corpo_txt, "plain", "utf-8"))
-    alt.attach(MIMEText(corpo_html, "html", "utf-8"))
-    msg.attach(alt)
+    return (
+        stats_base,
+        ticket,
+        conv,
+        por_horizonte,
+        best_params_preview,
+        html_out,
+        daily_pack,
+        dossie_ml,
+        por_custom,
+    )
 
-    part = MIMEApplication(pdf_bytes, _subtype="pdf")
-    part.add_header("Content-Disposition", "attachment", filename="ficha_cadastral_direcional_vendas_rj.pdf")
-    msg.attach(part)
 
+def run_analytics_only_pipeline(
+    dfs: dict[str, pd.DataFrame],
+) -> tuple[dict[str, float], float, float, dict[str, Any], dict[str, Any]]:
+    """Consolida matriz diária, *daily_pack* e dossiê EDA — sem treino de modelos preditivos."""
+    df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
+    dossie_ml = _build_ml_dossie_pack(df_master)
+    stats_base = {
+        "leads": float(df_master["vol_leads"].sum()),
+        "agend": float(df_master["vol_agend"].sum()),
+        "visit": float(df_master["vol_visit"].sum()),
+        "pastas": float(df_master["vol_pastas"].sum()),
+        "vendas": float(df_master["target_qtd"].sum()),
+        "vgv": float(df_master["target_valor"].sum()),
+    }
+    ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
+    conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
+    daily_pack = _daily_pack_from_master(df_master)
+    return stats_base, ticket, conv, daily_pack, dossie_ml
+
+
+def _streamlit_carregar_dados_exploratorios() -> None:
+    """Lê planilhas, constrói matriz diária e preenche `dados_exploratorios` (sem treino ML)."""
+    with st.spinner("A carregar e consolidar dados…"):
+        dfs_e, sheet_e, used_e = build_data_bundle()
+    st.session_state["sheet_metas"] = sheet_e
+    st.session_state["used_service_account"] = used_e
     try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-            server.starttls()
-            server.login(cfg["user"], cfg["password"])
-            server.sendmail(cfg["from_addr"], to_list, msg.as_string())
-        return True, "E-mail enviado com sucesso."
+        with st.spinner("A preparar indicadores e série diária…"):
+            sb, tk, cv, dpk, dml = run_analytics_only_pipeline(dfs_e)
+        st.session_state.dados_exploratorios = {
+            "stats_base": sb,
+            "ticket": tk,
+            "conv": cv,
+            "daily_pack": dpk,
+            "dossie_ml": dml,
+            "sheet_metas": sheet_e,
+            "df_formulario": dfs_e.get("formulario_previsao"),
+        }
+        st.rerun()
     except Exception as e:
-        return False, _smtp_erro_amigavel(e)
+        st.error(f"Erro ao preparar análises: {e}")
+        st.exception(e)
 
 
-def _section_container():
-    """Container com borda quando suportado (Streamlit recente)."""
-    try:
-        return st.container(border=True)
-    except TypeError:
-        return st.container()
+def _render_tab_formulario_previsao_humano() -> None:
+    """Painéis a partir da planilha de respostas ao formulário (previsão vs real, filtros)."""
+    import plotly.colors as plc
+    import plotly.graph_objects as go
 
-
-def _render_secao_formulario(secoes: list[str]) -> None:
-    """Uma seção por vez; navegação por botões na parte inferior."""
-    ss = st.session_state
-    ss.setdefault("ficha_secao_idx", 0)
-    n = len(secoes)
-    if n == 0:
-        _alert_vermelho("Nenhuma seção de formulário configurada.")
-        return
-
-    idx = max(0, min(int(ss["ficha_secao_idx"]), n - 1))
-    ss["ficha_secao_idx"] = idx
-    sec = secoes[idx]
-    _garantir_campos_secao_de_snapshot(sec)
-
-    if ss.get("ficha_erros_secao_idx") is not None and int(ss["ficha_erros_secao_idx"]) != idx:
-        ss.pop("ficha_erros_secao", None)
-        ss.pop("ficha_erros_secao_idx", None)
-
-    rotulo_curto = _tab_label(sec)
-    st.caption(f"Só mais um pouco: **{idx + 1}** de **{n}** · {rotulo_curto}")
-    pct = 100.0 * float(idx + 1) / float(n)
     st.markdown(
-        f'<div class="ficha-etapas-progress" role="progressbar" '
-        f'aria-valuenow="{idx + 1}" aria-valuemin="1" aria-valuemax="{n}" '
-        f'aria-label="Progresso das etapas do cadastro">'
-        f'<div class="ficha-etapas-progress-track">'
-        f'<div class="ficha-etapas-progress-fill" style="width:{pct:.4f}%"></div>'
-        f"</div></div>",
+        '<p class="pv-section-title">Formulário — previsão humana</p>',
         unsafe_allow_html=True,
     )
-
-    with _section_container():
-        st.markdown(
-            f'<p class="section-head">{sec}</p>',
-            unsafe_allow_html=True,
-        )
-        # Campos que controlam visibilidade de outros devem ficar FORA do st.form: dentro do form
-        # o Streamlit só sincroniza o state no envio, então «Sim» em CRECI não mostraria os demais campos.
-        dados_sec = _coletar_dados_formulario_completo()
-        if sec == "CRECI/TTI":
-            c_pc = next((c for c in CAMPOS if c["key"] == "possui_creci"), None)
-            if c_pc:
-                _widget_campo(c_pc)
-            dados_sec = _coletar_dados_formulario_completo()
-            cols = [
-                c
-                for c in campos_por_secao_visiveis(sec, dados_sec)
-                if c["key"] != "possui_creci"
-            ]
-        elif sec == "Informações para contato":
-            c_un = next((c for c in CAMPOS if c["key"] == "unidade_negocio"), None)
-            if c_un:
-                _widget_campo(c_un)
-            c_sg = next((c for c in CAMPOS if c["key"] == "account_name_nao_sei"), None)
-            if c_sg:
-                _widget_campo(c_sg)
-            dados_sec = _coletar_dados_formulario_completo()
-            cols = [
-                c
-                for c in campos_por_secao_visiveis(sec, dados_sec)
-                if c["key"] not in ("unidade_negocio", "account_name_nao_sei")
-            ]
-        else:
-            cols = campos_por_secao_visiveis(sec, dados_sec)
-
-        # st.form: ao usar «Avançar» / «Enviar», todos os valores da etapa são gravados de uma vez
-        # (evita depender de Enter ou blur em text_input/select).
-        form_key = f"ficha_etapa_{idx}"
-        with st.form(form_key, clear_on_submit=False, border=False):
-            # Grid 2 colunas: pares lado a lado; quando ímpar, o último ocupa largura total.
-            for i in range(0, len(cols), 2):
-                c1 = cols[i]
-                c2 = cols[i + 1] if i + 1 < len(cols) else None
-                if c2 is None:
-                    _widget_campo(c1)
-                    continue
-                left, right = st.columns(2)
-                with left:
-                    _widget_campo(c1)
-                with right:
-                    _widget_campo(c2)
-
-            st.markdown("<br/>", unsafe_allow_html=True)
-            if idx < n - 1:
-                col_avancar, col_voltar = st.columns(2)
-                with col_avancar:
-                    clicou_avancar = st.form_submit_button(
-                        "Avançar",
-                        type="primary",
-                        use_container_width=True,
-                    )
-                with col_voltar:
-                    clicou_voltar = st.form_submit_button(
-                        "Voltar",
-                        use_container_width=True,
-                        disabled=(idx <= 0),
-                    )
-            else:
-                st.markdown(
-                    '<div class="ficha-input-label">Documento de identidade '
-                    '<span class="ficha-star-req" aria-hidden="true">*</span><br/>'
-                    "<span style=\"font-weight:400;color:#64748b\">RG ou CNH — PDF, JPG ou PNG. "
-                    "Após o envio, tentamos gravar no Google Drive; se não for possível, o arquivo é enviado por e-mail à equipe.</span></div>",
-                    unsafe_allow_html=True,
-                )
-                st.file_uploader(
-                    "Documento de identidade (obrigatório)",
-                    type=["pdf", "png", "jpg", "jpeg"],
-                    key="ficha_identidade_upload",
-                    label_visibility="collapsed",
-                )
-                st.markdown(
-                    '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
-                    unsafe_allow_html=True,
-                )
-                st.text_input(
-                    "Company website",
-                    key="ficha_hp_website",
-                    label_visibility="collapsed",
-                    max_chars=96,
-                )
-                st.markdown(
-                    '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
-                    "credenciamento na Direcional, conforme a LGPD. "
-                    '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
-                    unsafe_allow_html=True,
-                )
-                st.checkbox(
-                    "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. "
-                    "(campo obrigatório)",
-                    key="fld_lgpd_ficha",
-                    label_visibility="collapsed",
-                )
-                col_enviar, col_voltar = st.columns(2)
-                with col_enviar:
-                    clicou_enviar = st.form_submit_button(
-                        "Enviar meu cadastro",
-                        type="primary",
-                        use_container_width=True,
-                    )
-                with col_voltar:
-                    clicou_voltar = st.form_submit_button(
-                        "Voltar",
-                        use_container_width=True,
-                        disabled=(len(secoes) <= 1),
-                    )
-
-        if idx < n - 1:
-            if clicou_voltar:
-                ss["ficha_secao_idx"] = idx - 1
-                ss.pop("ficha_erros_secao", None)
-                ss.pop("ficha_erros_secao_idx", None)
-                st.rerun()
-            if clicou_avancar:
-                dados = _coletar_dados_formulario_completo()
-                erros_sec = validar_obrigatorios_secao(sec, dados)
-                if erros_sec:
-                    ss["ficha_erros_secao"] = erros_sec
-                    ss["ficha_erros_secao_idx"] = idx
-                    st.rerun()
-                _snapshot_persistir_secao_atual(sec)
-                _snapshot_mesclar_todos_fld_do_session_state()
-                ss.pop("ficha_erros_secao", None)
-                ss.pop("ficha_erros_secao_idx", None)
-                ss["ficha_secao_idx"] = idx + 1
-                st.rerun()
-        else:
-            if clicou_voltar:
-                ss.pop("ficha_erros_envio", None)
-                ss["ficha_secao_idx"] = max(0, len(secoes) - 2)
-                st.rerun()
-            if clicou_enviar:
-                _processar_envio_cadastro()
-
-        if ss.get("ficha_erros_secao_idx") == idx and ss.get("ficha_erros_secao"):
-            lista = "<br>".join(f"• {html.escape(e)}" for e in ss["ficha_erros_secao"])
-            _alert_vermelho_html(
-                f"<strong>Preencha os campos obrigatórios desta etapa:</strong><br>{lista}"
-            )
-
-
-def _limpar_session_formulario():
-    for c in CAMPOS:
-        sk = f"fld_{c['key']}"
-        if sk in st.session_state:
-            del st.session_state[sk]
-    for k in (
-        "fld_lgpd_ficha",
-        "fc_mail_extra",
-        "fc_mail_extra_popup",
-        "ficha_sucesso",
-        "ficha_secao_idx",
-        "ficha_erros_secao",
-        "ficha_erros_secao_idx",
-        "ficha_snap_campos",
-        "ficha_email_boas_vindas_ok",
-        "ficha_email_boas_vindas_msg",
-        "ficha_erros_envio",
-        "ficha_seg_t0",
-        "ficha_rl_envios_ts",
-        "ficha_hp_website",
-        "ficha_modo_teste_design",
-        "ficha_sf_retry_row",
-        "ficha_sf_retry_sid",
-        "ficha_sf_retry_wname",
-        "ficha_identidade_upload",
-        "ficha_identidade_drive_link",
-        "ficha_identidade_drive_erro",
-        "ficha_identidade_email_para",
+    st.markdown(
+        "<div style='text-align:justify;color:#64748b;font-size:0.92rem;margin:0 auto 1rem auto;max-width:100%'>"
+        "Respostas ao <strong>Esboço — formulário</strong>: quantidades e VGV previstos versus realizados, por "
+        "<em>empreendimento</em>, <em>canal</em>, <em>regional</em> e <em>data de referência</em> (sábado). "
+        "Utilize <strong>Análises → Carregar dados</strong> ou <strong>Previsões → Gerar previsões</strong>, "
+        "ou o botão abaixo para sincronizar as planilhas.</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button(
+        "Sincronizar planilhas (inclui formulário)",
+        key="pv_form_reload",
+        width="stretch",
     ):
-        if k in st.session_state:
-            del st.session_state[k]
-
-
-def _finalizar_popup_e_novo_cadastro() -> None:
-    """Após «Finalizar» no popup: limpa tudo e volta ao formulário (sem tela final)."""
-    _limpar_session_formulario()
-    ss = st.session_state
-    for k in ("ficha_dados_enviados", "sf_contact_id", "sf_erro", "sf_avisos"):
-        ss.pop(k, None)
-
-
-def _design_teste_habilitado() -> bool:
-    """Modo teste de layout: env `FICHA_DESIGN_TEST=1` ou URL `?design_test=1`."""
-    if FICHA_MODO_PRODUCAO:
-        return False
-    if (os.environ.get("FICHA_DESIGN_TEST") or "").strip().lower() in ("1", "true", "yes", "on"):
-        return True
-    try:
-        v = st.query_params.get("design_test", "")
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        return False
-
-
-def _design_teste_expander_aberto() -> bool:
-    try:
-        v = st.query_params.get("design_test", "")
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        return False
-
-
-def _dados_ficha_demo_design() -> dict[str, Any]:
-    """Dados fictícios para pré-visualizar PDF e e-mail no modo teste de design."""
-    demo: dict[str, Any] = {}
-    for c in CAMPOS:
-        k = c["key"]
-        tipo = c["tipo"]
-        op = c.get("opcoes") or []
-        if tipo == "multiselect":
-            cand = [x for x in op if x and str(x).strip() and x != "--Nenhum--"]
-            demo[k] = [cand[0]] if cand else ["RJ"]
-        elif tipo == "select":
-            cand = [x for x in op if x and str(x).strip() and x != "--Nenhum--"]
-            demo[k] = cand[0] if cand else "—"
-        elif tipo == "date":
-            demo[k] = date(1990, 5, 15)
-        elif tipo == "number":
-            demo[k] = 1.0
-        elif tipo == "checkbox":
-            demo[k] = True
-        elif tipo == "id":
-            demo[k] = ""
-        else:
-            demo[k] = f"[Preview] {c['label'][:48]}"
-    demo["nome_completo"] = "Maria Silva Santos (pré-visualização design)"
-    demo["account_name_nao_sei"] = "Sim"
-    opts = _opcoes_nome_conta()
-    demo["account_name"] = opts[0] if opts else (NOMES_CONTA_FIXOS[0] if NOMES_CONTA_FIXOS else "Conta demo")
-    demo["cpf"] = "123.456.789-09"
-    demo["email"] = "maria.silva.demo@exemplo.com.br"
-    demo["mobile"] = "(21) 99999-0000"
-    return enriquecer_derivados_vendas_rj(demo)
-
-
-def _ativar_cenario_teste_design() -> None:
-    """Simula sucesso + popup sem planilha/Salesforce; preenche dados demo para ver PDF/e-mail."""
-    ss = st.session_state
-    ss["ficha_sucesso"] = True
-    ss["ficha_modo_teste_design"] = True
-    ss["ficha_dados_enviados"] = _dados_ficha_demo_design()
-    ss["sf_contact_id"] = None
-    ss["sf_erro"] = None
-    ss["sf_avisos"] = []
-
-
-def _processar_envio_cadastro() -> None:
-    """Grava planilha, tenta Salesforce e define tela de sucesso."""
-    ss = st.session_state
-    ss.pop("ficha_erros_envio", None)
-    ok_sec, msg_sec = verificar_antes_envio()
-    if not ok_sec:
-        ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
-        return
-    secoes_env = secoes_com_campos_visiveis()
-    idx_env = max(0, min(int(ss.get("ficha_secao_idx", 0)), len(secoes_env) - 1))
-    if secoes_env:
-        _snapshot_persistir_secao_atual(secoes_env[idx_env])
-    # Última etapa: valores do form acabam de entrar no session_state; etapas antigas já no snap.
-    _snapshot_mesclar_todos_fld_do_session_state()
-    dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario_completo())
-    erros = validar_obrigatorios(dados)
-    if not ss.get("ficha_identidade_upload"):
-        erros.append("Documento de identidade * (envie PDF, JPG ou PNG)")
-    if not ss.get("fld_lgpd_ficha"):
-        erros.append("Concordância LGPD *")
-    if erros:
-        ss["ficha_erros_envio"] = {"kind": "validation", "items": erros}
-        return
-
-    ss.pop("ficha_modo_teste_design", None)
-
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
-    if not creds:
-        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
-        return
-
-    gs = {}
-    if hasattr(st, "secrets"):
-        try:
-            gs = dict(st.secrets.get("google_sheets", {}))
-        except Exception:
-            gs = {}
-    sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
-    wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
-
-    st.caption("**Carregando…** Aguarde — gravando seu cadastro. Não feche a página.")
-    bar_envio = st.progress(0.0)
-
-    linha = linha_planilha(dados)
-    cab = cabecalho_planilha()
-
-    try:
-        bar_envio.progress(0.15)
-        row_num = anexar_linha(linha, cab, sid, wname, creds, gs)
-        bar_envio.progress(0.38)
-    except Exception:
-        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
-        return
-
-    ss["ficha_dados_enviados"] = dados
-    ss["sf_contact_id"] = None
-    ss["sf_erro"] = None
-    ss["sf_avisos"] = []
-    ss["ficha_sf_retry_row"] = row_num
-    ss["ficha_sf_retry_sid"] = sid
-    ss["ficha_sf_retry_wname"] = wname
-    ss["ficha_identidade_drive_link"] = None
-    ss["ficha_identidade_drive_erro"] = None
-    ss["ficha_identidade_email_para"] = None
-
-    up_doc = ss.get("ficha_identidade_upload")
-    if up_doc:
-        sec = st.secrets if hasattr(st, "secrets") else None
-        parent_drive = _drive_parent_id_identidade(sec)
-        dono_email = _drive_email_dono_apos_upload(sec)
-        dlink, derr = upload_identidade_google_drive(
-            creds,
-            parent_drive,
-            up_doc,
-            dados,
-            transferir_propriedade_para_email=dono_email,
-        )
-        if dlink:
-            ss["ficha_identidade_drive_link"] = dlink
-        else:
-            dest_doc = _email_destino_documento_identidade(sec)
-            ok_mail, err_mail = enviar_documento_identidade_por_email(
-                up_doc, dados, dest_doc
-            )
-            if ok_mail:
-                ss["ficha_identidade_email_para"] = dest_doc
-            else:
-                partes = [x for x in (derr, err_mail) if x]
-                ss["ficha_identidade_drive_erro"] = " | ".join(partes) if partes else (
-                    "Falha no Drive e no envio por e-mail."
-                )
-    bar_envio.progress(0.52)
-
-    _aplicar_secrets_sf()
-    bar_envio.progress(0.58)
-    if not _credenciais_salesforce_ok():
-        atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).", ""
-        )
-        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
-        bar_envio.progress(0.88)
-        _tentar_enviar_email_boas_vindas(dados, None)
-        bar_envio.progress(1.0)
-        ss["ficha_sucesso"] = True
+        with st.spinner("A ler Google Sheets…"):
+            dfs_f, meta_f, ua_f = build_data_bundle()
+        st.session_state["sheet_metas"] = meta_f
+        st.session_state["used_service_account"] = ua_f
+        st.session_state["formulario_snapshot"] = dfs_f.get("formulario_previsao")
+        st.success("Formulário atualizado a partir das fontes configuradas.")
         st.rerun()
-        return
 
-    if not _SF_SDK_DISPONIVEL:
-        atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "simple_salesforce não instalado.", ""
-        )
-        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
-        bar_envio.progress(0.88)
-        _tentar_enviar_email_boas_vindas(dados, None)
-        bar_envio.progress(1.0)
-        ss["ficha_sucesso"] = True
-        st.rerun()
-        return
-
-    payload, avisos = montar_payload_salesforce(dados)
-    avisos = list(avisos)
-    avisos.extend(_enriquecer_mobile_phone(payload, dados))
-    bar_envio.progress(0.68)
-
-    sf = conectar_salesforce()
-    bar_envio.progress(0.78)
-    if not sf:
-        atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "Falha ao conectar ao Salesforce (credenciais ou rede).", ""
-        )
-        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
-        ss["sf_avisos"] = avisos
-        bar_envio.progress(0.88)
-        _tentar_enviar_email_boas_vindas(dados, None)
-        bar_envio.progress(1.0)
-        ss["ficha_sucesso"] = True
-        st.rerun()
-        return
-
-    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
-    bar_envio.progress(0.85)
-    cid, err = criar_contato_payload(sf, payload)
-    bar_envio.progress(0.93)
-    link = _url_contact(cid) if cid else ""
-
-    if cid:
-        atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Sucesso", "", link)
-        ss["sf_contact_id"] = cid
-        ss["sf_erro"] = None
-        ss.pop("ficha_sf_retry_row", None)
-        ss.pop("ficha_sf_retry_sid", None)
-        ss.pop("ficha_sf_retry_wname", None)
-    else:
-        err_full = _explicacao_erro_record_type_se_aplicavel(err)
-        atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Erro", err_full[:49000], "")
-        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
-
-    ss["sf_avisos"] = avisos
-    bar_envio.progress(0.96)
-    _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
-    bar_envio.progress(1.0)
-    ss["ficha_sucesso"] = True
-    st.rerun()
-
-
-def _retentar_salesforce_ultimo_envio() -> None:
-    """
-    Repete apenas a criação do contato no Salesforce com os mesmos dados já gravados na planilha.
-    Atualiza a mesma linha (status / log / link); não insere nova linha.
-    """
-    ss = st.session_state
-    dados = ss.get("ficha_dados_enviados")
-    row_num = ss.get("ficha_sf_retry_row")
-    sid = ss.get("ficha_sf_retry_sid")
-    wname = ss.get("ficha_sf_retry_wname")
-    if not isinstance(dados, dict) or row_num is None:
-        ss["sf_erro"] = "Não há dados salvos para retentativa. Use «Começar um novo cadastro»."
-        return
-    if not sid or not wname:
-        ss["sf_erro"] = "Contexto da planilha perdido; não é possível retentar o envio ao Salesforce."
-        return
-
-    ok_sec, msg_sec = verificar_antes_envio()
-    if not ok_sec:
-        ss["sf_erro"] = f"Retentativa bloqueada: {msg_sec}"
-        return
-
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
-    if not creds:
-        ss["sf_erro"] = "Credenciais Google Sheets ausentes — necessárias para atualizar o status na planilha."
-        return
-
-    _aplicar_secrets_sf()
-    if not _credenciais_salesforce_ok():
-        atualizar_status_envio_salesforce(
-            str(sid),
-            str(wname),
-            creds,
-            int(row_num),
-            "Erro",
-            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
-            "",
-        )
-        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
-        return
-
-    if not _SF_SDK_DISPONIVEL:
-        atualizar_status_envio_salesforce(
-            str(sid),
-            str(wname),
-            creds,
-            int(row_num),
-            "Erro",
-            "simple_salesforce não instalado.",
-            "",
-        )
-        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
-        return
-
-    dados_c = dict(dados)
-    payload, avisos = montar_payload_salesforce(dados_c)
-    avisos = list(avisos)
-    avisos.extend(_enriquecer_mobile_phone(payload, dados_c))
-
-    with st.spinner("Tentando novamente no Salesforce..."):
-        sf = conectar_salesforce()
-    if not sf:
-        atualizar_status_envio_salesforce(
-            str(sid),
-            str(wname),
-            creds,
-            int(row_num),
-            "Erro",
-            "Falha ao conectar ao Salesforce (credenciais ou rede).",
-            "",
-        )
-        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
-        ss["sf_avisos"] = avisos
-        return
-
-    _aplicar_enriquecimentos_payload_sf(payload, dados_c, sf, avisos)
-    cid, err = criar_contato_payload(sf, payload)
-    link = _url_contact(cid) if cid else ""
-
-    if cid:
-        atualizar_status_envio_salesforce(str(sid), str(wname), creds, int(row_num), "Sucesso", "", link)
-        ss["sf_contact_id"] = cid
-        ss["sf_erro"] = None
-        ss.pop("ficha_sf_retry_row", None)
-        ss.pop("ficha_sf_retry_sid", None)
-        ss.pop("ficha_sf_retry_wname", None)
-    else:
-        err_full = _explicacao_erro_record_type_se_aplicavel(err)
-        atualizar_status_envio_salesforce(
-            str(sid), str(wname), creds, int(row_num), "Erro", err_full[:49000], ""
-        )
-        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
-
-    ss["sf_avisos"] = avisos
-    _tentar_enviar_email_boas_vindas(dados_c, cid if cid else None)
-
-
-@st.dialog("Obrigado — você faz parte da nossa operação", width="medium")
-def _dialog_recursos_pos_cadastro() -> None:
-    """Popup ao concluir o cadastro: confirmação (bolinha ✓), mapa, vídeo e links úteis."""
-    ss = st.session_state
-    modo_design = bool(ss.get("ficha_modo_teste_design"))
-
-    if modo_design:
-        _render_status_final_tela(
-            sucesso=True,
-            mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
-        )
+    df_raw = _formulario_df_from_state()
+    if df_raw is None or df_raw.empty:
         st.info(
-            "Modo teste de design: o PDF/e-mail usam **dados fictícios**. Use **Finalizar** para voltar ao formulário."
+            "Nenhuma base do formulário em memória. Carregue os dados na aba **Análises** ou **Previsões**, "
+            "ou clique em **Sincronizar planilhas** acima."
         )
-        st.markdown(
-            "Abaixo: pré-visualização do **mapa**, **vídeo** do simulador e **links** úteis (como no fluxo real)."
+        return
+
+    fn = normalize_dataframe_columns(df_raw.copy())
+    mc = _formulario_map_columns(fn)
+
+    def _ref_series() -> pd.Series:
+        if not mc.get("ref") or mc["ref"] not in fn.columns:
+            return pd.Series(pd.NaT, index=fn.index)
+        return pd.to_datetime(fn[mc["ref"]], errors="coerce")
+
+    rs = _ref_series()
+    fn["_ref_d"] = rs.dt.normalize()
+
+    emp_c = mc.get("empreendimento")
+    reg_c = mc.get("regional")
+    canal_c = mc.get("canal")
+    regiao_c = mc.get("regiao")
+
+    st.markdown("##### Filtros")
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        emp_opts: list[str] = []
+        if emp_c and emp_c in fn.columns:
+            emp_opts = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
+        sel_emp = st.multiselect("Empreendimento", options=emp_opts, default=[], key="pv_ff_emp")
+    with f2:
+        dlist = sorted({_ for _ in fn["_ref_d"].dropna().unique()})
+        d_labels = [pd.Timestamp(x).strftime("%Y-%m-%d") for x in dlist]
+        sel_d = st.multiselect("Data de referência (sábado)", options=d_labels, default=[], key="pv_ff_dt")
+    with f3:
+        canal_opts: list[str] = []
+        if canal_c and canal_c in fn.columns:
+            canal_opts = sorted({_formulario_canon_canal(x) for x in fn[canal_c].unique()})
+        sel_canal = st.multiselect("Canal", options=canal_opts, default=[], key="pv_ff_canal")
+    with f4:
+        reg_opts: list[str] = []
+        if reg_c and reg_c in fn.columns:
+            reg_opts = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
+        sel_reg = st.multiselect("Regional ou IMOB", options=reg_opts, default=[], key="pv_ff_reg")
+
+    dff = fn.copy()
+    if sel_emp and emp_c and emp_c in dff.columns:
+        dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
+    if sel_d:
+        pick = {pd.Timestamp(s).normalize() for s in sel_d}
+        dff = dff[dff["_ref_d"].isin(pick)]
+    if sel_canal and canal_c and canal_c in dff.columns:
+        dff = dff[dff[canal_c].map(_formulario_canon_canal).isin(sel_canal)]
+    if sel_reg and reg_c and reg_c in dff.columns:
+        dff = dff[dff[reg_c].astype(str).isin(sel_reg)]
+
+    if dff.empty:
+        st.warning("Sem linhas após aplicar os filtros.")
+        return
+
+    st.caption(f"**{len(dff):,}** linhas (após filtros) · **{dff.shape[1]}** colunas na base bruta.")
+
+    qfp, qfr = mc.get("q_fac_p"), mc.get("q_fac_r")
+    qnp, qnr = mc.get("q_norm_p"), mc.get("q_norm_r")
+    vgp, vgr = mc.get("vgv_prev"), mc.get("vgv_real")
+    vprev, vreal = mc.get("vendas_prev"), mc.get("vendas_real")
+    nf_p = mc.get("nf_prev")
+
+    s_qfp = _formulario_num_series(dff, qfp)
+    s_qfr = _formulario_num_series(dff, qfr)
+    s_qnp = _formulario_num_series(dff, qnp)
+    s_qnr = _formulario_num_series(dff, qnr)
+    s_vgp = _formulario_num_series(dff, vgp)
+    s_vgr = _formulario_num_series(dff, vgr)
+
+    tot_fac_p = float(s_qfp.sum())
+    tot_fac_r = float(s_qfr.sum())
+    tot_norm_p = float(s_qnp.sum())
+    tot_norm_r = float(s_qnr.sum())
+    tot_vgv_p = float(s_vgp.sum())
+    tot_vgv_r = float(s_vgr.sum())
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric("QTD facilitadas — previstas", f"{tot_fac_p:,.0f}")
+    with m2:
+        st.metric("QTD facilitadas — reais", f"{tot_fac_r:,.0f}")
+    with m3:
+        st.metric("QTD normais — previstas", f"{tot_norm_p:,.0f}")
+    with m4:
+        st.metric("QTD normais — reais", f"{tot_norm_r:,.0f}")
+    with m5:
+        st.metric("VGV previsto (soma)", f"R$ {tot_vgv_p/1e6:.2f} mi")
+    with m6:
+        st.metric("VGV real (soma)", f"R$ {tot_vgv_r/1e6:.2f} mi")
+
+    if mc.get("erro") and mc["erro"] in dff.columns:
+        err = pd.to_numeric(dff[mc["erro"]], errors="coerce").dropna()
+        if len(err):
+            e1, e2 = st.columns(2)
+            with e1:
+                st.metric("Erro de previsão — média |·|", f"{float(err.abs().mean()):,.2f}")
+            with e2:
+                st.metric("Erro de previsão — mediana", f"{float(err.median()):,.2f}")
+
+    _ipc = {"displayModeBar": True, "displaylogo": False}
+    pal = plc.qualitative.Bold + plc.qualitative.Pastel1 + plc.qualitative.Dark24
+
+    def _stack_xy_color(
+        title: str,
+        xcol: str | None,
+        ccol: str | None,
+        yser: pd.Series,
+        *,
+        height: int = 400,
+    ) -> go.Figure | None:
+        if not xcol or xcol not in dff.columns or not ccol or ccol not in dff.columns:
+            return None
+        sub = pd.DataFrame({xcol: dff[xcol].astype(str), ccol: dff[ccol].astype(str), "_y": yser})
+        sub = sub.groupby([xcol, ccol], as_index=False)["_y"].sum()
+        sub = sub[sub["_y"] != 0]
+        if sub.empty:
+            return None
+        xcats = sorted(sub[xcol].unique().tolist())
+        colors = sorted(sub[ccol].unique().tolist())
+        fig = go.Figure()
+        for i, lab in enumerate(colors):
+            chunk = sub[sub[ccol] == lab]
+            yv = chunk.set_index(xcol)["_y"].reindex(xcats).fillna(0).values
+            fig.add_trace(
+                go.Bar(
+                    name=str(lab)[:46],
+                    x=xcats,
+                    y=yv,
+                    marker_color=pal[i % len(pal)],
+                    text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                    textposition="inside",
+                    insidetextfont=dict(color="white", size=10),
+                )
+            )
+        fig.update_layout(
+            **_plotly_layout_direcional(
+                title=title,
+                height=height,
+                barmode="stack",
+                legend=_plotly_legend_bottom(),
+                xaxis_tickangle=-34,
+                margin=dict(t=100, l=52, r=36, b=max(128, min(240, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+            )
         )
+        return fig
+
+    def _group_prev_real(
+        title: str,
+        xcol: str | None,
+        s_pre: pd.Series,
+        s_re: pd.Series,
+        lab_p: str,
+        lab_r: str,
+        *,
+        height: int = 380,
+    ) -> go.Figure | None:
+        if not xcol or xcol not in dff.columns:
+            return None
+        sub = pd.DataFrame({xcol: dff[xcol].astype(str), "_p": s_pre, "_r": s_re})
+        g = sub.groupby(xcol, as_index=False).agg(_p=("_p", "sum"), _r=("_r", "sum"))
+        if g.empty:
+            return None
+        g = g.sort_values("_p", ascending=False)
+        xcats = g[xcol].tolist()
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                name=lab_p,
+                x=xcats,
+                y=g["_p"],
+                marker_color=PLOT_AZUL,
+                text=[f"{v:.0f}" for v in g["_p"]],
+                textposition="outside",
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                name=lab_r,
+                x=xcats,
+                y=g["_r"],
+                marker_color=PLOT_ACCENT,
+                text=[f"{v:.0f}" for v in g["_r"]],
+                textposition="outside",
+            )
+        )
+        fig.update_layout(
+            **_plotly_layout_direcional(
+                title=title,
+                height=height,
+                barmode="group",
+                legend=_plotly_legend_bottom(),
+                xaxis_tickangle=-34,
+                margin=dict(t=100, l=52, r=36, b=max(128, min(260, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+            )
+        )
+        return fig
+
+    st.markdown("##### Previsão por regional — empilhado (QTD)")
+    st.caption("Cada cor é um **empreendimento**; o eixo X é **Regional ou IMOB**.")
+    ra, rb = st.columns(2)
+    with ra:
+        fg = _stack_xy_color(
+            "Previsão por produto — Vendas facilitadas (QTD previstas)",
+            reg_c,
+            emp_c,
+            s_qfp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with rb:
+        fg = _stack_xy_color(
+            "Previsão por produto — Vendas normais (QTD previstas)",
+            reg_c,
+            emp_c,
+            s_qnp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+
+    st.markdown("##### Previsão por produto — canal (QTD e VGV)")
+    st.caption("Eixo X: **empreendimento**; empilhamento por **canal** (DV / IMOB).")
+    if canal_c and emp_c:
+        sc = dff[canal_c].map(_formulario_canon_canal)
+        ca, cb = st.columns(2)
+        with ca:
+            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_qnp})
+            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
+            sub = sub[sub["_y"] != 0]
+            if not sub.empty:
+                xcats = sorted(sub[emp_c].unique().tolist())
+                fig = go.Figure()
+                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
+                    chunk = sub[sub["__canal__"] == lab]
+                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(lab),
+                            x=xcats,
+                            y=yv,
+                            marker_color=pal[i % len(pal)],
+                            text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                            textposition="inside",
+                            insidetextfont=dict(color="white", size=10),
+                        )
+                    )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title="Previsão por produto — Normais (QTD)",
+                        height=400,
+                        barmode="stack",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-34,
+                        margin=dict(t=100, l=52, r=36, b=168),
+                    )
+                )
+                st.plotly_chart(fig, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        with cb:
+            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_vgp})
+            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
+            sub = sub[sub["_y"] != 0]
+            if not sub.empty:
+                xcats = sorted(sub[emp_c].unique().tolist())
+                fig = go.Figure()
+                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
+                    chunk = sub[sub["__canal__"] == lab]
+                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
+                    lbl_txt = [f"{float(v)/1e3:.1f} mil" if v > 0 else "" for v in yv]
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(lab),
+                            x=xcats,
+                            y=yv,
+                            marker_color=pal[i % len(pal)],
+                            text=lbl_txt,
+                            textposition="inside",
+                            insidetextfont=dict(color="white", size=9),
+                        )
+                    )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title="Previsão por produto — VGV",
+                        height=400,
+                        barmode="stack",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-34,
+                        yaxis_title="R$",
+                        margin=dict(t=100, l=52, r=36, b=168),
+                    )
+                )
+                st.plotly_chart(fig, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
     else:
-        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
-        st.markdown(
-            """
-**Recebemos o seu cadastro com sucesso.** Você deve ter recebido **automaticamente** no seu e-mail do cadastro
-uma mensagem com **apresentação da Direcional**, **links de materiais de vendas** e, quando possível, o **PDF da ficha** em anexo.
+        st.caption("Colunas de empreendimento ou canal ausentes — gráficos por canal omitidos.")
 
-Aqui neste painel: **mapa** de empreendimentos, **vídeo** do simulador e **links** úteis.
-            """.strip()
+    st.markdown("##### Previsão por produto — empilhado por regional (QTD)")
+    st.caption("Eixo X: **empreendimento**; cores: **Regional ou IMOB**.")
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        fg = _stack_xy_color(
+            "Previsão por produto — Facilitadas",
+            emp_c,
+            reg_c,
+            s_qfp,
         )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with pc2:
+        fg = _stack_xy_color(
+            "Previsão por produto — Normais",
+            emp_c,
+            reg_c,
+            s_qnp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
 
-    st.markdown("##### Empreendimentos no mapa")
-    st.caption(
-        "Minimapa: **+** / **−** para zoom, arraste para mover e **tela cheia** no canto superior direito."
-    )
-    try:
-        from empreendimentos_mapa import render_mapa_empreendimentos_streamlit
+    if nf_p and nf_p in dff.columns and reg_c and reg_c in dff.columns:
+        st.markdown("##### Previsão agregada por tipo (Normal / Facilitada / …)")
+        vp = (
+            _formulario_num_series(dff, vprev)
+            if vprev
+            else pd.Series(1.0, index=dff.index, dtype=float)
+        )
+        sub = pd.DataFrame(
+            {
+                reg_c: dff[reg_c].astype(str),
+                nf_p: dff[nf_p].astype(str).replace("nan", "(vazio)"),
+                "_y": vp,
+            }
+        )
+        sub = sub.groupby([reg_c, nf_p], as_index=False)["_y"].sum()
+        sub = sub[sub["_y"] != 0]
+        if not sub.empty:
+            xcats = sorted(sub[reg_c].unique().tolist())
+            fig = go.Figure()
+            for i, lab in enumerate(sorted(sub[nf_p].unique().tolist())):
+                chunk = sub[sub[nf_p] == lab]
+                yv = chunk.set_index(reg_c)["_y"].reindex(xcats).fillna(0).values
+                fig.add_trace(
+                    go.Bar(
+                        name=str(lab)[:40],
+                        x=xcats,
+                        y=yv,
+                        marker_color=pal[i % len(pal)],
+                        text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                        textposition="outside",
+                    )
+                )
+            fig.update_layout(
+                **_plotly_layout_direcional(
+                    title="Previsão — soma de «Vendas Previsão» por regional e tipo",
+                    height=400,
+                    barmode="stack",
+                    legend=_plotly_legend_bottom(),
+                    xaxis_tickangle=-28,
+                    margin=dict(t=100, l=52, r=36, b=138),
+                )
+            )
+            st.plotly_chart(fig, width="stretch", config=_ipc)
+        else:
+            st.caption("Sem dados para o gráfico de tipos.")
 
-        render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
-    except Exception:
-        st.caption("Mapa indisponível no momento.")
-    st.markdown("##### Como usar o simulador")
-    st.markdown(
-        f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
-        f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_SIMULADOR_EMBED)}" '
-        f'title="Como usar o simulador de negociação" loading="lazy" '
-        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
-        f"allowfullscreen referrerpolicy=\"strict-origin-when-cross-origin\"></iframe>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-    st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_SIMULADOR}]({URL_YOUTUBE_SIMULADOR})")
+    st.markdown("##### Previsão × Real — por **Regional ou IMOB**")
+    gx1, gx2 = st.columns(2)
+    with gx1:
+        fg = _group_prev_real(
+            "Vendas Previsão × Real — Facilitadas (QTD)",
+            reg_c,
+            s_qfp,
+            s_qfr,
+            "QTD facilitadas previstas",
+            "QTD facilitadas reais",
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with gx2:
+        fg = _group_prev_real(
+            "Vendas Previsão × Real — Normais (QTD)",
+            reg_c,
+            s_qnp,
+            s_qnr,
+            "QTD normais previstas",
+            "QTD normais reais",
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
 
-    st.markdown("##### Links úteis")
-    st.link_button(
-        "Materiais de marketing (Linktree)",
-        URL_LINKTREE_MARKETING,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Pedir acesso ao simulador de negociação",
-        URL_FORM_SIMULADOR,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Treinamentos — Diri Academy",
-        URL_DIRI_ACADEMY,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Salesforce (portal de vendas)",
-        URL_SALESFORCE_VENDAS,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Entrar no grupo — WhatsApp",
-        URL_WHATSAPP_EQUIPE,
-        use_container_width=True,
-    )
+    st.markdown("##### Previsão × Real — por **empreendimento** (top por volume previsto)")
+    if emp_c and emp_c in dff.columns:
+        sub = pd.DataFrame(
+            {
+                emp_c: dff[emp_c].astype(str),
+                "_p": s_qnp + s_qfp,
+                "_pf": s_qfp,
+                "_pr": s_qfr,
+                "_qn": s_qnp,
+                "_qr": s_qnr,
+            }
+        )
+        g = sub.groupby(emp_c, as_index=False).agg(
+            _p=("_p", "sum"),
+            _pf=("_pf", "sum"),
+            _pr=("_pr", "sum"),
+            _qn=("_qn", "sum"),
+            _qr=("_qr", "sum"),
+        )
+        g = g.sort_values("_p", ascending=False).head(22)
+        if not g.empty:
+            xcats = g[emp_c].tolist()
 
-    st.markdown("")
-    if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_dialog_recursos_fechar"):
-        _finalizar_popup_e_novo_cadastro()
-        st.rerun()
+            def _pair_fig(title: str, yp: str, yr: str, npref: str, nrref: str) -> go.Figure:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        name=npref,
+                        x=xcats,
+                        y=g[yp],
+                        marker_color=PLOT_AZUL,
+                        text=[f"{v:.0f}" for v in g[yp]],
+                        textposition="outside",
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        name=nrref,
+                        x=xcats,
+                        y=g[yr],
+                        marker_color=PLOT_ACCENT,
+                        text=[f"{v:.0f}" for v in g[yr]],
+                        textposition="outside",
+                    )
+                )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title=title,
+                        height=440,
+                        barmode="group",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-40,
+                        margin=dict(t=100, l=52, r=36, b=188),
+                    )
+                )
+                return fig
+
+            gy1, gy2 = st.columns(2)
+            with gy1:
+                st.plotly_chart(
+                    _pair_fig(
+                        "Facilitadas — previstas × reais",
+                        "_pf",
+                        "_pr",
+                        "QTD facilitadas previstas",
+                        "QTD facilitadas reais",
+                    ),
+                    width="stretch",
+                    config=_ipc,
+                )
+            with gy2:
+                st.plotly_chart(
+                    _pair_fig(
+                        "Normais — previstas × reais",
+                        "_qn",
+                        "_qr",
+                        "QTD normais previstas",
+                        "QTD normais reais",
+                    ),
+                    width="stretch",
+                    config=_ipc,
+                )
+    else:
+        st.caption("—")
+
+    st.markdown("##### Tabelas resumo — **Região** × canal (DV / IMOB)")
+    if regiao_c and regiao_c in dff.columns and canal_c and canal_c in dff.columns:
+        dpx = dff[[regiao_c, canal_c]].copy()
+        dpx["_can"] = dpx[canal_c].map(_formulario_canon_canal)
+        dpx["_q_prev"] = s_qnp + s_qfp
+        dpx["_q_real"] = s_qnr + s_qfr
+        pv = (
+            dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_q_prev",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        pr = (
+            dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_q_real",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        pv.columns = [str(c) if c != regiao_c else "Região" for c in pv.columns]
+        pr.columns = [str(c) if c != regiao_c else "Região" for c in pr.columns]
+
+        def _add_total_row(tab: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
+            if tab.empty:
+                return tab
+            row = {tab.columns[0]: "Total geral"}
+            for c in num_cols:
+                if c in tab.columns:
+                    row[c] = pd.to_numeric(tab[c], errors="coerce").fillna(0).sum()
+            return pd.concat([tab, pd.DataFrame([row])], ignore_index=True)
+
+        num_p = [c for c in pv.columns if c != "Região"]
+        num_r = [c for c in pr.columns if c != "Região"]
+        st.caption("Totais de **QTD** (normais + facilitadas) por região e canal.")
+        t1, t2 = st.columns(2)
+        with t1:
+            st.markdown("**Previsão (QTD)**")
+            st.dataframe(_add_total_row(pv, num_p), width="stretch", hide_index=True)
+        with t2:
+            st.markdown("**Realizado (QTD)**")
+            st.dataframe(_add_total_row(pr, num_r), width="stretch", hide_index=True)
+
+        if vgp and vgr:
+            dpx["_v_prev"] = s_vgp
+            dpx["_v_real"] = s_vgr
+            pv2 = (
+                dpx.pivot_table(
+                    index=regiao_c,
+                    columns="_can",
+                    values="_v_prev",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            pr2 = (
+                dpx.pivot_table(
+                    index=regiao_c,
+                    columns="_can",
+                    values="_v_real",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            pv2.columns = [str(c) if c != regiao_c else "Região" for c in pv2.columns]
+            pr2.columns = [str(c) if c != regiao_c else "Região" for c in pr2.columns]
+            st.markdown("**VGV por região e canal (R$)**")
+            t3, t4 = st.columns(2)
+            with t3:
+                st.caption("Previsão")
+                n3 = [c for c in pv2.columns if c != "Região"]
+                st.dataframe(_add_total_row(pv2, n3), width="stretch", hide_index=True)
+            with t4:
+                st.caption("Realizado")
+                n4 = [c for c in pr2.columns if c != "Região"]
+                st.dataframe(_add_total_row(pr2, n4), width="stretch", hide_index=True)
+    else:
+        st.caption("Defina colunas **Região** e **Canal** na planilha para ver as tabelas cruzadas.")
+
+    with st.expander("Pré-visualização dos dados filtrados (primeiras linhas)", expanded=False):
+        show_cols = [
+            c
+            for c in [
+                mc.get("ref"),
+                emp_c,
+                reg_c,
+                canal_c,
+                regiao_c,
+                qfp,
+                qfr,
+                qnp,
+                qnr,
+                vgp,
+                vgr,
+                vprev,
+                vreal,
+                mc.get("erro"),
+            ]
+            if c and c in dff.columns
+        ]
+        st.dataframe(dff[show_cols].head(200), width="stretch", hide_index=True)
 
 
-def main():
-    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
-    st.set_page_config(
-        page_title="Credenciamento | Direcional Vendas RJ",
-        page_icon=str(fav) if fav else None,
-        layout="centered",
-        initial_sidebar_state="collapsed",
-    )
-    _aplicar_secrets_sf()
-    aplicar_estilo()
-    injetar_cliente_e_meta()
+def _render_tab_introducao() -> None:
+    """Secção estática: metodologia, métricas, modelos e exemplos (sem dados reais)."""
+    import plotly.graph_objects as go
 
-    ss = st.session_state
-    ss.setdefault("ficha_sucesso", False)
-
-    if _teste_planilha_sf_habilitado():
-        _render_sidebar_teste_planilha_sf()
-
-    if ss.get("ficha_sucesso"):
-        _dialog_recursos_pos_cadastro()
-        _cabecalho_pagina()
+    def _ix(html: str) -> None:
         st.markdown(
-            '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
+            f'<div style="text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem;box-sizing:border-box">{html}</div>',
             unsafe_allow_html=True,
         )
+
+    def _lx(s: str) -> None:
+        st.latex(s)
+
+    _ipc = {"displayModeBar": True, "displaylogo": False}
+    st.markdown(
+        '<p class="pv-section-title">Introdução</p>',
+        unsafe_allow_html=True,
+    )
+    _ix(
+        "A <strong>previsão por machine learning</strong> estima apenas a <strong>quantidade</strong> de vendas (unidades) a partir da matriz diária; "
+        "o VGV continua a aparecer nas <strong>análises descritivas</strong> e indicadores históricos, mas não é alvo do modelo preditivo. "
+        "Em cada instante <em>t</em>, o vetor <strong>X</strong> usa exclusivamente informação até <em>t</em>."
+    )
+
+    st.markdown("#### 1 · Problema e alvos")
+    _ix(
+        "Trata-se de um problema de regressão ao longo do tempo: o alvo <strong>Y</strong> é escalar e o preditor "
+        "<strong>X</strong> é vetorial, ambos indexados por <em>t</em>. Ademais, cada componente de <strong>X</strong> "
+        "deve depender apenas do passado observado até <em>t</em>, sob pena de enviesar a validação fora da amostra."
+    )
+    _ix(
+        "<strong>Horizonte H.</strong> Na aba <strong>Previsões</strong> escolhe-se <strong>um ou mais</strong> valores "
+        "entre <strong>3</strong>, <strong>7</strong> e <strong>30</strong> dias. Para cada <em>t</em>, o alvo <strong>Y</strong> "
+        "é a soma da <strong>quantidade</strong> de vendas nos <strong>H</strong> primeiros dias da série "
+        "imediatamente posteriores a <em>t</em> (apenas dias presentes no índice temporal)."
+    )
+    _ix(
+        "<strong>Intervalo [d₁, d₂].</strong> Na mesma aba, quando indicadas duas datas, define-se um alvo adicional "
+        "correspondente à soma no calendário entre esses limites, <em>além</em> dos horizontes H que tiver selecionado."
+    )
+    _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
+    _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
+    _ix(
+        "O conjunto 𝒟<sub>t,7</sub> reúne, por ordem temporal, até <strong>sete</strong> instantes da série "
+        "<strong>estritamente posteriores</strong> a <em>t</em>, ou seja, o primeiro dia útil após <em>t</em> e os seis seguintes "
+        "no índice observado."
+    )
+
+    st.markdown("#### 2 · Métricas de erro (regressão)")
+    _ix(
+        "No conjunto de <strong>teste</strong> — tipicamente os últimos ~30% da série, preservando a ordem cronológica — "
+        "consideram-se <em>n</em> pares (<em>yᵢ</em>, <em>ŷᵢ</em>) para as definições seguintes:"
+    )
+    _lx(r"\mathrm{MAE} = \frac{1}{n}\sum_{i=1}^{n} \left| y_i - \hat{y}_i \right|")
+    _ix("O MAE mede o erro médio absoluto e exprime-se na mesma unidade que o alvo, facilitando, assim, a leitura em escala de negócio.")
+    _lx(r"\mathrm{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n} (y_i - \hat{y}_i)^2}")
+    _ix("O RMSE penaliza de forma mais acentuada os erros grandes; consequentemente, é mais sensível a outliers do que o MAE.")
+    _lx(r"R^2 = 1 - \frac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2}")
+    _ix(
+        "O R² compara o modelo a uma referência ingênua que prediz sempre a média <em>ȳ</em> do bloco de teste; "
+        "valores mais altos indicam melhor ajuste, embora devam ser interpretados em conjunto com MAE e RMSE."
+    )
+
+    st.markdown("#### 3 · Acurácia direcional (auxiliar)")
+    _ix(
+        "<strong>Acurácia direcional:</strong> calcula-se a mediana de <em>Y</em> no treino e, em teste, compara-se se "
+        "<em>y</em> e <em>ŷ</em> ficam ambos acima ou ambos abaixo dessa mediana. Este indicador complementa, portanto, "
+        "MAE, RMSE e R², focando na capacidade de antever a direção do desvio face ao patamar histórico."
+    )
+    _lx(
+        r"\hat{b}_i = \mathbb{1}\left[ \hat{y}_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right],\quad"
+        r" b_i = \mathbb{1}\left[ y_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right]"
+    )
+    _lx(r"\mathrm{Acc}_{\mathrm{dir}} = \frac{1}{n}\sum_{i=1}^{n} \mathbb{1}[\hat{b}_i = b_i]")
+
+    st.markdown("#### 4 · Pré-processamento e validação (previsão de quantidade)")
+    _ix(
+        "Após engenharia de *features* na matriz diária, calcula-se a correlação absoluta de cada coluna com o alvo; "
+        "selecionam-se as <strong>30</strong> mais correlacionadas e aplica-se <strong>PolynomialFeatures</strong> de grau 2 "
+        "(interações e termos quadráticos), sem <strong>MinMaxScaler</strong> neste fluxo."
+    )
+    _ix(
+        "A <strong>partição</strong> é cronológica: aproximadamente <strong>70% treino</strong> e <strong>30% teste</strong>. "
+        "Cada candidato é ajustado no treino e comparado no teste pelo <strong>MAE</strong>; o modelo com menor MAE "
+        "é re-treinado em toda a série histórica válida para gerar a previsão do último dia."
+    )
+    _ix(
+        "Não há otimização automática de hiperparâmetros nem *TimeSeriesSplit* adicional: os regressores "
+        "utilizam os valores fixos do *pipeline* <strong>prevhtml</strong> (abaixo)."
+    )
+
+    st.markdown("#### 5 · Modelos utilizados na previsão (fixos)")
+    rows_mod = [
+        {
+            "Modelo": "XGBoost",
+            "Implementação": "`XGBRegressor`",
+            "Notas": "n_estimators=100, learning_rate=0.05, max_depth=4, random_state fixo.",
+        },
+        {
+            "Modelo": "Random Forest",
+            "Implementação": "`RandomForestRegressor`",
+            "Notas": "n_estimators=100, max_depth=5, random_state fixo.",
+        },
+        {
+            "Modelo": "Gradient Boosting",
+            "Implementação": "`GradientBoostingRegressor`",
+            "Notas": "n_estimators=100, learning_rate=0.05, max_depth=4, random_state fixo.",
+        },
+        {
+            "Modelo": "Ridge Linear",
+            "Implementação": "`Ridge`",
+            "Notas": "alpha=1.0 (regularização L2).",
+        },
+        {
+            "Modelo": "Ensemble (Voting)",
+            "Implementação": "`VotingRegressor`",
+            "Notas": "Média das previsões dos quatro modelos anteriores (quando XGBoost está disponível).",
+        },
+    ]
+    st.dataframe(pd.DataFrame(rows_mod), width="stretch", hide_index=True)
+    _ix(
+        "A <strong>previsão oficial</strong> corresponde ao estimador com menor MAE no teste entre estes cinco; "
+        "os restantes servem de referência no relatório HTML (*benchmark*)."
+    )
+
+    st.markdown("##### Ilustrações por tipo de modelo (dados sintéticos, 1D)")
+    _ix(
+        "Ilustração pedagógica com dados fictícios: na aplicação, a previsão de quantidade usa apenas o conjunto fixo da secção 5. "
+        "O vetor <strong>X</strong> real tem muitas dimensões; estes painéis ajudam a <strong>intuir a forma</strong> "
+        "das funções (reta, degraus, *kernel*, vizinhos, árvores, *boosting*)."
+    )
+    try:
+        from sklearn.ensemble import (
+            GradientBoostingRegressor,
+            RandomForestRegressor,
+        )
+        from sklearn.linear_model import LinearRegression
+        from sklearn.neighbors import KNeighborsRegressor
+        from sklearn.svm import SVR
+        from sklearn.tree import DecisionTreeRegressor
+        from plotly.subplots import make_subplots
+
+        rng = np.random.default_rng(42)
+        n_pt = 55
+        xs = np.sort(rng.uniform(0, 10, n_pt))
+        y_true = 2.0 + 0.82 * xs
+        ys = y_true + rng.normal(0, 1.05, n_pt)
+        x_col = xs.reshape(-1, 1)
+        x_grid = np.linspace(0, 10, 200).reshape(-1, 1)
+
+        def _lo_intro(
+            title: str, *, yl: str = "y", xl: str = "x", height: int = 300
+        ) -> dict[str, Any]:
+            return _plotly_layout_direcional(
+                title=title,
+                height=height,
+                xaxis_title=f"Eixo X — {xl}",
+                yaxis_title=f"Eixo Y — {yl}",
+                margin=dict(t=88, l=48, r=28, b=118),
+                legend=_plotly_legend_bottom(),
+            )
+
+        sc_d = dict(size=7, color=PLOT_MUTED, opacity=0.72, line=dict(width=0.5, color="#fff"))
+
+        lr = LinearRegression().fit(x_col, ys)
+        y_lin = lr.predict(x_grid)
+        y_on_pts = lr.predict(x_col)
+        xx_res: list[Any] = []
+        yy_res: list[Any] = []
+        for i in range(n_pt):
+            xx_res.extend([xs[i], xs[i], None])
+            yy_res.extend([ys[i], float(y_on_pts[i]), None])
+        fig_lin = go.Figure()
+        fig_lin.add_trace(
+            go.Scatter(
+                x=xx_res,
+                y=yy_res,
+                mode="lines",
+                line=dict(color="rgba(148,163,184,0.55)", width=1.2),
+                name="Resíduo (vertical)",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig_lin.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_lin.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_lin,
+                mode="lines",
+                name="ŷ = β₀ + β₁x",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_lin.update_layout(**_lo_intro("Regressão linear (ideia Ridge / ElasticNet)"))
+
+        knn = KNeighborsRegressor(n_neighbors=5, weights="distance").fit(x_col, ys)
+        y_knn = knn.predict(x_grid)
+        _xq_demo = np.array([[5.0]], dtype=float)
+        _, kn_ix = knn.kneighbors(_xq_demo)
+        _x_band = xs[kn_ix[0]]
+        b_lo, b_hi = float(_x_band.min()), float(_x_band.max())
+        fig_knn = go.Figure()
+        fig_knn.add_vrect(
+            x0=b_lo,
+            x1=b_hi,
+            fillcolor="rgba(14, 116, 144, 0.14)",
+            layer="below",
+            line_width=0,
+        )
+        fig_knn.add_vline(
+            x=5.0,
+            line_width=1.5,
+            line_dash="dash",
+            line_color=PLOT_VERMELHO,
+        )
+        fig_knn.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_knn.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_knn,
+                mode="lines",
+                name="Média local (vizinhos)",
+                line=dict(color=PLOT_VERMELHO, width=2.8),
+            )
+        )
+        fig_knn.update_layout(**_lo_intro("k-NN — vizinhança em x (exemplo em x = 5)"))
+
+        dt = DecisionTreeRegressor(max_depth=3, random_state=42).fit(x_col, ys)
+        y_dt = dt.predict(x_grid)
+        fig_dt = go.Figure()
+        fig_dt.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_dt.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_dt,
+                mode="lines",
+                name="Predição em degraus",
+                line=dict(color=PLOT_AZUL, width=2.5),
+            )
+        )
+        for th in _sklearn_tree_split_thresholds_x0(dt):
+            fig_dt.add_vline(
+                x=th,
+                line_width=1.2,
+                line_dash="dot",
+                line_color="rgba(100,116,139,0.72)",
+            )
+        fig_dt.update_layout(**_lo_intro("Árvore de decisão — cortes em x e patamares"))
+
+        rf = RandomForestRegressor(
+            n_estimators=60, max_depth=4, random_state=42, n_jobs=-1
+        ).fit(x_col, ys)
+        y_rf = rf.predict(x_grid)
+        tricol = [PLOT_AZUL, PLOT_VERMELHO, PLOT_ACCENT]
+        fig_rf = make_subplots(
+            rows=2,
+            cols=1,
+            row_heights=[0.36, 0.64],
+            vertical_spacing=0.13,
+            subplot_titles=(
+                "Três árvores de decisão do ensemble (cada curva = degraus)",
+                "Random Forest: muitas árvores (cinza) + média agregada",
+            ),
+        )
+        for j, est in enumerate(rf.estimators_[:3]):
+            ytj = est.predict(x_grid)
+            fig_rf.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=ytj,
+                    mode="lines",
+                    name=f"Árvore {j + 1}",
+                    line=dict(width=2.6, color=tricol[j % len(tricol)]),
+                ),
+                row=1,
+                col=1,
+            )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                name="Observações",
+                marker=sc_d,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        for est in rf.estimators_[:12]:
+            yt = est.predict(x_grid)
+            fig_rf.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=yt,
+                    mode="lines",
+                    line=dict(width=0.9, color="rgba(100,116,139,0.28)"),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=2,
+                col=1,
+            )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_rf,
+                mode="lines",
+                name="Média das árvores",
+                line=dict(color=PLOT_AZUL, width=3),
+            ),
+            row=2,
+            col=1,
+        )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker=sc_d,
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=2,
+            col=1,
+        )
+        fig_rf.update_layout(
+            **_plotly_layout_direcional(
+                title="Random Forest — árvores de decisão e voto pela média",
+                height=560,
+                margin=dict(t=92, l=48, r=28, b=138),
+                legend=_plotly_legend_bottom(),
+            )
+        )
+        fig_rf.update_xaxes(title_text="Eixo X — x", row=1, col=1)
+        fig_rf.update_xaxes(title_text="Eixo X — x", row=2, col=1)
+        fig_rf.update_yaxes(title_text="Eixo Y — ŷ", row=1, col=1)
+        fig_rf.update_yaxes(title_text="Eixo Y — ŷ", row=2, col=1)
+
+        gbr = GradientBoostingRegressor(
+            n_estimators=14,
+            max_depth=2,
+            learning_rate=0.45,
+            subsample=0.9,
+            random_state=42,
+        ).fit(x_col, ys)
+        staged = list(gbr.staged_predict(x_grid))
+        fig_gb = go.Figure()
+        fig_gb.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        show_st = [0, 3, 7, len(staged) - 1]
+        dash_c = ["dot", "dash", "longdash", "solid"]
+        for i, si in enumerate(show_st):
+            lab = f"Após árvore {si + 1}" if si < len(staged) - 1 else "Modelo completo"
+            fig_gb.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=staged[si],
+                    mode="lines",
+                    name=lab,
+                    line=dict(
+                        width=2.4 if i == len(show_st) - 1 else 1.6,
+                        color=PLOT_VERMELHO if i == len(show_st) - 1 else PLOT_ACCENT,
+                        dash=dash_c[i],
+                    ),
+                )
+            )
+        fig_gb.update_layout(**_lo_intro("Gradient boosting — soma progressiva de árvores fracas"))
+
+        svr = SVR(kernel="rbf", C=12.0, epsilon=0.2, gamma=0.28).fit(x_col, ys)
+        y_svr = svr.predict(x_grid)
+        eps_svr = float(getattr(svr, "epsilon", 0.2) or 0.2)
+        xg1 = x_grid.ravel()
+        y_up = y_svr.ravel() + eps_svr
+        y_lo = y_svr.ravel() - eps_svr
+        fig_svr = go.Figure()
+        fig_svr.add_trace(
+            go.Scatter(
+                x=np.concatenate([xg1, xg1[::-1]]),
+                y=np.concatenate([y_up, y_lo[::-1]]),
+                fill="toself",
+                fillcolor="rgba(14, 116, 144, 0.16)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name=f"Tubo insensível ε = {eps_svr:g}",
+                hoverinfo="skip",
+            )
+        )
+        fig_svr.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_svr.add_trace(
+            go.Scatter(
+                x=xg1,
+                y=y_svr,
+                mode="lines",
+                name="Kernel RBF (f)",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_svr.update_layout(**_lo_intro("SVR — tubo ε e curva suave (kernel RBF)"))
+
+        r1a, r1b = st.columns(2)
+        with r1a:
+            st.plotly_chart(fig_lin, width="stretch", config=_ipc)
+            st.caption(
+                "**Lineares:** reta que minimiza o erro; os traços verticais cinzentos mostram o **resíduo** em cada ponto. "
+                "Com Ridge/ElasticNet, os coeficientes encolhem (L2/L1)."
+            )
+        with r1b:
+            st.plotly_chart(fig_knn, width="stretch", config=_ipc)
+            st.caption(
+                "**k-NN:** a **faixa esbatida** contém os *k*=5 pontos de treino mais próximos de *x*=5 (linha tracejada); "
+                "a curva vermelha é a média **ponderada pela distância** ao longo de todo o eixo."
+            )
+
+        r2a, r2b = st.columns(2)
+        with r2a:
+            st.plotly_chart(fig_dt, width="stretch", config=_ipc)
+            st.caption(
+                "**Árvore única:** as **linhas tracejadas** marcam os cortes em *x*; entre dois cortes consecutivos a predição é **constante** (degraus)."
+            )
+        with r2b:
+            st.plotly_chart(fig_rf, width="stretch", config=_ipc)
+            st.caption(
+                "**Random Forest:** em cima, **três árvores** reais do modelo (cada cor = uma função em degraus). "
+                "Em baixo, dezenas de árvores (cinza) e a **média** (linha forte) — é assim que o *ensemble* reduz variância."
+            )
+
+        r3a, r3b = st.columns(2)
+        with r3a:
+            st.plotly_chart(fig_gb, width="stretch", config=_ipc)
+            st.caption(
+                "**Boosting (LightGBM / XGBoost / CatBoost):** cada curva tracejada acumula mais uma **árvore fraca** que mexe nos resíduos; "
+                "a linha vermelha final é o modelo completo."
+            )
+        with r3b:
+            st.plotly_chart(fig_svr, width="stretch", config=_ipc)
+            st.caption(
+                "**SVR:** a faixa semitransparente é o **tubo ε** (erros pequenos não penalizam); a linha azul é a função suave dada pelo **kernel RBF**."
+            )
+
+        med_y = float(np.median(ys))
+        fig_base = go.Figure()
+        fig_base.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_base.add_trace(
+            go.Scatter(
+                x=[0, 10],
+                y=[med_y, med_y],
+                mode="lines",
+                name="Baseline mediana",
+                line=dict(color=PLOT_VERMELHO, width=2.8, dash="dash"),
+            )
+        )
+        fig_base.update_layout(**_lo_intro("Baseline — predição constante (mediana)"))
+        st.plotly_chart(fig_base, width="stretch", config=_ipc)
+        st.caption(
+            "**Stack / ensemble:** combina predições de vários modelos (por média ponderada ou meta-modelo); "
+            "a mediana é a referência ingénua mais simples."
+        )
+    except Exception as _e_intro_viz:
+        st.caption(
+            f"Não foi possível gerar as ilustrações automáticas (dependências ou ambiente: {_e_intro_viz!s}). "
+            "Instale `scikit-learn` e confirme a versão compatível com o projeto."
+        )
+
+    st.markdown("#### 6 · *Gradient boosting* (LightGBM) — parâmetros (referência pedagógica)")
+    _ix(
+        "Tabela ilustrativa de hiperparâmetros típicos em bibliotecas do tipo LightGBM/XGBoost. "
+        "Na <strong>previsão de quantidade</strong> desta aplicação não se usa LightGBM nem busca automática de hiperparâmetros: "
+        "o treino segue o script <strong>prevhtml</strong> (XGBoost, Random Forest, Gradient Boosting, Ridge, Voting)."
+    )
+    ex_hp = pd.DataFrame(
+        [
+            {"Parâmetro": "n_estimators", "Significado": "Número de árvores na sequência", "Exemplo": "200–2000"},
+            {"Parâmetro": "learning_rate", "Significado": "Passo de cada árvore", "Exemplo": "0.01–0.2"},
+            {"Parâmetro": "num_leaves", "Significado": "Complexidade folhas (2^profundidade efetiva)", "Exemplo": "16–256"},
+            {"Parâmetro": "min_child_samples", "Significado": "Mínimo de amostras por folha", "Exemplo": "5–120"},
+            {"Parâmetro": "subsample / colsample", "Significado": "Amostragem de linhas / colunas", "Exemplo": "0.6–1.0"},
+            {"Parâmetro": "reg_alpha / reg_lambda", "Significado": "Regularização L1 / L2", "Exemplo": "1e-8–10"},
+        ]
+    )
+    st.dataframe(ex_hp, width="stretch", hide_index=True)
+
+    st.markdown("#### 7 · Dossiê (EDA)")
+    _ix(
+        "O <strong>Dossiê</strong> agrega, de forma estruturada, estatísticas descritivas, análise de outliers, "
+        "matrizes de correlação, VIF, histogramas e o perfil semanal — permitindo, assim, uma leitura integrada da qualidade dos dados."
+    )
+    st.markdown(
+        """
+<div class="pv-fullbleed-table-wrap">
+<table style="font-size:0.92rem;color:#334155">
+<thead><tr style="border-bottom:2px solid #e2e8f0">
+<th style="padding:10px 12px;text-align:left;width:22%">Bloco</th>
+<th style="padding:10px 12px;text-align:left">Conteúdo típico</th>
+</tr></thead>
+<tbody>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Descritivas</td>
+<td style="padding:10px 12px;text-align:left">Média, mediana, moda, DP, quartis, percentis, curtose</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Outliers IQR</td>
+<td style="padding:10px 12px;text-align:left">Limites Q1−1,5·IQR e Q3+1,5·IQR</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Correlação</td>
+<td style="padding:10px 12px;text-align:left">Pearson entre <em>features</em> e alvos amostrados</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">VIF</td>
+<td style="padding:10px 12px;text-align:left">Redundância linear (subconjunto de colunas)</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Distribuições</td>
+<td style="padding:10px 12px;text-align:left">Histogramas de qtd e VGV diários</td></tr>
+<tr><td style="padding:10px 12px;text-align:left;vertical-align:top">Perfil semanal</td>
+<td style="padding:10px 12px;text-align:left">Médias por dia da semana</td></tr>
+</tbody></table></div>
+""",
+        unsafe_allow_html=True,
+    )
+    _ix("<strong>Correlação de Pearson</strong> (amostral) entre variáveis <em>x</em> e <em>y</em>:")
+    _lx(
+        r"r_{xy} = \frac{\sum_i (x_i - \bar{x})(y_i - \bar{y})}"
+        r"{\sqrt{\sum_i (x_i-\bar{x})^2}\,\sqrt{\sum_i (y_i-\bar{y})^2}}"
+    )
+    _ix("<strong>VIF</strong> da variável <em>j</em> (via regressão OLS de <em>xⱼ</em> nas demais colunas do subconjunto):")
+    _lx(r"\mathrm{VIF}_j = \frac{1}{1 - R^2_j}")
+    _ix(
+        "Aqui, R²ⱼ designa o coeficiente de determinação dessa regressão auxiliar; assim, valores de VIF elevados "
+        "(&gt; 5–10) sugerem colinearidade potencialmente problemática."
+    )
+    _ix(
+        "<strong>Outliers (regra IQR):</strong> define-se IQR = Q3 − Q1; os pontos fora de [L<sub>inf</sub>, L<sub>sup</sub>] "
+        "são destacados para análise, todavia <strong>não</strong> são eliminados automaticamente do alvo de negócio."
+    )
+    _lx(
+        r"L_{\mathrm{inf}} = Q_1 - 1.5 \cdot \mathrm{IQR},\quad "
+        r"L_{\mathrm{sup}} = Q_3 + 1.5 \cdot \mathrm{IQR}"
+    )
+
+    st.markdown("#### 8 · Gráficos de exemplo")
+    _ix(
+        "Os gráficos abaixo replicam os tipos utilizados na aba <strong>Análises</strong>; porém, os dados são sintéticos "
+        "e destinam-se apenas a ilustrar a leitura visual."
+    )
+    g1, g2 = st.columns(2)
+    with g1:
+        fig_ex = go.Figure(
+            go.Bar(
+                x=[0.28, 0.19, 0.14, 0.11, 0.09, 0.08, 0.06],
+                y=[
+                    "Lag vendas 1d",
+                    "Leads méd. 7d",
+                    "Dia da semana",
+                    "Feriado (fwd)",
+                    "Macro (z)",
+                    "Ticket lag",
+                    "Outras",
+                ],
+                orientation="h",
+                marker_color=PLOT_AZUL,
+            )
+        )
+        fig_ex.update_layout(
+            **_plotly_layout_direcional(
+                title="Importância relativa (exemplo)",
+                height=360,
+                showlegend=False,
+                margin=dict(l=160, r=24, t=52, b=40),
+                xaxis_title="Peso relativo",
+            ),
+        )
+        st.plotly_chart(fig_ex, width="stretch", config=_ipc)
+    with g2:
+        lbl = ["A", "B", "C", "D"]
+        z = [[1.0, 0.35, -0.12, 0.08], [0.35, 1.0, 0.22, -0.05], [-0.12, 0.22, 1.0, 0.41], [0.08, -0.05, 0.41, 1.0]]
+        fig_c = go.Figure(
+            go.Heatmap(
+                z=z,
+                x=lbl,
+                y=lbl,
+                colorscale=[[0, PLOT_VERMELHO], [0.5, "#f1f5f9"], [1, PLOT_AZUL]],
+                zmin=-1,
+                zmax=1,
+                zmid=0,
+            )
+        )
+        fig_c.update_layout(
+            **_plotly_layout_direcional(
+                title="Correlação (exemplo)",
+                height=360,
+                margin=dict(l=48, r=48, t=52, b=48),
+            ),
+        )
+        st.plotly_chart(fig_c, width="stretch", config=_ipc)
+
+    fig_ser = go.Figure()
+    fig_ser.add_trace(
+        go.Scatter(
+            y=[12, 15, 11, 18, 22, 19, 24, 21, 26, 23],
+            mode="lines+markers",
+            name="Série A",
+            line=dict(color=PLOT_AZUL, width=2.5),
+        )
+    )
+    fig_ser.add_trace(
+        go.Scatter(
+            y=[13, 14, 13, 17, 21, 20, 23, 22, 25, 24],
+            mode="lines",
+            name="Série B",
+            line=dict(color=PLOT_VERMELHO, width=2, dash="dot"),
+        )
+    )
+    fig_ser.update_layout(
+        **_plotly_layout_direcional(
+            title="Duas séries (exemplo)",
+            height=340,
+            xaxis_title="Eixo X — ordem no tempo",
+            yaxis_title="Eixo Y — valor",
+            legend=_plotly_legend_bottom(),
+            margin=dict(t=100, l=56, r=48, b=108),
+        ),
+    )
+    st.plotly_chart(fig_ser, width="stretch", config=_ipc)
+
+    st.markdown("#### 9 · Abas")
+    _ix("Segue-se um resumo orientativo das secções da aplicação:")
+    st.markdown(
+        """
+<div class="pv-fullbleed-table-wrap" style="margin-bottom:1.5rem !important">
+<table style="font-size:0.92rem;color:#334155">
+<thead><tr style="border-bottom:2px solid #e2e8f0">
+<th style="padding:10px 14px;text-align:left;width:22%">Secção</th>
+<th style="padding:10px 14px;text-align:left">Conteúdo</th>
+</tr></thead>
+<tbody>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Introdução</strong></td>
+<td style="padding:10px 14px;text-align:left">Conceitos e notação</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Análises</strong></td>
+<td style="padding:10px 14px;text-align:left">Indicadores e gráficos da série diária</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Formulário</strong></td>
+<td style="padding:10px 14px;text-align:left">Previsões humanas do Esboço: gráficos previsão × real, filtros e tabelas por região/canal</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Previsões</strong></td>
+<td style="padding:10px 14px;text-align:left">Treino, tabela e exportação HTML</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Dossiê</strong></td>
+<td style="padding:10px 14px;text-align:left">EDA; métricas e importância de <em>features</em> na sub-aba <strong>Modelos</strong> (com treino)</td></tr>
+<tr><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Apêndice</strong></td>
+<td style="padding:10px 14px;text-align:left">Metodologia e hiperparâmetros</td></tr>
+</tbody></table></div>
+""",
+        unsafe_allow_html=True,
+    )
+    _ix(
+        "Repare-se que a opção <em>Carregar dados</em>, nas abas <strong>Análises</strong>, <strong>Dossiê</strong> e <strong>Apêndice</strong>, "
+        "atualiza apenas a matriz e os resumos exploratórios, <strong>sem</strong> executar o treino preditivo."
+    )
+
+
+def _render_streamlit_ml_feature_importance(
+    por_h: dict[Any, dict[str, Any]],
+    plot_config: dict[str, Any],
+) -> None:
+    """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
+    import plotly.graph_objects as go
+
+    hz_keys = _chaves_horizonte_em_por_h(por_h)
+    _tem_imp = any(
+        (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
+        for h in hz_keys
+    )
+    if _tem_imp:
+        st.markdown(
+            '<p class="pv-section-title">Importância de features (quantidade, por horizonte)</p>',
+            unsafe_allow_html=True,
+        )
+        for h in hz_keys:
+            sub = por_h.get(h) or {}
+            st.caption(f"**H={h}d** — volume (quantidade)")
+            names = sub.get("qtd", {}).get("importance_names") or []
+            vals = sub.get("qtd", {}).get("importance_vals") or []
+            if names and vals:
+                top_n = min(18, len(names))
+                fig_i = go.Figure(
+                    go.Bar(
+                        x=vals[:top_n][::-1],
+                        y=names[:top_n][::-1],
+                        orientation="h",
+                        marker_color=PLOT_AZUL,
+                        marker_line=dict(width=0),
+                    )
+                )
+                fig_i.update_layout(
+                    **_plotly_layout_direcional(
+                        height=28 * top_n + 88,
+                        margin=dict(l=220, r=40, t=40, b=48),
+                        xaxis_title="Importância",
+                        showlegend=False,
+                    ),
+                )
+                st.plotly_chart(fig_i, width="stretch", config=plot_config)
+            else:
+                st.caption("— (modelo atual não expõe importância)")
+        st.divider()
+    else:
+        st.markdown(
+            '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin-top:0.5rem">'
+            "Importância de <em>features</em> por horizonte: disponível após <strong>Gerar previsões</strong>.</p>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+
+def _render_streamlit_tab_analises(
+    daily: dict[str, Any],
+    stats_base: dict[str, float],
+    ticket: float,
+    conv: float,
+) -> None:
+    import plotly.graph_objects as go
+
+    st.markdown(
+        '<p class="pv-section-title">Indicadores consolidados (histórico diário)</p>',
+        unsafe_allow_html=True,
+    )
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Leads", f"{stats_base['leads']:,.0f}")
+    with k2:
+        st.metric("Agendamentos", f"{stats_base['agend']:,.0f}")
+    with k3:
+        st.metric("Visitas", f"{stats_base['visit']:,.0f}")
+    with k4:
+        st.metric("Pastas", f"{stats_base['pastas']:,.0f}")
+    with k5:
+        st.metric("Vendas (qtd)", f"{stats_base['vendas']:,.0f}")
+
+    k6, k7, k8 = st.columns(3)
+    with k6:
+        st.metric("VGV acumulado", f"R$ {stats_base['vgv']/1e6:.2f} M")
+    with k7:
+        st.metric("Ticket médio", f"R$ {ticket/1e3:,.0f} k")
+    with k8:
+        st.metric("Conversão leads → vendas", f"{conv:.2f} %")
+
+    st.markdown(
+        "<p class=\"pv-caption-center\">"
+        f"A matriz diária subjacente contém {daily.get('n_rows', 0):,} dias e {daily.get('n_features', 0)} colunas "
+        "após engenharia de atributos.</p>",
+        unsafe_allow_html=True,
+    )
+
+    dates = daily.get("dates") or []
+    if not dates:
+        st.warning("Não há datas na série temporal; portanto, os gráficos não podem ser exibidos.")
         return
 
-    _cabecalho_pagina(com_intro_formulario=True)
+    _pc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
+    fig_f = go.Figure()
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_leads"],
+            name="Leads",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(4, 66, 143, 0.42)",
+            hovertemplate="<b>Leads</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_agend"],
+            name="Agend.",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(203, 9, 53, 0.32)",
+            hovertemplate="<b>Agend.</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_visit"],
+            name="Visitas",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(14, 116, 144, 0.38)",
+            hovertemplate="<b>Visitas</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_pastas"],
+            name="Pastas",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(4, 66, 143, 0.22)",
+            hovertemplate="<b>Pastas</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["target_qtd"],
+            name="Vendas (linha)",
+            yaxis="y2",
+            mode="lines",
+            line=dict(color=PLOT_AZUL, width=2.8),
+            hovertemplate="%{x}<br>Quantidade: %{y:,.0f}<extra></extra>",
+        )
+    )
+    vgv_mi = [float(v) / 1e6 for v in daily["target_valor"]]
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=vgv_mi,
+            name="VGV (linha)",
+            yaxis="y3",
+            mode="lines",
+            line=dict(color=PLOT_VERMELHO, width=2.2, dash="dot"),
+            hovertemplate="%{x}<br>Valor: %{y:.3f} mi R$<extra></extra>",
+        )
+    )
+    _lo_f = _plotly_layout_direcional(
+        title="Funil diário (empilhado) e alvos",
+        height=500,
+        legend=_plotly_legend_bottom(),
+        margin=dict(t=108, l=58, r=62, b=120),
+    )
+    _xr_f = _plotly_xaxis_range_from_dates(dates)
+    if _xr_f:
+        _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
+    fig_f.update_layout(
+        **_lo_f,
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y₁ — contagens do funil (empilhadas, / dia)",
+        yaxis2=dict(
+            overlaying="y",
+            side="right",
+            title=dict(
+                text="Eixo Y₂ — quantidade vendida (/ dia)",
+                font=dict(size=12, color=PLOT_AZUL),
+            ),
+            showgrid=False,
+            tickfont=dict(size=11),
+        ),
+        yaxis3=dict(
+            anchor="free",
+            overlaying="y",
+            side="right",
+            position=0.97,
+            title=dict(
+                text="Eixo Y₃ — valor vendido (mi R$ / dia)",
+                font=dict(size=12, color=PLOT_VERMELHO),
+            ),
+            showgrid=False,
+            tickfont=dict(size=11),
+        ),
+    )
+    st.plotly_chart(fig_f, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
 
-    if _design_teste_habilitado():
-        with st.expander(
-            "Modo teste de design — popup de conclusão (sem enviar dados)",
-            expanded=_design_teste_expander_aberto(),
-        ):
+    tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
+    roll7 = tq.rolling(7, min_periods=1).mean()
+    fig_roll = go.Figure()
+    fig_roll.add_trace(
+        go.Scatter(
+            x=dates,
+            y=tq.tolist(),
+            name="Observado (dia a dia)",
+            line=dict(color=PLOT_MUTED, width=1.2),
+        )
+    )
+    fig_roll.add_trace(
+        go.Scatter(
+            x=dates,
+            y=roll7.tolist(),
+            name="Suavização (MM7)",
+            line=dict(color=PLOT_AZUL, width=2.8),
+        )
+    )
+    _lo_roll = _plotly_layout_direcional(
+        title="Vendas diárias e suavização (7 dias)",
+        height=380,
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+        legend=_plotly_legend_bottom(),
+        margin=dict(t=100, l=56, r=52, b=112),
+    )
+    _xr_roll = _plotly_xaxis_range_from_dates(dates)
+    if _xr_roll:
+        _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
+    fig_roll.update_layout(**_lo_roll)
+    st.plotly_chart(fig_roll, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
+
+    fig_sc = go.Figure()
+    fig_sc.add_trace(
+        go.Scatter(
+            x=daily["vol_leads"],
+            y=daily["target_qtd"],
+            mode="markers",
+            marker=dict(size=7, opacity=0.5, color=PLOT_AZUL, line=dict(width=0.5, color="#ffffff")),
+            name="Leads × vendas (mesmo dia)",
+        )
+    )
+    fig_sc.update_layout(
+        **_plotly_layout_direcional(
+            title="Dispersão: leads vs vendas (mesmo dia)",
+            height=400,
+            xaxis_title="Eixo X — leads (/ dia)",
+            yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+        ),
+    )
+    st.plotly_chart(fig_sc, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Leads × vendas (mesmo dia)", _interpret_text_leads_vendas(daily))
+
+    dl = daily.get("dow_labels") or []
+    fig_d = go.Figure()
+    fig_d.add_trace(
+        go.Bar(
+            x=dl,
+            y=daily.get("dow_mean_qtd") or [],
+            name="Barras — quantidade",
+            marker_color=PLOT_AZUL,
+            marker_line=dict(width=0),
+        )
+    )
+    fig_d.add_trace(
+        go.Bar(
+            x=dl,
+            y=[float(v) / 1e6 for v in (daily.get("dow_mean_valor") or [])],
+            name="Barras — VGV",
+            marker_color=PLOT_VERMELHO,
+            marker_line=dict(width=0),
+            yaxis="y2",
+        )
+    )
+    fig_d.update_layout(
+        **_plotly_layout_direcional(
+            title="Perfil por dia da semana (média histórica)",
+            height=420,
+            barmode="group",
+            xaxis_title="Eixo X — dia da semana",
+            yaxis_title="Eixo Y₁ — média de quantidade (/ dia)",
+            legend=_plotly_legend_bottom(),
+            margin=dict(t=100, l=56, r=52, b=112),
+            yaxis2=dict(
+                overlaying="y",
+                side="right",
+                title="Eixo Y₂ — média de VGV (mi R$ / dia)",
+                showgrid=False,
+                tickfont=dict(size=11),
+            ),
+        ),
+    )
+    st.plotly_chart(fig_d, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Média por dia da semana", _interpret_text_dow(daily))
+
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        fig_h = go.Figure(
+            data=go.Heatmap(
+                z=cz,
+                x=cl,
+                y=cl,
+                colorscale=[
+                    [0.0, PLOT_VERMELHO],
+                    [0.5, "#f1f5f9"],
+                    [1.0, PLOT_AZUL],
+                ],
+                zmid=0,
+                zmin=-1,
+                zmax=1,
+                hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>",
+            )
+        )
+        fig_h.update_layout(
+            **_plotly_layout_direcional(
+                title="Correlação (Pearson) — variáveis-chave",
+                height=max(340, 30 * len(cl)),
+                margin=dict(l=130, r=48, t=56, b=130),
+            ),
+        )
+        st.plotly_chart(fig_h, width="stretch", config=_pc)
+        _st_interpretacao_grafico("Matriz de correlação (Pearson)", _interpret_text_correlation_matrix(cl, cz))
+        st.caption(
+            "A matriz resume associações lineares entre pares de variáveis; para ver a nuvem de pontos entre **quaisquer duas** "
+            "colunas numéricas (incluindo `target_qtd` e `target_valor`), utilize a secção **Dispersão — par de variáveis** abaixo — "
+            "ou o gráfico fixo **leads × vendas** mais acima nesta aba."
+        )
+    else:
+        st.markdown(
+            '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">A matriz de correlação não está disponível, '
+            "seja por falta de colunas numéricas suficientes, seja por dados insuficientes.</p>",
+            unsafe_allow_html=True,
+        )
+
+    ns_pick = daily.get("numeric_series_for_picker") or {}
+    n_pick_cols = len(ns_pick)
+    if n_pick_cols >= 2:
+        ref_len = len(next(iter(ns_pick.values())))
+        if any(len(v) != ref_len for v in ns_pick.values()):
+            st.warning(
+                "As séries numéricas do seletor têm comprimentos inconsistentes; volte a carregar ou a regenerar a matriz diária."
+            )
+        else:
             st.markdown(
-                "Simula o **cadastro concluído**: abre só o **popup** (confirmação, mapa, vídeo e links), "
-                "sem gravar na planilha nem no Salesforce. O PDF e o e-mail usam **dados fictícios** para você ver o layout."
+                '<p class="pv-section-title">Dispersão — par de variáveis</p>',
+                unsafe_allow_html=True,
             )
             st.caption(
-                "Ative este bloco com a variável de ambiente **FICHA_DESIGN_TEST=1** "
-                "ou com **?design_test=1** na URL (o expander abre já expandido)."
+                "Escolha duas colunas numéricas da matriz diária: cada ponto corresponde ao mesmo dia civil (pares alinhados por data). "
+                "O coeficiente r de Pearson resume a associação linear da nuvem. "
+                "Para cruzar com vendas, utilize `target_qtd` ou `target_valor` em X ou em Y; para comparar métricas do funil, "
+                "selecione, por exemplo, `vol_leads` e `vol_visit`."
             )
-            if st.button(
-                "Simular cadastro enviado e abrir o popup",
-                type="secondary",
-                key="ficha_simular_sucesso_design",
-            ):
-                _ativar_cenario_teste_design()
-                st.rerun()
+            opts_pick = sorted(ns_pick.keys())
+            ix_x = opts_pick.index("vol_leads") if "vol_leads" in opts_pick else 0
+            ix_y = opts_pick.index("target_qtd") if "target_qtd" in opts_pick else min(1, len(opts_pick) - 1)
+            if ix_y == ix_x and len(opts_pick) > 1:
+                ix_y = (ix_x + 1) % len(opts_pick)
+            cxa, cxb = st.columns(2)
+            with cxa:
+                sel_x = st.selectbox(
+                    "Variável — eixo horizontal (X)",
+                    options=opts_pick,
+                    index=ix_x,
+                    key="pv_pair_var_x",
+                )
+            with cxb:
+                sel_y = st.selectbox(
+                    "Variável — eixo vertical (Y)",
+                    options=opts_pick,
+                    index=ix_y,
+                    key="pv_pair_var_y",
+                )
+            if sel_x == sel_y:
+                st.warning("Selecione duas variáveis distintas para exibir a dispersão e o coeficiente de correlação.")
+            else:
+                xv = ns_pick.get(sel_x) or []
+                yv = ns_pick.get(sel_y) or []
+                if len(xv) != len(yv):
+                    st.warning(
+                        "O comprimento das séries escolhidas não coincide; por favor, volte a carregar os dados."
+                    )
+                else:
+                    r_xy, n_xy = _pearson_pairwise_complete(xv, yv)
+                    mxa, mxb = st.columns(2)
+                    with mxa:
+                        st.metric("r de Pearson (X, Y)", f"{r_xy:+.3f}" if r_xy is not None else "—")
+                    with mxb:
+                        st.metric("Observações válidas (ambas finitas)", f"{n_xy:,}")
+                    xlab = str(sel_x) if len(str(sel_x)) <= 48 else str(sel_x)[:45] + "…"
+                    ylab = str(sel_y) if len(str(sel_y)) <= 48 else str(sel_y)[:45] + "…"
+                    use_dates = len(dates) == len(xv) == len(yv)
+                    htempl = (
+                        f"Data=%{{customdata}}<br>{xlab}=%{{x:.4g}}<br>{ylab}=%{{y:.4g}}<extra></extra>"
+                        if use_dates
+                        else f"{xlab}=%{{x:.4g}}<br>{ylab}=%{{y:.4g}}<extra></extra>"
+                    )
+                    fig_pair = go.Figure(
+                        data=go.Scatter(
+                            x=xv,
+                            y=yv,
+                            mode="markers",
+                            marker=dict(
+                                size=8,
+                                opacity=0.55,
+                                color=PLOT_AZUL,
+                                line=dict(width=0.45, color="#fff"),
+                            ),
+                            customdata=dates if use_dates else None,
+                            hovertemplate=htempl,
+                        )
+                    )
+                    fig_pair.update_layout(
+                        **_plotly_layout_direcional(
+                            title=f"Dispersão: {xlab} × {ylab}",
+                            height=440,
+                            xaxis_title=f"Eixo X — {xlab}",
+                            yaxis_title=f"Eixo Y — {ylab}",
+                            margin=dict(t=56, l=56, r=48, b=100),
+                        ),
+                    )
+                    st.plotly_chart(fig_pair, width="stretch", config=_pc)
+                    _txt_r = (
+                        f"O coeficiente de Pearson estimado é r = {r_xy:+.3f}, com n = {n_xy} dias em que ambos os valores são finitos."
+                        if r_xy is not None
+                        else "O coeficiente de Pearson não é definido (poucos pontos ou variância nula num dos eixos)."
+                    )
+                    _st_interpretacao_grafico(
+                        "Leitura",
+                        f"«{sel_x}» (eixo X) e «{sel_y}» (eixo Y) estão emparelhados por dia civil. {_txt_r} "
+                        "Trata-se de correlação linear contemporânea; assim, não implica causalidade nem substitui modelos com defasagem explícita.",
+                    )
+    elif n_pick_cols == 1:
+        st.caption(
+            "Para comparar duas variáveis na dispersão, a matriz diária precisa de pelo menos **duas** colunas numéricas além do índice."
+        )
+    elif not ns_pick:
+        st.caption(
+            "Para habilitar o seletor de pares numéricos, execute novamente **Carregar dados** ou **Gerar previsões**, "
+            "pois resultados antigos em cache podem não incluir `numeric_series_for_picker`."
+        )
 
-    _init_defaults()
-    iniciar_sessao_formulario()
-    secoes = secoes_com_campos_visiveis()
-    _render_secao_formulario(secoes)
-
-    fe = ss.get("ficha_erros_envio")
-    if fe:
-        kind = fe.get("kind")
-        if kind == "validation":
-            linhas = "<br>".join(f"• {html.escape(e)}" for e in fe.get("items") or [])
-            _alert_vermelho_html(
-                f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
+    macro = daily.get("macro") or {}
+    if macro:
+        fig_m = go.Figure()
+        for name, series in macro.items():
+            s = pd.to_numeric(pd.Series(series), errors="coerce").fillna(0.0)
+            if s.std() and float(s.std()) > 0:
+                z = ((s - s.mean()) / s.std()).tolist()
+            else:
+                z = [0.0] * len(s)
+            fig_m.add_trace(
+                go.Scatter(
+                    x=dates,
+                    y=z,
+                    name=str(name),
+                    mode="lines",
+                    line=dict(width=2),
+                )
             )
-        elif kind == "html":
-            _alert_vermelho(FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO)
-        elif kind == "text":
-            _alert_vermelho(fe.get("text") or "")
+        _lo_m = _plotly_layout_direcional(
+            title="Indicadores macro (z-score por série)",
+            height=400,
+            xaxis_title="Eixo X — data",
+            yaxis_title="Eixo Y — desvio em σ (por série)",
+            legend=_plotly_legend_bottom(),
+            margin=dict(t=100, l=56, r=52, b=112),
+        )
+        _xr_m = _plotly_xaxis_range_from_dates(dates)
+        if _xr_m:
+            _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
+        fig_m.update_layout(**_lo_m)
+        st.plotly_chart(fig_m, width="stretch", config=_pc)
+        _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
+
+    st.divider()
+    oa_key, oa_model = _openai_key_and_model()
+    if oa_key:
+        with st.expander("Síntese em prosa (OpenAI)", expanded=False):
+            st.caption(
+                f"Modelo configurado: `{oa_model}`. O texto gerado baseia-se exclusivamente nos resumos automáticos desta aba."
+            )
+            if st.button("Gerar síntese", key="pv_eda_openai_btn"):
+                facts = _facts_eda_compact(daily)
+                with st.spinner("A contactar a API…"):
+                    syn = _openai_eda_synopsis(facts)
+                if syn:
+                    st.session_state["pv_eda_openai_syn"] = syn
+                else:
+                    st.error(
+                        "Não foi obtida resposta válida da API; verifique a rede, quotas ou a chave de autenticação."
+                    )
+            if st.session_state.get("pv_eda_openai_syn"):
+                st.markdown(st.session_state["pv_eda_openai_syn"])
+
+
+def _render_streamlit_tab_apendice(
+    por_h: dict[int, dict[str, Any]],
+    best_params_preview: dict[Any, dict[str, dict[str, Any]]],
+    full_period_train: bool,
+    blend_top_k: int,
+    random_seed: int,
+    daily: dict[str, Any],
+) -> None:
+    hz_keys_ap = _chaves_horizonte_em_por_h(por_h)
+    hz_txt = ", ".join(str(x) for x in (hz_keys_ap or list(HORIZONTES_PREVISAO_DISPONIVEIS)))
+    modo = (
+        "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
+        "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
+        if full_period_train
+        else "Adota-se uma divisão **70% treino / 30% teste** segundo a ordem cronológica; ademais, nos 70% iniciais, "
+        "reserva-se cerca de 8% no extremo temporal para validação interna na escolha do *ensemble*. "
+        "Neste cenário, as métricas principais (MAE, RMSE, R², entre outras) reportam-se ao **bloco de teste (30%)**."
+    )
+    st.markdown(
+        '<p class="pv-section-title">Apêndice</p>',
+        unsafe_allow_html=True,
+    )
+    _tab_labels = ["Metodologia"] + [f"H = {h} dias" for h in hz_keys_ap] + ["Personalizado"]
+    ap_tabs = st.tabs(_tab_labels)
+    with ap_tabs[0]:
+        st.markdown(
+            f"""
+#### Resumo
+
+- **Alvo (previsão):** apenas **quantidade** — soma de vendas (unidades) nos **H** dias seguintes a *t*, com *H* ∈ {{{hz_txt}}}. Na aba **Previsões**, um intervalo de datas pode definir um alvo **complementar** também em quantidade.
+- **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia (as abas de análise continuam a usar VGV onde aplicável).
+- **Validação:** {modo}
+- **Modelos (fixos):** **XGBoost**, **Random Forest**, **Gradient Boosting**, **Ridge** (`alpha=1.0`) e **VotingRegressor**; competição por MAE no teste cronológico; **PolynomialFeatures** (grau 2) sobre as 30 variáveis mais correlacionadas com o alvo. Semente: **{random_seed}**.
+- **Tabelas binárias no HTML:** comparam-se previsões à mediana de *y* no treino do benchmark.
+
+O relatório HTML na aba **Previsões** inclui gráficos, curvas ROC e *benchmark* dos modelos de quantidade.
+"""
+        )
+
+    def _ap_horizon_block(h: int) -> None:
+        sub = por_h.get(h) or {}
+        qd = sub.get("qtd", {})
+        st.markdown(
+            f'<p class="pv-section-title">Horizonte {h} dias — quantidade</p>'
+            f"<p style='text-align:center;color:#64748b;font-size:0.9rem;margin-top:-0.25rem'>"
+            f"{qd.get('model_label', '—')}</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("**Volume (quantidade)** — modelo")
+        st.code(str(qd.get("model_label", "—")), language=None)
+        bp = best_params_preview.get(h, {}) if isinstance(best_params_preview, dict) else {}
+        st.markdown("**Parâmetros / metadados**")
+        st.json(bp.get("qtd") or {})
+
+    for _ti, _h in enumerate(hz_keys_ap, start=1):
+        with ap_tabs[_ti]:
+            _ap_horizon_block(_h)
+
+    with ap_tabs[len(hz_keys_ap) + 1]:
+        bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
+        if bpc:
+            st.markdown(
+                '<p class="pv-section-title">Cenário personalizado (quantidade — prevhtml)</p>',
+                unsafe_allow_html=True,
+            )
+            st.json({"volume (qtd)": bpc.get("qtd") or {}})
+        else:
+            st.markdown(
+                '<p style="text-align:center;color:#64748b;font-size:0.88rem">'
+                "Sem cenário personalizado nesta execução.</p>",
+                unsafe_allow_html=True,
+            )
+
+
+def _render_streamlit_dossie_ml(
+    dossie: dict[str, Any],
+    por_h: dict[Any, dict[str, Any]],
+    daily_pack: dict[str, Any],
+    por_custom: dict[str, Any] | None,
+) -> None:
+    import plotly.graph_objects as go
+
+    _dpc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
+
+    st.markdown(
+        "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 0.85rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
+        "O Dossiê consolida estatísticas descritivas, análise IQR, matrizes de correlação, VIF, histogramas e, "
+        "quando aplicável, métricas de modelo — oferecendo, desta forma, uma visão integrada da qualidade dos dados e do ajuste.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if dossie.get("erro"):
+        st.error(str(dossie["erro"]))
+        return
+
+    if dossie.get("aviso_previsao_custom"):
+        st.warning(str(dossie["aviso_previsao_custom"]))
+
+    td1, td2, td3, td4, td5 = st.tabs(
+        [
+            "Dados e tratamento",
+            "Descritivas e outliers",
+            "Correlação e VIF",
+            "Distribuições e perfil",
+            "Modelos e personalizado",
+        ]
+    )
+
+    with td1:
+        st.markdown(
+            """
+**Tratamento**
+- O índice diário é deduplicado, conservando a última linha por data.
+- Nos alvos, eliminam-se apenas as linhas sem `target_qtd` ou `target_valor`; valores não finitos são tratados antes da agregação.
+- Nas *features*, `inf` é convertido para valor finito e a ausência de dados imputa-se a 0 após a engenharia (lags utilizam exclusivamente o passado).
+- Na **previsão de quantidade**, utilizam-se modelos **sem** `MinMaxScaler`: correlação → top 30 → `PolynomialFeatures(2)` e regressores **XGBoost, Random Forest, Gradient Boosting, Ridge e Voting**, com competição por MAE.
+- Os outliers no alvo não são truncados; o *cap* aplicado às previsões deriva, portanto, do próprio treino.
+
+**Validação / tuning (quantidade)**
+- *Split* cronológico 70/30 (e zona interna para escolha do vencedor), alinhado ao fluxo prevhtml.
+"""
+        )
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Observações na matriz diária", f"{dossie.get('n_linhas', 0):,}")
+        with m2:
+            st.metric("Colunas após engenharia", f"{dossie.get('n_colunas', 0):,}")
+        st.caption(
+            f"Período coberto pela matriz: de **{dossie.get('primeira_data', '—')}** a **{dossie.get('ultima_data', '—')}**."
+        )
+
+    desc = dossie.get("descritivas") or []
+    oi = dossie.get("outliers_iqr") or []
+    with td2:
+        if desc:
+            st.markdown("##### Estatísticas descritivas")
+            st.caption(
+                "A curtose reportada corresponde ao excesso (definição *pandas*); a moda corresponde ao primeiro valor modal encontrado."
+            )
+            st.dataframe(pd.DataFrame(desc), width="stretch", hide_index=True)
+        else:
+            st.caption("Não há tabela descritiva disponível para o conjunto atual.")
+        st.divider()
+        if oi:
+            st.markdown("##### Outliers (regra IQR — 1,5×IQR)")
+            st.dataframe(pd.DataFrame(oi), width="stretch", hide_index=True)
+        else:
+            st.caption("Não foi possível gerar o resumo de outliers para estes dados.")
+
+    cl = dossie.get("correlation_labels") or []
+    cz = dossie.get("correlation_matrix") or []
+    pares = dossie.get("pares_multicolinearidade") or []
+    vifs = dossie.get("vif") or []
+    with td3:
+        if len(cl) >= 2 and cz:
+            st.markdown("##### Matriz de correlação (Pearson)")
+            fig_h = go.Figure(
+                data=go.Heatmap(
+                    z=cz,
+                    x=cl,
+                    y=cl,
+                    colorscale=[
+                        [0.0, PLOT_VERMELHO],
+                        [0.5, "#f1f5f9"],
+                        [1.0, PLOT_AZUL],
+                    ],
+                    zmid=0,
+                    zmin=-1,
+                    zmax=1,
+                    hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>",
+                )
+            )
+            fig_h.update_layout(
+                **_plotly_layout_direcional(
+                    title="Correlação entre variáveis-chave",
+                    height=max(360, 28 * len(cl)),
+                    margin=dict(l=130, r=48, t=56, b=130),
+                ),
+            )
+            st.plotly_chart(fig_h, width="stretch", config=_dpc)
+            _st_interpretacao_grafico(
+                "Correlações (leitura automática)",
+                _interpret_text_correlation_matrix(cl, cz),
+            )
+        else:
+            st.markdown(
+                '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">A matriz de correlação não está disponível neste subconjunto (colunas ou dados insuficientes).</p>',
+                unsafe_allow_html=True,
+            )
+
+        _vl3 = daily_pack.get("vol_leads") or []
+        _tq3 = daily_pack.get("target_qtd") or []
+        _tv3 = daily_pack.get("target_valor") or []
+        if len(_vl3) == len(_tq3) == len(_tv3) and len(_vl3) > 5:
+            st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
+            st.caption(
+                "Além dos valores agregados na matriz de correlação, a dispersão posiciona cada dia no plano "
+                "leads × volume, permitindo visualizar dispersão, aglomerados e observações atípicas que o coeficiente r resume de forma sintética."
+            )
+            from plotly.subplots import make_subplots
+
+            _tv3_mi = [float(v) / 1e6 for v in _tv3]
+            fig_td3 = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=("Quantidade diária", "VGV (mi R$ / dia)"),
+                horizontal_spacing=0.12,
+            )
+            fig_td3.add_trace(
+                go.Scatter(
+                    x=_vl3,
+                    y=_tq3,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.5, color=PLOT_AZUL, line=dict(width=0.5, color="#ffffff")),
+                    name="qtd",
+                    hovertemplate="Leads=%{x:.4g}<br>qtd=%{y:,.0f}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+            fig_td3.add_trace(
+                go.Scatter(
+                    x=_vl3,
+                    y=_tv3_mi,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.5, color=PLOT_VERMELHO, line=dict(width=0.5, color="#ffffff")),
+                    name="VGV",
+                    hovertemplate="Leads=%{x:.4g}<br>VGV mi=%{y:.3f}<extra></extra>",
+                ),
+                row=1,
+                col=2,
+            )
+            base_td3 = _plotly_layout_direcional(height=420, showlegend=False)
+            fig_td3.update_layout(
+                **{
+                    k: v
+                    for k, v in base_td3.items()
+                    if k not in ("xaxis", "yaxis", "margin", "title")
+                },
+                title=dict(
+                    text="Dispersão (eixo horizontal: leads; mesmos dias da série diária)",
+                    font=dict(size=15, color=PLOT_AZUL, family="Montserrat, sans-serif"),
+                    x=0.5,
+                    xanchor="center",
+                ),
+                margin=dict(t=56, l=56, r=48, b=56),
+            )
+            fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=1)
+            fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=2)
+            fig_td3.update_yaxes(title_text="Eixo Y₁ — qtd vendida (/ dia)", row=1, col=1)
+            fig_td3.update_yaxes(title_text="Eixo Y₂ — VGV (mi R$ / dia)", row=1, col=2)
+            st.plotly_chart(fig_td3, width="stretch", config=_dpc)
+
+        st.divider()
+        if pares:
+            st.markdown("##### Pares com |r| ≥ 0,85")
+            st.dataframe(pd.DataFrame(pares), width="stretch", hide_index=True)
+        if vifs:
+            st.markdown("##### VIF (subconjunto de *features*)")
+            st.caption(
+                "Valores de VIF superiores a 5–10 sugerem possível redundância linear entre *features*; interprete-as em conjunto com a matriz de correlação."
+            )
+            st.dataframe(pd.DataFrame(vifs), width="stretch", hide_index=True)
+            _st_interpretacao_grafico("VIF (leitura automática)", _interpret_text_vif_rows(vifs))
+        if not pares and not vifs:
+            st.caption("Não há tabelas de multicolinearidade para apresentar nesta execução.")
+        facts_cv = _facts_corr_vif_for_llm(cl, cz, vifs)
+        oa_key_d, oa_model_d = _openai_key_and_model()
+        if oa_key_d and facts_cv.strip():
+            st.divider()
+            with st.expander("Síntese: correlação e VIF (OpenAI)", expanded=False):
+                st.caption(f"Modelo: `{oa_model_d}`.")
+                if st.button("Gerar síntese", key="pv_dossie_openai_btn"):
+                    with st.spinner("A contactar a API…"):
+                        syn_d = _openai_eda_synopsis(facts_cv)
+                    if syn_d:
+                        st.session_state["pv_dossie_openai_syn"] = syn_d
+                    else:
+                        st.error("Sem resposta ou erro na API.")
+                if st.session_state.get("pv_dossie_openai_syn"):
+                    st.markdown(st.session_state["pv_dossie_openai_syn"])
+
+    bal = dossie.get("balanceamento_qtd") or {}
+    hq = dossie.get("hist_target_qtd") or {}
+    hv = dossie.get("hist_target_valor") or {}
+    dates = daily_pack.get("dates") or []
+    vl = daily_pack.get("vol_leads") or []
+    tq = daily_pack.get("target_qtd") or []
+    dow_lbl = daily_pack.get("dow_labels") or []
+    dow_q = daily_pack.get("dow_mean_qtd") or []
+    with td4:
+        if bal:
+            st.markdown("##### Balanceamento do volume diário (vs mediana)")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Dias acima da mediana", f"{bal.get('dias_acima_mediana', 0):,}")
+            with c2:
+                st.metric("Dias ≤ mediana", f"{bal.get('dias_abaixo_igual_mediana', 0):,}")
+            with c3:
+                st.metric(
+                    "Proporção classe minoritária",
+                    f"{bal.get('proporcao_classe_minoritaria', 0)*100:.1f}%",
+                )
+            fig_p = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=["Acima da mediana", "Abaixo ou igual"],
+                        values=[
+                            bal.get("dias_acima_mediana", 0),
+                            bal.get("dias_abaixo_igual_mediana", 0),
+                        ],
+                        hole=0.38,
+                        marker=dict(colors=[PLOT_AZUL, PLOT_MUTED], line=dict(color="#fff", width=2)),
+                        textinfo="percent+label",
+                    )
+                ]
+            )
+            fig_p.update_layout(
+                **_plotly_layout_direcional(
+                    title="Partilha de dias por regime de volume", height=420, showlegend=False
+                ),
+            )
+            st.plotly_chart(fig_p, width="stretch", config=_dpc)
+        if hq.get("counts") and hq.get("edges"):
+            st.markdown("##### Histograma — vendas diárias (qtd)")
+            edges = hq["edges"]
+            cnt = hq["counts"]
+            xs = [(edges[i] + edges[i + 1]) / 2 for i in range(len(cnt))]
+            fig = go.Figure(
+                go.Bar(
+                    x=xs,
+                    y=cnt,
+                    marker_color=PLOT_AZUL,
+                    marker_line=dict(width=0),
+                )
+            )
+            fig.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    xaxis_title="Volume (qtd)",
+                    yaxis_title="Frequência",
+                ),
+            )
+            st.plotly_chart(fig, width="stretch", config=_dpc)
+        if hv.get("counts") and hv.get("edges"):
+            st.markdown("##### Histograma — VGV diário")
+            edges = hv["edges"]
+            cnt = hv["counts"]
+            xs = [((edges[i] + edges[i + 1]) / 2) / 1e6 for i in range(len(cnt))]
+            figv = go.Figure(
+                go.Bar(
+                    x=xs,
+                    y=cnt,
+                    marker_color=PLOT_VERMELHO,
+                    marker_line=dict(width=0),
+                )
+            )
+            figv.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    xaxis_title="VGV (mi R$)",
+                    yaxis_title="Frequência",
+                ),
+            )
+            st.plotly_chart(figv, width="stretch", config=_dpc)
+        if len(dates) == len(vl) == len(tq) and len(dates) > 5:
+            st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
+            fig_s = go.Figure(
+                go.Scatter(
+                    x=vl,
+                    y=tq,
+                    mode="markers",
+                    marker=dict(
+                        size=7,
+                        opacity=0.45,
+                        color=PLOT_AZUL,
+                        line=dict(width=0.5, color="#ffffff"),
+                    ),
+                )
+            )
+            fig_s.update_layout(
+                **_plotly_layout_direcional(
+                    height=420,
+                    xaxis_title="Eixo X — leads (/ dia)",
+                    yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+                ),
+            )
+            st.plotly_chart(fig_s, width="stretch", config=_dpc)
+        if dow_lbl and dow_q:
+            st.markdown("##### Média de volume por dia da semana")
+            fig_b = go.Figure(
+                go.Bar(
+                    x=dow_lbl,
+                    y=dow_q,
+                    marker_color=PLOT_AZUL,
+                    marker_line=dict(width=0),
+                )
+            )
+            fig_b.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    yaxis_title="Qtd média",
+                ),
+            )
+            st.plotly_chart(fig_b, width="stretch", config=_dpc)
+
+    with td5:
+        _render_streamlit_ml_feature_importance(por_h, _dpc)
+        st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
+        st.markdown(
+            "**Acurácia dir.:** no conjunto de teste, corresponde à percentagem de dias em que o valor real e a previsão "
+            "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
+        )
+        rows_m = []
+        for h in _chaves_horizonte_em_por_h(por_h):
+            sub = por_h.get(h) or {}
+            m = (sub.get("qtd") or {}).get("metrics_test") or {}
+            rows_m.append(
+                {
+                    "Horizonte": f"{h}d",
+                    "Alvo": "Quantidade",
+                    "MAE": m.get("MAE"),
+                    "RMSE": m.get("RMSE"),
+                    "R²": m.get("R2"),
+                    "Acurácia dir.": m.get("Acc_dir_mediana"),
+                }
+            )
+        if por_custom:
+            m = (por_custom.get("qtd") or {}).get("metrics_test") or {}
+            rows_m.append(
+                {
+                    "Horizonte": "Personalizado",
+                    "Alvo": "Quantidade",
+                    "MAE": m.get("MAE"),
+                    "RMSE": m.get("RMSE"),
+                    "R²": m.get("R2"),
+                    "Acurácia dir.": m.get("Acc_dir_mediana"),
+                }
+            )
+        _hay_metricas = any(r.get("MAE") is not None for r in rows_m)
+        if _hay_metricas:
+            st.dataframe(pd.DataFrame(rows_m), width="stretch", hide_index=True)
+        else:
+            st.markdown(
+                '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin:0.5rem 0">'
+                "As métricas detalhadas surgirão nesta secção após executar <strong>Gerar previsões</strong>.</p>",
+                unsafe_allow_html=True,
+            )
+        low_acc: list[dict[str, Any]] = []
+        for r in rows_m:
+            ad = r.get("Acurácia dir.")
+            if ad is None:
+                continue
+            try:
+                adf = float(ad)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(adf) and adf < 0.8:
+                low_acc.append(r)
+        if _hay_metricas and low_acc:
+            st.warning(
+                "A acurácia direcional é inferior a 80% em, pelo menos, um horizonte (quantidade); analise o conjunto de métricas "
+                "antes de utilizar as previsões como único critério de decisão."
+            )
+        st.divider()
+        if por_custom:
+            st.markdown("##### Intervalo personalizado")
+            st.markdown(f"**{por_custom.get('label', '—')}**")
+            qc = por_custom.get("qtd") or {}
+            st.markdown(
+                f"- **Qtd prevista (último dia):** {float(qc.get('pred_ultimo_dia', 0)):,.2f} · "
+                f"MAE teste: {float((qc.get('metrics_test') or {}).get('MAE', 0)):.3f} · "
+                f"Acurácia dir.: {float((qc.get('metrics_test') or {}).get('Acc_dir_mediana', 0))*100:.1f}%"
+            )
+            st.caption(
+                "As variáveis `fwd_*` incorporam fins de semana e feriados brasileiros dentro do horizonte da soma, quando aplicável."
+            )
+        else:
+            st.caption("Não foi definido cenário personalizado por intervalo de datas nesta execução.")
+
+
+def main() -> None:
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(
+        page_title="Previsão de vendas | Direcional",
+        page_icon=str(fav) if fav else "📊",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    _configure_streamlit_progress()
+    inject_css()
+    _exibir_logo_topo()
+
+    st.markdown(
+        '<div class="pv-hero-block">'
+        '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
+        '<p class="pv-hero-sub">Matriz diária, previsão de <strong>quantidade</strong> (horizontes 3, 7 e/ou 30 dias), análises exploratórias e relatório HTML.</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="pv-bar-wrap"><div class="pv-bar"></div></div>', unsafe_allow_html=True)
+
+    if "resultado" not in st.session_state:
+        st.session_state.resultado = None
+    if "dados_exploratorios" not in st.session_state:
+        st.session_state.dados_exploratorios = None
+    if "formulario_snapshot" not in st.session_state:
+        st.session_state.formulario_snapshot = None
+
+    tab_intro, tab_analises, tab_form, tab_previsoes, tab_dossie, tab_apendice = st.tabs(
+        ["Introdução", "Análises", "Formulário", "Previsões", "Dossiê", "Apêndice"]
+    )
+
+    with tab_intro:
+        _render_tab_introducao()
+
+    with tab_form:
+        _render_tab_formulario_previsao_humano()
+
+    with tab_previsoes:
+        st.markdown(
+            '<p class="pv-section-title">Previsões e relatório</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
+            "A previsão ML é apenas de <strong>quantidade</strong> (VGV não é modelado). Escolha <strong>um ou mais</strong> horizontes "
+            "(<strong>3</strong>, <strong>7</strong> e/ou <strong>30</strong> dias). Opcionalmente, indique um intervalo de datas para um cenário adicional em quantidade.</div>",
+            unsafe_allow_html=True,
+        )
+        hz_sel = st.multiselect(
+            "Horizontes de previsão (soma nos próximos H dias da série)",
+            options=list(HORIZONTES_PREVISAO_DISPONIVEIS),
+            default=list(HORIZONTES_PREVISAO_DISPONIVEIS),
+            format_func=lambda x: f"{x} dias",
+            key="pv_horizontes_multiselect",
+            help="Apenas os valores selecionados são treinados (menos tempo de execução se escolher só um).",
+        )
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            d_ini = st.date_input(
+                "Dia inicial do intervalo (opcional)",
+                value=None,
+                key="pv_interval_start",
+            )
+        with ic2:
+            d_fim = st.date_input(
+                "Dia final do intervalo (opcional)",
+                value=None,
+                key="pv_interval_end",
+            )
+        if d_ini is not None and d_fim is not None:
+            a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+            st.info(
+                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes que selecionar acima."
+            )
+        elif d_ini is None and d_fim is None:
+            pass
+        else:
+            st.warning(
+                "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
+            )
+
+        run_btn = st.button("Gerar previsões", type="primary", width="stretch", key="pv_gerar")
+
+        if run_btn:
+            if not hz_sel:
+                st.error("Selecione pelo menos um horizonte: 3, 7 ou 30 dias.")
+            elif (d_ini is None) ^ (d_fim is None):
+                st.error("Intervalo incompleto: são necessárias duas datas válidas ou nenhuma (deixe ambos os campos vazios).")
+            else:
+                with st.spinner("A carregar e analisar as planilhas…"):
+                    dfs, sheet_metas, used_sa = build_data_bundle()
+                st.session_state["sheet_metas"] = sheet_metas
+                st.session_state["used_service_account"] = used_sa
+                try:
+                    custom_previsao = None
+                    if d_ini is not None and d_fim is not None:
+                        a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+                        custom_previsao = {
+                            "mode": "range",
+                            "date_start": a.isoformat(),
+                            "date_end": b.isoformat(),
+                        }
+                    with st.spinner("A treinar modelos e gerar o relatório…"):
+                        (
+                            stats_base,
+                            ticket,
+                            conv,
+                            por_h,
+                            bpp,
+                            html_out,
+                            daily_pack,
+                            dossie_ml,
+                            por_custom,
+                        ) = run_training_pipeline(
+                            dfs,
+                            custom_previsao=custom_previsao,
+                            horizontes=normalize_horizontes_previsao(hz_sel),
+                        )
+                    st.session_state.resultado = {
+                        "stats_base": stats_base,
+                        "ticket": ticket,
+                        "conv": conv,
+                        "por_h": por_h,
+                        "best_params_preview": bpp,
+                        "html": html_out,
+                        "daily_pack": daily_pack,
+                        "dossie_ml": dossie_ml,
+                        "por_custom": por_custom,
+                        "full_train": FULL_PERIOD_TRAIN_FIXO,
+                        "sheet_metas": sheet_metas,
+                        "used_sa": used_sa,
+                        "df_formulario": dfs.get("formulario_previsao"),
+                        "horizontes": normalize_horizontes_previsao(hz_sel),
+                    }
+                    st.success("Execução concluída com sucesso.")
+                    st.session_state.dados_exploratorios = None
+                except Exception as e:
+                    st.error(f"Ocorreu um erro durante a execução: {e}")
+                    st.exception(e)
+
+        res = st.session_state.resultado
+        if res is None:
+            pass
+        else:
+            stats_base = res["stats_base"]
+            ticket = res["ticket"]
+            conv = res["conv"]
+            por_h = res["por_h"]
+            html_out = res["html"]
+            full_train = res["full_train"]
+            sheet_metas = res.get("sheet_metas") or st.session_state.get("sheet_metas")
+
+            if sheet_metas:
+                st.markdown(
+                    '<p class="pv-section-title">Fontes carregadas</p>',
+                    unsafe_allow_html=True,
+                )
+                rows_m = []
+                for k, m in sheet_metas.items():
+                    rows_m.append(
+                        {
+                            "Base": k,
+                            "Método": m.get("method", "—"),
+                            "Livro": m.get("spreadsheet_title") or "—",
+                            "Aba": m.get("worksheet_title") or "—",
+                            "gid": m.get("gid", "—"),
+                            "Cabeçalho (linha)": m.get("header_row_index", "—"),
+                            "Pontuação": m.get("score", "—"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(rows_m), width="stretch", hide_index=True)
+
+            c1, c2 = st.columns(2)
+            c3, c4 = st.columns(2)
+            with c1:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Vendas (histórico)</h4><div class="val">{stats_base["vendas"]:,.0f}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(
+                    f'<div class="metric-card"><h4>VGV acumulado</h4><div class="val">R$ {stats_base["vgv"]/1e6:.2f} M</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Ticket médio</h4><div class="val">R$ {ticket/1e3:,.0f} k</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c4:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Conversão leads → vendas</h4><div class="val">{conv:.2f} %</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                '<p class="pv-section-title">Previsões (último dia da série)</p>',
+                unsafe_allow_html=True,
+            )
+            rows = []
+            lbl = "In-sample" if full_train else "Holdout 30%"
+            for h in res.get("horizontes") or _chaves_horizonte_em_por_h(por_h):
+                q = por_h[h]["qtd"]
+                acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
+                rows.append(
+                    {
+                        "Horizonte (dias)": h,
+                        "Qtd prevista": f"{float(q['pred_ultimo_dia']):,.1f}",
+                        f"MAE ({lbl})": f"{q['metrics_test']['MAE']:.2f}",
+                        "Acurácia dir.": f"{acc_q*100:.1f}%"
+                        if acc_q is not None and np.isfinite(acc_q)
+                        else "—",
+                        "Modelo": q["model_label"],
+                    }
+                )
+            pc = res.get("por_custom")
+            if pc:
+                qc = pc.get("qtd") or {}
+                aq = (qc.get("metrics_test") or {}).get("Acc_dir_mediana")
+                rows.append(
+                    {
+                        "Horizonte (dias)": f"Personalizado: {(pc.get('label') or '')[:52]}",
+                        "Qtd prevista": f"{float(qc.get('pred_ultimo_dia', 0)):,.1f}",
+                        f"MAE ({lbl})": f"{float((qc.get('metrics_test') or {}).get('MAE', 0)):.2f}",
+                        "Acurácia dir.": f"{aq*100:.1f}%"
+                        if aq is not None and np.isfinite(aq)
+                        else "—",
+                        "Modelo": qc.get("model_label", "—"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            acc_warn = False
+            for h in res.get("horizontes") or _chaves_horizonte_em_por_h(por_h):
+                m = (por_h.get(h) or {}).get("qtd", {}).get("metrics_test") or {}
+                a = m.get("Acc_dir_mediana")
+                if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                    acc_warn = True
+            if pc:
+                m = (pc.get("qtd") or {}).get("metrics_test") or {}
+                a = m.get("Acc_dir_mediana")
+                if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                    acc_warn = True
+            if acc_warn:
+                st.warning(
+                    "A acurácia direcional situa-se abaixo de 80% em, pelo menos, um horizonte (quantidade); recomenda-se "
+                    "cruzar este sinal com MAE, RMSE e estabilidade temporal antes de decisões operacionais."
+                )
+
+            st.download_button(
+                label="Descarregar relatório HTML",
+                data=html_out.encode("utf-8"),
+                file_name="dashboard_previsao_vendas.html",
+                mime="text/html; charset=utf-8",
+                width="stretch",
+            )
+
+            st.caption(
+                "O detalhe do esquema de métricas encontra-se no **Apêndice**; o ficheiro HTML inclui, adicionalmente, "
+                "o *benchmark* de modelos e as curvas ROC."
+            )
+
+        st.divider()
+        if st.button(
+            "Limpar cenário opcional",
+            width="stretch",
+            key="pv_clear_cfg",
+        ):
+            for _k in ("pv_interval_start", "pv_interval_end"):
+                st.session_state.pop(_k, None)
+            st.session_state.pop("pv_custom_cfg", None)
+            st.rerun()
+        if st.button(
+            "Limpar cache das planilhas",
+            width="stretch",
+            key="pv_clear_cache",
+        ):
+            _load_one_role_cached.clear()
+            st.success("O cache das planilhas foi limpo; na próxima leitura, os ficheiros serão obtidos novamente.")
+
+    with tab_analises:
+        st.markdown(
+            '<p class="pv-section-title">Análises</p>',
+            unsafe_allow_html=True,
+        )
+        if st.button(
+            "Carregar dados (sem treino)",
+            type="primary",
+            width="stretch",
+            key="pv_load_eda",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
+        res_a = st.session_state.resultado
+        dex_a = st.session_state.get("dados_exploratorios")
+        fonte_a: dict[str, Any] | None = None
+        if res_a and res_a.get("daily_pack"):
+            fonte_a = res_a
+        elif isinstance(dex_a, dict) and dex_a.get("daily_pack"):
+            fonte_a = dex_a
+        if fonte_a:
+            _render_streamlit_tab_analises(
+                fonte_a["daily_pack"],
+                fonte_a["stats_base"],
+                fonte_a["ticket"],
+                fonte_a["conv"],
+            )
+
+    with tab_dossie:
+        st.markdown('<p class="pv-section-title">Dossiê</p>', unsafe_allow_html=True)
+        if st.button(
+            "Carregar dados (sem treino)",
+            type="primary",
+            width="stretch",
+            key="pv_load_eda_dossie",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
+        res_d = st.session_state.resultado
+        dex_d = st.session_state.get("dados_exploratorios")
+        if res_d and res_d.get("dossie_ml") and res_d.get("daily_pack"):
+            _render_streamlit_dossie_ml(
+                res_d["dossie_ml"],
+                res_d["por_h"],
+                res_d["daily_pack"],
+                res_d.get("por_custom"),
+            )
+        elif isinstance(dex_d, dict) and dex_d.get("dossie_ml") and dex_d.get("daily_pack"):
+            _render_streamlit_dossie_ml(
+                dex_d["dossie_ml"],
+                {},
+                dex_d["daily_pack"],
+                None,
+            )
+
+    with tab_apendice:
+        st.markdown('<p class="pv-section-title">Apêndice</p>', unsafe_allow_html=True)
+        if st.button(
+            "Carregar dados (sem treino)",
+            type="primary",
+            width="stretch",
+            key="pv_load_eda_apendice",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
+        res_ap = st.session_state.resultado
+        dex_ap = st.session_state.get("dados_exploratorios")
+        if res_ap and res_ap.get("daily_pack"):
+            bpp = res_ap.get("best_params_preview") or {}
+            _render_streamlit_tab_apendice(
+                res_ap["por_h"],
+                bpp,
+                res_ap["full_train"],
+                BLEND_TOP_K_FIXO,
+                RANDOM_SEED,
+                res_ap["daily_pack"],
+            )
+        elif isinstance(dex_ap, dict) and dex_ap.get("daily_pack"):
+            _render_streamlit_tab_apendice(
+                {},
+                {},
+                FULL_PERIOD_TRAIN_FIXO,
+                BLEND_TOP_K_FIXO,
+                RANDOM_SEED,
+                dex_ap["daily_pack"],
+            )
+
+    st.markdown(
+        '<div class="pv-foot-wrap">'
+        '<p class="pv-foot">Direcional Engenharia · Previsão de vendas</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
