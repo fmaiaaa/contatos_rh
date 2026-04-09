@@ -11,6 +11,7 @@ import base64
 import html
 import io
 import json
+import logging
 import os
 import platform
 import re
@@ -29,6 +30,8 @@ import requests
 import streamlit as st
 
 _DIR_APP = Path(__file__).resolve().parent
+
+_LOG_FICHA = logging.getLogger(__name__)
 
 # --- Salesforce (simple_salesforce; antes: salesforce_api.py) ---
 try:
@@ -5230,6 +5233,11 @@ def _processar_envio_cadastro() -> None:
 
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
+        _LOG_FICHA.error(
+            "Ficha cadastro: envio indisponível (mensagem genérica ao usuário) — "
+            "credenciais Google ausentes ou SERVICE_ACCOUNT_JSON inválido/ausente em "
+            "st.secrets['google_sheets']; verifique Secrets no deploy."
+        )
         ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
         return
 
@@ -5269,6 +5277,15 @@ def _processar_envio_cadastro() -> None:
             msg = (
                 "Não foi possível concluir o envio por falta de permissão na planilha."
             )
+        _LOG_FICHA.exception(
+            "Ficha cadastro: falha em anexar_linha (planilha). "
+            "planilha_id=%r aba=%r mensagem_ao_usuario=%r tipo_excecao=%s erro_str=%r",
+            sid,
+            wname,
+            msg,
+            type(e).__name__,
+            erro_txt or repr(e),
+        )
         ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
         return
 
