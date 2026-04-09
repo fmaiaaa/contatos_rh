@@ -5239,8 +5239,8 @@ def _processar_envio_cadastro() -> None:
             gs = dict(st.secrets.get("google_sheets", {}))
         except Exception:
             gs = {}
-    sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
-    wname = str(gs.get("WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME))
+    sid = str(gs.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
+    wname = str(gs.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME).strip() or DEFAULT_WORKSHEET_NAME
 
     st.caption("**Carregando…** Aguarde — gravando seu cadastro. Não feche a página.")
     bar_envio = st.progress(0.0)
@@ -5252,8 +5252,24 @@ def _processar_envio_cadastro() -> None:
         bar_envio.progress(0.15)
         row_num = anexar_linha(linha, cab, sid, wname, creds, gs)
         bar_envio.progress(0.38)
-    except Exception:
-        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
+    except Exception as e:
+        erro_txt = str(e or "").strip()
+        erro_low = erro_txt.lower()
+        msg = FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO
+        if "spreadsheet" in erro_low and "not found" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio porque a planilha configurada não foi encontrada "
+                "ou não está acessível para a conta de serviço."
+            )
+        elif "worksheet" in erro_low and "not found" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio porque a aba configurada na planilha não foi encontrada."
+            )
+        elif "permission" in erro_low or "forbidden" in erro_low or "insufficient" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio por falta de permissão na planilha."
+            )
+        ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
         return
 
     ss["ficha_dados_enviados"] = dados
