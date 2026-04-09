@@ -2235,6 +2235,8 @@ DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
 DEFAULT_WORKSHEET_NAME = "Corretores"
 # Segunda aba: documentação de valores preenchidos automaticamente (não digitados pelo corretor).
 DEFAULT_VALORES_FIXOS_WORKSHEET = "Valores fixos (automáticos)"
+# Aba de referência: rótulos do formulário × nomes de API Salesforce (criada/atualizada a cada envio).
+DEFAULT_DICIONARIO_WORKSHEET = "Dicionário"
 # Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
 DEFAULT_GERENTES_WORKSHEET = "Gerentes"
 DEFAULT_COL_NOME_CONTA = "Nome da Conta"
@@ -2605,6 +2607,74 @@ def _nome_aba_valores_fixos_planilha(gs: Dict[str, Any]) -> str:
     )
 
 
+def _nome_aba_dicionario_planilha(gs: Dict[str, Any]) -> str:
+    return (
+        str(
+            gs.get("DICIONARIO_WORKSHEET")
+            or gs.get("dicionario_worksheet")
+            or DEFAULT_DICIONARIO_WORKSHEET
+        ).strip()
+        or DEFAULT_DICIONARIO_WORKSHEET
+    )
+
+
+def _linhas_conteudo_aba_dicionario() -> List[List[str]]:
+    """Cabeçalho + uma linha por campo com mapeamento Salesforce (mesma lógica do Excel «Dicionário»)."""
+    rows: List[List[str]] = [
+        ["Rótulo do campo", "Nome do campo (API Salesforce)"],
+    ]
+    for c in CAMPOS:
+        sf = c.get("sf")
+        if not sf:
+            continue
+        lab = str(c.get("label") or "")
+        if lab.endswith(" *"):
+            lab = lab[:-2].rstrip()
+        rows.append([lab, str(sf)])
+    return rows
+
+
+def _garantir_aba_dicionario(sh: Any, gs: Dict[str, Any]) -> None:
+    """Cria ou atualiza a aba «Dicionário» na planilha do Google Sheets."""
+    nome = _nome_aba_dicionario_planilha(gs)[:99]
+    body = _linhas_conteudo_aba_dicionario()
+    if len(body) < 2:
+        return
+    ncols = len(body[0])
+    try:
+        ws = sh.worksheet(nome)
+    except Exception:
+        ws = sh.add_worksheet(
+            title=nome,
+            rows=max(len(body) + 5, 80),
+            cols=max(ncols, 4),
+        )
+    try:
+        cur = ws.get_all_values()
+        precisa = not cur or len(cur) < len(body)
+        if not precisa and cur:
+            for i, row in enumerate(body):
+                if i >= len(cur):
+                    precisa = True
+                    break
+                exp = row[:ncols]
+                got = (cur[i] + [""] * ncols)[:ncols]
+                if [_norm_cabecalho_planilha(x) for x in got] != [
+                    _norm_cabecalho_planilha(x) for x in exp
+                ]:
+                    precisa = True
+                    break
+        if precisa:
+            ws.clear()
+            ws.update(
+                f"A1:{_col_letter(ncols)}{len(body)}",
+                body,
+                value_input_option="USER_ENTERED",
+            )
+    except Exception:
+        pass
+
+
 def _linhas_conteudo_aba_valores_fixos() -> List[List[str]]:
     """Referência estática: o que o sistema preenche sem o corretor digitar (ou via Secrets)."""
     return [
@@ -2737,13 +2807,18 @@ def anexar_linha(
 ) -> int:
     """
     Garante que a aba existe, cabeçalho na linha 1 alinhado ao layout atual e anexa a linha.
-    Atualiza também a aba «Valores fixos (automáticos)» (nome configurável nos Secrets).
+    Atualiza também a aba «Valores fixos (automáticos)» (nome configurável nos Secrets)
+    e a aba «Dicionário» (rótulos × API Salesforce).
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
     gs = dict(google_sheets_extras or {})
     try:
         _garantir_aba_valores_fixos(sh, gs)
+    except Exception:
+        pass
+    try:
+        _garantir_aba_dicionario(sh, gs)
     except Exception:
         pass
     try:
@@ -3140,6 +3215,9 @@ URL_LINKTREE_MARKETING = "https://linktr.ee/comercialdirecionalrj"
 URL_FORM_SIMULADOR = "https://forms.gle/NLibApxbaimEbdBEA"
 URL_YOUTUBE_SIMULADOR = "https://youtu.be/dE42s0g7K-c"
 URL_YOUTUBE_SIMULADOR_EMBED = "https://www.youtube.com/embed/dE42s0g7K-c"
+# Vídeo de boas-vindas do RH (primeiro passo no popup após o cadastro).
+URL_YOUTUBE_BOAS_VINDAS_RH = "https://youtu.be/7cm3wFnoCSY"
+URL_YOUTUBE_BOAS_VINDAS_RH_EMBED = "https://www.youtube.com/embed/7cm3wFnoCSY"
 URL_DIRI_ACADEMY = "https://diriacademy.skore.io/login"
 URL_SALESFORCE_VENDAS = "https://direcional.my.site.com/vendas"
 URL_WHATSAPP_EQUIPE = "https://chat.whatsapp.com/KnZg4Zax3Z20viB7XEWvmo"
@@ -4517,8 +4595,8 @@ def montar_corpo_email_boas_vindas(
     bloco_pdf_plain = (
         "Anexamos neste e-mail o PDF da sua ficha cadastral (cópia do que você enviou pelo formulário).\n\n"
         if tem_pdf_anexo
-        else "Não foi possível gerar o PDF automaticamente neste envio; use o popup do formulário "
-        "(após o cadastro) para baixar a cópia ou solicitar reenvio.\n\n"
+        else "Não foi possível gerar o PDF automaticamente neste envio; após o cadastro, conclua o aviso "
+        "de boas-vindas no formulário e use os recursos na página seguinte, ou peça uma nova cópia ao RH.\n\n"
     )
     bloco_pdf_html = (
         f'<p style="margin:0 0 16px 0;padding:14px 16px;background:{COR_INPUT_BG};border-radius:10px;'
@@ -4526,8 +4604,8 @@ def montar_corpo_email_boas_vindas(
         f"<strong>PDF em anexo:</strong> segue a cópia em PDF da sua ficha cadastral.</p>"
         if tem_pdf_anexo
         else f'<p style="margin:0 0 16px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">'
-        f"Se o PDF não estiver disponível neste e-mail, abra o <strong>popup de boas-vindas</strong> no "
-        f"formulário para baixar ou reenviar a cópia.</p>"
+        f"Se o PDF não estiver disponível neste e-mail, após o cadastro clique em <strong>Concluir</strong> "
+        f"no aviso inicial e use os recursos na página seguinte, ou solicite uma nova cópia ao RH.</p>"
     )
 
     plain = (
@@ -4541,8 +4619,9 @@ def montar_corpo_email_boas_vindas(
         + "\n".join(linhas_txt)
         + "\n\n"
         + bloco_pdf_plain
-        + "No popup do formulário você também encontra o mapa de empreendimentos e o vídeo do simulador.\n\n"
-        "Direcional Engenharia · Vendas Rio de Janeiro"
+        + "No formulário, após clicar em **Concluir** no aviso de boas-vindas, a página mostra o mapa de "
+        + "empreendimentos, o vídeo do simulador e links úteis.\n\n"
+        + "Direcional Engenharia · Vendas Rio de Janeiro"
     )
 
     apresent_esc = html.escape(_APRESENTACAO_DIRECIONAL_PLAIN)
@@ -4586,8 +4665,8 @@ Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe 
 <tr><td style="padding:8px 28px 8px 28px;">
 {bloco_pdf_html}
 <p style="margin:0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-No <strong>popup de boas-vindas</strong> do formulário há também o <strong>mapa de empreendimentos</strong> e o
-<strong>vídeo</strong> do simulador (mesma experiência visual do cadastro).
+Após clicar em <strong>Concluir</strong> no aviso inicial de boas-vindas, a <strong>página do formulário</strong>
+exibe o <strong>mapa de empreendimentos</strong>, o <strong>vídeo</strong> do simulador e os links úteis.
 </p>
 </td></tr>
 <tr><td style="padding:20px 24px 28px 24px;border-top:1px solid {borda};">
@@ -5127,9 +5206,17 @@ def _limpar_session_formulario():
         "ficha_creci_drive_link",
         "ficha_creci_drive_erro",
         "ficha_creci_email_para",
+        "ficha_boas_vindas_popup_concluido",
     ):
         if k in st.session_state:
             del st.session_state[k]
+
+
+def _definir_sucesso_pos_cadastro() -> None:
+    """Marca cadastro concluído e reabre o popup de boas-vindas (antes de «Concluir»)."""
+    ss = st.session_state
+    ss["ficha_sucesso"] = True
+    ss["ficha_boas_vindas_popup_concluido"] = False
 
 
 def _finalizar_popup_e_novo_cadastro() -> None:
@@ -5195,7 +5282,7 @@ def _dados_ficha_demo_design() -> dict[str, Any]:
 def _ativar_cenario_teste_design() -> None:
     """Simula sucesso + popup sem planilha/Salesforce; preenche dados demo para ver PDF/e-mail."""
     ss = st.session_state
-    ss["ficha_sucesso"] = True
+    _definir_sucesso_pos_cadastro()
     ss["ficha_modo_teste_design"] = True
     ss["ficha_dados_enviados"] = _dados_ficha_demo_design()
     ss["sf_contact_id"] = None
@@ -5336,7 +5423,7 @@ def _processar_envio_cadastro() -> None:
         bar_envio.progress(0.88)
         _tentar_enviar_email_boas_vindas(dados, None)
         bar_envio.progress(1.0)
-        ss["ficha_sucesso"] = True
+        _definir_sucesso_pos_cadastro()
         st.rerun()
         return
 
@@ -5348,7 +5435,7 @@ def _processar_envio_cadastro() -> None:
         bar_envio.progress(0.88)
         _tentar_enviar_email_boas_vindas(dados, None)
         bar_envio.progress(1.0)
-        ss["ficha_sucesso"] = True
+        _definir_sucesso_pos_cadastro()
         st.rerun()
         return
 
@@ -5368,7 +5455,7 @@ def _processar_envio_cadastro() -> None:
         bar_envio.progress(0.88)
         _tentar_enviar_email_boas_vindas(dados, None)
         bar_envio.progress(1.0)
-        ss["ficha_sucesso"] = True
+        _definir_sucesso_pos_cadastro()
         st.rerun()
         return
 
@@ -5394,7 +5481,7 @@ def _processar_envio_cadastro() -> None:
     bar_envio.progress(0.96)
     _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
     bar_envio.progress(1.0)
-    ss["ficha_sucesso"] = True
+    _definir_sucesso_pos_cadastro()
     st.rerun()
 
 
@@ -5541,52 +5628,13 @@ def gerar_workbook_ficha_cadastro_bytes(dados: Dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
-@st.dialog("Obrigado — você faz parte da nossa operação", width="medium")
-def _dialog_recursos_pos_cadastro() -> None:
-    """Popup ao concluir o cadastro: confirmação (bolinha ✓), mapa, vídeo e links úteis."""
+def _render_recursos_pos_concluir_na_pagina() -> None:
+    """Mapa, vídeo do simulador e links — na página principal após «Concluir» no popup de boas-vindas."""
     ss = st.session_state
-    modo_design = bool(ss.get("ficha_modo_teste_design"))
-
-    if modo_design:
-        _render_status_final_tela(
-            sucesso=True,
-            mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
-        )
+    if ss.get("ficha_modo_teste_design"):
         st.info(
-            "Modo teste de design: o PDF/e-mail usam **dados fictícios**. Use **Finalizar** para voltar ao formulário."
+            "Modo teste de design: pré-visualização com **dados fictícios** — nenhum envio real foi feito."
         )
-        st.markdown(
-            "Abaixo: pré-visualização do **mapa**, **vídeo** do simulador e **links** úteis (como no fluxo real)."
-        )
-    else:
-        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
-        st.markdown(
-            """
-**Recebemos o seu cadastro com sucesso.** Você deve ter recebido **automaticamente** no seu e-mail do cadastro
-uma mensagem com **apresentação da Direcional**, **links de materiais de vendas** e, quando possível, o **PDF da ficha** em anexo.
-
-Aqui neste painel: **mapa** de empreendimentos, **vídeo** do simulador e **links** úteis.
-            """.strip()
-        )
-
-    dados_x = ss.get("ficha_dados_enviados")
-    if isinstance(dados_x, dict):
-        try:
-            xbytes = gerar_workbook_ficha_cadastro_bytes(dados_x)
-            nome_arq = (
-                f"ficha_cadastral_{_safe_filename_part(_nome_candidato_ficha(dados_x))}.xlsx"
-            )
-            st.download_button(
-                "Baixar base em Excel (respostas + dicionário de campos)",
-                data=xbytes,
-                file_name=nome_arq,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="ficha_download_excel_popup",
-            )
-        except Exception:
-            st.caption("Não foi possível gerar o Excel da ficha agora.")
-
     st.markdown("##### Empreendimentos no mapa")
     st.caption(
         "Minimapa: **+** / **−** para zoom, arraste para mover e **tela cheia** no canto superior direito."
@@ -5603,7 +5651,7 @@ Aqui neste painel: **mapa** de empreendimentos, **vídeo** do simulador e **link
         f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_SIMULADOR_EMBED)}" '
         f'title="Como usar o simulador de negociação" loading="lazy" '
         f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
-        f"allowfullscreen referrerpolicy=\"strict-origin-when-cross-origin\"></iframe>"
+        f'allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>'
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -5637,8 +5685,54 @@ Aqui neste painel: **mapa** de empreendimentos, **vídeo** do simulador e **link
     )
 
     st.markdown("")
-    if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_dialog_recursos_fechar"):
+    if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_pos_cadastro_fechar"):
         _finalizar_popup_e_novo_cadastro()
+        st.rerun()
+
+
+@st.dialog("Boas-vindas", width="medium")
+def _dialog_recursos_pos_cadastro() -> None:
+    """Popup inicial: sucesso, mensagem de boas-vindas e vídeo do RH; mapa e demais recursos ficam na página após «Concluir»."""
+    ss = st.session_state
+    modo_design = bool(ss.get("ficha_modo_teste_design"))
+
+    if modo_design:
+        _render_status_final_tela(
+            sucesso=True,
+            mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
+        )
+        st.markdown(
+            "Assista ao vídeo de boas-vindas do RH e clique em **Concluir** para ver na página o mapa, "
+            "o vídeo do simulador e os links úteis."
+        )
+        st.caption("No modo teste, PDF e e-mail usam dados fictícios.")
+    else:
+        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
+        st.markdown(
+            """
+**Recebemos o seu cadastro com sucesso.** Você deve receber **automaticamente** no e-mail informado uma mensagem
+com a apresentação da Direcional, **links de materiais** e, quando possível, o **PDF da ficha** em anexo.
+
+Assista ao vídeo de boas-vindas do RH abaixo. Em seguida clique em **Concluir** para abrir na página o **mapa** de
+empreendimentos, o **vídeo** do simulador e os **links** úteis.
+            """.strip()
+        )
+
+    st.markdown("##### Vídeo de boas-vindas — RH")
+    st.markdown(
+        f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
+        f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_BOAS_VINDAS_RH_EMBED)}" '
+        f'title="Boas-vindas — RH" loading="lazy" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
+        f'allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_BOAS_VINDAS_RH}]({URL_YOUTUBE_BOAS_VINDAS_RH})")
+
+    st.markdown("")
+    if st.button("Concluir", type="primary", use_container_width=True, key="ficha_dialog_boas_vindas_concluir"):
+        ss["ficha_boas_vindas_popup_concluido"] = True
         st.rerun()
 
 
@@ -5661,8 +5755,11 @@ def main():
         _render_sidebar_teste_planilha_sf()
 
     if ss.get("ficha_sucesso"):
-        _dialog_recursos_pos_cadastro()
+        if not ss.get("ficha_boas_vindas_popup_concluido"):
+            _dialog_recursos_pos_cadastro()
         _cabecalho_pagina()
+        if ss.get("ficha_boas_vindas_popup_concluido"):
+            _render_recursos_pos_concluir_na_pagina()
         st.markdown(
             '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
             unsafe_allow_html=True,
@@ -5677,8 +5774,9 @@ def main():
             expanded=_design_teste_expander_aberto(),
         ):
             st.markdown(
-                "Simula o **cadastro concluído**: abre só o **popup** (confirmação, mapa, vídeo e links), "
-                "sem gravar na planilha nem no Salesforce. O PDF e o e-mail usam **dados fictícios** para você ver o layout."
+                "Simula o **cadastro concluído**: abre o **popup** de boas-vindas (vídeo do RH); após **Concluir**, "
+                "o **mapa**, o vídeo do simulador e os **links** aparecem na página. Não grava na planilha nem no "
+                "Salesforce. PDF e e-mail usam **dados fictícios**."
             )
             st.caption(
                 "Ative este bloco com a variável de ambiente **FICHA_DESIGN_TEST=1** "
