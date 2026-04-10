@@ -134,6 +134,23 @@ def email_contato_formato_valido(val: Any) -> bool:
     return bool(_EMAIL_CONTATO_RE.match(s))
 
 
+# Trecho obrigatório no login do e-mail corporativo Vendas RJ (ex.: nomesobrenome.direcionalvendas@gmail.com).
+_EMAIL_CORP_DIRECIONAL_MARKER = ".direcionalvendas"
+
+_MSG_EMAIL_CORPORATIVO_OBRIGATORIO = (
+    "E-mail * — use o **e-mail corporativo** com **.direcionalvendas** no login "
+    "(ex.: nomesobrenome.direcionalvendas@gmail.com)."
+)
+
+
+def email_corporativo_direcionalvendas_obrigatorio(val: Any) -> bool:
+    """Formato válido e trecho corporativo `.direcionalvendas` no endereço (case-insensitive)."""
+    if not email_contato_formato_valido(val):
+        return False
+    s = (str(val).strip() if val is not None else "") or ""
+    return _EMAIL_CORP_DIRECIONAL_MARKER in s.lower()
+
+
 def record_type_id_contato_payload_e_aviso() -> Tuple[str, str]:
     """
     Record Type Id de Contact começa com **012**. **005…** é Id de **usuário** → INVALID_CROSS_REFERENCE_KEY.
@@ -666,6 +683,15 @@ def _campos_def() -> List[Campo]:
             opcoes=ESTADO_CIVIL_OPTS,
             req=True,
         ),
+        _z(
+            key="nome_conjuge",
+            label="Nome do Cônjuge",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf="Nome_do_Conjuge__c",
+            req=False,
+            help="Preencha apenas se o estado civil for **Casado** (obrigatório nesse caso).",
+        ),
         _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
         _z(
             key="nacionalidade",
@@ -807,9 +833,18 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Email",
             req=True,
-            help="Use o e-mail corporativo: nomesobrenome.direcionalvendas@gmail.com",
+            help="Obrigatório: e-mail corporativo com **.direcionalvendas** no login (ex.: nomesobrenome.direcionalvendas@gmail.com). "
+            "Sem isso não é possível avançar nem enviar a ficha.",
         ),
-        # ——— Dados Familiares ———
+        # ——— Dados Familiares (filiação e filhos; cônjuge fica em Dados Pessoais junto ao estado civil) ———
+        _z(
+            key="nome_mae",
+            label="Nome da Mãe *",
+            sec="Dados Familiares",
+            tipo="text",
+            sf="Nome_da_Mae__c",
+            req=True,
+        ),
         _z(
             key="nome_pai",
             label="Nome do Pai *",
@@ -828,27 +863,11 @@ def _campos_def() -> List[Campo]:
             req=False,
         ),
         _z(
-            key="nome_mae",
-            label="Nome da Mãe *",
-            sec="Dados Familiares",
-            tipo="text",
-            sf="Nome_da_Mae__c",
-            req=True,
-        ),
-        _z(
             key="qtd_filhos",
             label="Quantidade de Filhos",
             sec="Dados Familiares",
             tipo="number",
             sf="Quantidade_de_Filhos__c",
-            req=False,
-        ),
-        _z(
-            key="nome_conjuge",
-            label="Nome do Cônjuge",
-            sec="Dados Familiares",
-            tipo="text",
-            sf="Nome_do_Conjuge__c",
             req=False,
         ),
         # ——— Dados Bancários Pessoa Física ———
@@ -868,16 +887,8 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Conta_Banc_ria__c",
             req=True,
-            help="Número da conta sem o dígito verificador (use o campo seguinte para o dígito).",
-        ),
-        _z(
-            key="digito_conta",
-            label="Dígito da conta *",
-            sec="Dados Bancários Pessoa Física",
-            tipo="text",
-            sf="Digito_conta_bancaria__c",
-            req=True,
-            help="Dígito verificador da conta (geralmente 1 dígito).",
+            help="Informe o número completo da conta **já com o dígito verificador** (um único campo). "
+            "No Salesforce não há campo separado para o dígito — tudo vai em Conta bancária.",
         ),
         _z(
             key="agencia_bancaria",
@@ -1100,6 +1111,40 @@ def campos_planilha_corretor() -> List[Campo]:
     return out
 
 
+def campos_planilha_todos() -> List[Campo]:
+    """
+    Todos os campos do modelo (formulário visível + ocultos / automáticos), em SEC_ORDER.
+    Usado na aba Corretores: valores fixos e derivados aparecem em toda linha.
+    """
+    out: List[Campo] = []
+    seen: set[str] = set()
+    for sec in SEC_ORDER:
+        for c in CAMPOS:
+            if c["sec"] != sec or c["key"] in seen:
+                continue
+            seen.add(c["key"])
+            out.append(c)
+    return out
+
+
+def cabecalhos_api_salesforce_ordenados() -> List[str]:
+    """Nomes de API na aba Corretores (bloco «enviado ao Salesforce»), ordem alfabética estável."""
+    keys: set[str] = set()
+    for c in CAMPOS:
+        sf = c.get("sf")
+        if sf:
+            keys.add(str(sf))
+    for extra in ("RecordTypeId", "FirstName", "LastName", "AccountId", "OwnerId", "Apelido__c"):
+        keys.add(extra)
+    return sorted(keys)
+
+
+# Cabeçalhos fixos da aba Corretores (linha 1)
+PLANILHA_COL_DATA_ENVIO = "Data e hora do envio"
+PLANILHA_COL_LINK_SF = "Link do contato (Salesforce)"
+PLANILHA_COL_LINK_LEGACY = "Link do contato"
+
+
 # Campos da seção CRECI/TTI exibidos só quando «Possui CRECI?» = Sim.
 CAMPOS_CRECI_DETALHES: frozenset[str] = frozenset(
     {
@@ -1147,10 +1192,10 @@ def campos_por_secao_visiveis(
         d = dados or {}
         if _norm_picklist(d.get("unidade_negocio")) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
             cols = [c for c in cols if c["key"] != "atividade"]
-    if sec == "Dados Familiares":
+    if sec == "Dados Pessoais":
         d = dados or {}
         ec = _norm_picklist(d.get("estado_civil"))
-        if ec == "Solteiro" or not ec:
+        if ec != "Casado":
             cols = [c for c in cols if c["key"] != "nome_conjuge"]
     return cols
 
@@ -1301,10 +1346,13 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     if not nc:
         erros.append("Nome completo *")
     em = (dados.get("email") or "").strip()
-    if em and not email_contato_formato_valido(em):
-        erros.append(
-            "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
-        )
+    if em:
+        if not email_contato_formato_valido(em):
+            erros.append(
+                "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
+            )
+        elif not email_corporativo_direcionalvendas_obrigatorio(em):
+            erros.append(_MSG_EMAIL_CORPORATIVO_OBRIGATORIO)
     erros.extend(_erros_preenchimento_creci_se_sim(dados))
     erros.extend(_erros_conjuge_se_casado(dados))
     cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
@@ -1349,18 +1397,22 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
             erros.append(c["label"])
     if sec == "Dados para Contato":
         em = (dados.get("email") or "").strip()
-        if em and not email_contato_formato_valido(em):
-            erros.append(
-                "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
-            )
+        if em:
+            if not email_contato_formato_valido(em):
+                erros.append(
+                    "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
+                )
+            elif not email_corporativo_direcionalvendas_obrigatorio(em):
+                erros.append(_MSG_EMAIL_CORPORATIVO_OBRIGATORIO)
     if sec == "Dados Pessoais":
-        erros.extend(_erros_conjuge_se_casado(dados))
         cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
         if cpf_d and len(cpf_d) != 11:
             erros.append("CPF * (informe 11 dígitos)")
         eb = _erro_validacao_nascimento(dados.get("birthdate"))
         if eb:
             erros.append(eb)
+    if sec == "Dados Pessoais":
+        erros.extend(_erros_conjuge_se_casado(dados))
     if sec == "CRECI/TTI":
         erros.extend(_erros_preenchimento_creci_se_sim(dados))
     return list(dict.fromkeys(erros))
@@ -1576,6 +1628,9 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         if key == "nome_completo":
             continue
 
+        if key == "nome_conjuge" and _norm_picklist(dados.get("estado_civil")) != "Casado":
+            continue
+
         if sf is None:
             if raw and str(raw).strip() and key not in ("nome_completo",):
                 extras_obs.append(f"{c['label']}: {raw}")
@@ -1660,15 +1715,6 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                     payload[sf] = int(digits)
                 except ValueError:
                     payload[sf] = digits
-            continue
-
-        if key == "digito_conta" and sf == "Digito_conta_bancaria__c":
-            ds = re.sub(r"\D", "", str(raw if raw is not None else ""))
-            if ds:
-                try:
-                    payload[sf] = int(ds[-1])
-                except (ValueError, IndexError):
-                    avisos.append(f"{c['label']}: dígito inválido — omitido.")
             continue
 
         if key == "endereco_cep" and sf == "EnderecoResidencialCEP__c":
@@ -1782,34 +1828,70 @@ def _agora_envio_brasilia() -> tuple[str, str]:
         return now.strftime("%d/%m/%Y %H:%M:%S"), now.isoformat(timespec="seconds")
 
 
-def linha_planilha(dados: Dict[str, Any]) -> List[str]:
-    data_hora_br, iso = _agora_envio_brasilia()
+def _valor_celula_campo_planilha(c: Campo, dados: Dict[str, Any]) -> str:
+    """Texto gravado na coluna do rótulo do campo (valores do formulário / enriquecidos)."""
+    k = c["key"]
+    v = dados.get(k)
+    if c["tipo"] == "multiselect" and isinstance(v, list):
+        return "; ".join(str(x) for x in v)
+    if v is None:
+        return ""
+    if isinstance(v, (date, datetime)):
+        if isinstance(v, datetime):
+            return v.strftime("%d/%m/%Y %H:%M") if v.time() else v.date().strftime("%d/%m/%Y")
+        return v.strftime("%d/%m/%Y")
+    return str(v)
+
+
+def _valor_celula_payload_api(v: Any) -> str:
+    """Serialização para colunas de API Salesforce (linha da planilha)."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        if v != v:  # NaN
+            return ""
+        iv = int(v)
+        if iv == v:
+            return str(iv)
+        return str(v)
+    if isinstance(v, int):
+        return str(v)
+    s = str(v)
+    if len(s) > 48000:
+        return s[:47999] + "…"
+    return s
+
+
+def linha_planilha(
+    dados: Dict[str, Any], payload_salesforce: Optional[Dict[str, Any]] = None
+) -> List[str]:
+    """
+    Linha da aba Corretores: col 1 = data/hora envio, col 2 = link (vazio até atualizar SF),
+    depois todos os campos (form + ocultos), depois colunas API (JSON enviado), Envio? e Log.
+    """
+    data_hora_br, _ = _agora_envio_brasilia()
     row: List[str] = []
-    for c in campos_planilha_corretor():
-        k = c["key"]
-        v = dados.get(k)
-        if c["tipo"] == "multiselect" and isinstance(v, list):
-            row.append("; ".join(str(x) for x in v))
-        elif v is None:
-            row.append("")
-        else:
-            row.append(str(v))
     row.append(data_hora_br)
-    row.append(iso)
-    row.append("")  # Envio? — preenchido após tentativa Salesforce
-    row.append("")  # Log / erro
-    row.append("")  # Link do contato
+    row.append("")
+    for c in campos_planilha_todos():
+        row.append(_valor_celula_campo_planilha(c, dados))
+    apis = cabecalhos_api_salesforce_ordenados()
+    pay = dict(payload_salesforce or {})
+    for api in apis:
+        row.append(_valor_celula_payload_api(pay.get(api)))
+    row.append("")
+    row.append("")
     return row
 
 
 def cabecalho_planilha() -> List[str]:
-    return [c["label"] for c in campos_planilha_corretor()] + [
-        "Data e hora do envio",
-        "Carimbo ISO",
-        "Envio?",
-        "Log / erro",
-        "Link do contato",
-    ]
+    h: List[str] = [PLANILHA_COL_DATA_ENVIO, PLANILHA_COL_LINK_SF]
+    h.extend(c["label"] for c in campos_planilha_todos())
+    h.extend(cabecalhos_api_salesforce_ordenados())
+    h.extend(["Envio?", "Log / erro"])
+    return h
 
 
 def _norm_cabecalho_planilha(s: str) -> str:
@@ -1856,8 +1938,8 @@ def _indice_coluna_planilha_para_campo(
 def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[str, Any]:
     """
     Converte uma linha da aba Corretores (valores alinhados aos cabeçalhos) em dict de chaves do formulário.
-    Cabeçalhos da parte de dados = rótulos de `campos_planilha_corretor()` + colunas de sistema no final.
-    Campos ocultos ficam vazios até `_merge_defaults_ficha_em_dict` / `enriquecer_derivados_vendas_rj`.
+    Layout esperado na linha 1: data e link nas duas primeiras colunas; rótulos de `campos_planilha_todos()`;
+    colunas de API Salesforce; **Envio?** e **Log / erro**. Só rótulos que casam com `CAMPOS` entram no dict.
     """
     hmap: Dict[str, int] = {}
     for i, h in enumerate(headers):
@@ -1999,7 +2081,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
 
     if anexar_nova_linha_duplicada:
         try:
-            linha = linha_planilha(dados)
+            linha = linha_planilha(dados, payload)
             cab = cabecalho_planilha()
             row_num_atualizar = anexar_linha(linha, cab, sid, wname, creds, gs)
         except Exception as e:
@@ -2010,8 +2092,14 @@ def _executar_teste_criar_sf_de_linha_planilha(
         if atualizar_status_nesta_linha and row_num_atualizar >= 2:
             try:
                 atualizar_status_envio_salesforce(
-                    sid, wname, creds, row_num_atualizar, "Erro",
-                    "Falha ao conectar ao Salesforce.", "",
+                    sid,
+                    wname,
+                    creds,
+                    row_num_atualizar,
+                    "Erro",
+                    "Falha ao conectar ao Salesforce.",
+                    "",
+                    payload_final=payload,
                 )
             except Exception:
                 pass
@@ -2024,7 +2112,16 @@ def _executar_teste_criar_sf_de_linha_planilha(
     if atualizar_status_nesta_linha and row_num_atualizar >= 2:
         try:
             if cid:
-                atualizar_status_envio_salesforce(sid, wname, creds, row_num_atualizar, "Sucesso", "", link)
+                atualizar_status_envio_salesforce(
+                    sid,
+                    wname,
+                    creds,
+                    row_num_atualizar,
+                    "Sucesso",
+                    "",
+                    link,
+                    payload_final=payload,
+                )
             else:
                 atualizar_status_envio_salesforce(
                     sid,
@@ -2036,6 +2133,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
                     if err
                     else "Erro desconhecido",
                     "",
+                    payload_final=payload,
                 )
         except Exception as ex:
             avisos.append(f"Planilha (status): {ex}")
@@ -2113,7 +2211,7 @@ def _render_sidebar_teste_planilha_sf() -> None:
         row_1based = idx + 2
 
         atualizar = st.checkbox(
-            "Atualizar **Envio?**, **Log / erro** e **Link do contato** na planilha "
+            "Atualizar **Envio?**, **Log / erro**, **link** e colunas **API Salesforce** na planilha "
             "(na linha escolhida; se duplicar abaixo, na **linha nova**)",
             value=True,
             key="test_pl_atualizar_status",
@@ -2618,19 +2716,40 @@ def _nome_aba_dicionario_planilha(gs: Dict[str, Any]) -> str:
     )
 
 
-def _linhas_conteudo_aba_dicionario() -> List[List[str]]:
-    """Cabeçalho + uma linha por campo com mapeamento Salesforce (mesma lógica do Excel «Dicionário»)."""
-    rows: List[List[str]] = [
-        ["Rótulo do campo", "Nome do campo (API Salesforce)"],
-    ]
+def _dicionario_texto_coluna_corretores(header: str, cabecalhos_api: frozenset[str]) -> str:
+    """Descrição da coluna da aba Corretores para a aba Dicionário."""
+    nh = _norm_cabecalho_planilha(header)
+    if nh == _norm_cabecalho_planilha(PLANILHA_COL_DATA_ENVIO):
+        return "Metadado: data/hora do envio (não é campo do objeto Contact)."
+    if nh == _norm_cabecalho_planilha(PLANILHA_COL_LINK_SF) or nh == _norm_cabecalho_planilha(
+        PLANILHA_COL_LINK_LEGACY
+    ):
+        return "URL do registro no Lightning (Contact); preenchida após o insert."
+    if nh == _norm_cabecalho_planilha("Envio?"):
+        return "Controle interno: Sucesso ou Erro da criação do Contato."
+    if nh == _norm_cabecalho_planilha("Log / erro"):
+        return "Controle interno: mensagem de erro Salesforce ou vazio."
+    if header in cabecalhos_api:
+        return f"Contact.{header} — valor efetivo enviado no JSON (API REST / insert)."
     for c in CAMPOS:
-        sf = c.get("sf")
-        if not sf:
-            continue
         lab = str(c.get("label") or "")
-        if lab.endswith(" *"):
-            lab = lab[:-2].rstrip()
-        rows.append([lab, str(sf)])
+        if lab == header or (lab.endswith(" *") and lab[:-2].strip() == header):
+            sf = c.get("sf")
+            if sf:
+                return f"Contact.{sf} — valor como no formulário (rótulo «{lab}»)."
+            return "Sem API dedicada no insert; pode compor Observations__c ou não ser enviado."
+    return "—"
+
+
+def _linhas_conteudo_aba_dicionario() -> List[List[str]]:
+    """Uma linha por coluna da aba Corretores: nome exato na linha 1 × significado no Salesforce."""
+    cab = cabecalho_planilha()
+    api_f = frozenset(cabecalhos_api_salesforce_ordenados())
+    rows: List[List[str]] = [
+        ["Coluna na aba Corretores (linha 1)", "Campo / significado no Salesforce"],
+    ]
+    for coluna in cab:
+        rows.append([coluna, _dicionario_texto_coluna_corretores(coluna, api_f)])
     return rows
 
 
@@ -2797,6 +2916,132 @@ def _garantir_aba_valores_fixos(sh: Any, gs: Dict[str, Any]) -> None:
         pass
 
 
+def _linha_planilha_padded(ws: Any, row_1based: int, ncols: int) -> List[str]:
+    """Valores da linha com comprimento = ncols (células vazias como '')."""
+    try:
+        row = ws.row_values(row_1based)
+    except Exception:
+        row = []
+    if len(row) < ncols:
+        row = list(row) + [""] * (ncols - len(row))
+    return row[:ncols]
+
+
+def _indice_coluna_por_cabecalho(headers: List[str], nome: str) -> Optional[int]:
+    t = _norm_cabecalho_planilha(nome)
+    for i, h in enumerate(headers):
+        if _norm_cabecalho_planilha(h) == t:
+            return i
+    return None
+
+
+def _indice_coluna_link_contato(headers: List[str]) -> Optional[int]:
+    """Reconhece «Link do contato» ou «Link do contato (Salesforce)»."""
+    for i, h in enumerate(headers):
+        nh = _norm_cabecalho_planilha(h)
+        if "link" in nh and "contato" in nh:
+            return i
+    return None
+
+
+def _formatar_visual_aba_corretores(ws: Any, cabecalho: List[str]) -> None:
+    """Linha 1: cores por bloco (sistema | formulário+automáticos | API SF | controle), bordas e congelamento."""
+    try:
+        sheet_id = ws.id
+        n = len(cabecalho)
+        n_ctl = 2
+        n_api = len(cabecalhos_api_salesforce_ordenados())
+        n_form = n - 2 - n_api - n_ctl
+        if n_form < 1 or n < 4:
+            return
+
+        def rgb(r: float, g: float, b: float) -> Dict[str, float]:
+            return {"red": r, "green": g, "blue": b, "alpha": 1.0}
+
+        def hdr_fmt(bg: Dict[str, float], fg: Dict[str, float]) -> Dict[str, Any]:
+            return {
+                "backgroundColor": bg,
+                "horizontalAlignment": "CENTER",
+                "wrapStrategy": "WRAP",
+                "textFormat": {"foregroundColor": fg, "bold": True, "fontSize": 10},
+            }
+
+        i_sys0, i_sys1 = 0, 2
+        i_form0, i_form1 = 2, 2 + n_form
+        i_api0, i_api1 = i_form1, i_form1 + n_api
+        i_ctl0, i_ctl1 = i_api1, n
+
+        sp = ws.spreadsheet
+        reqs: List[Dict[str, Any]] = [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+        ]
+
+        def repeat_block(c0: int, c1: int, fmt: Dict[str, Any]) -> None:
+            reqs.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": c0,
+                            "endColumnIndex": c1,
+                        },
+                        "cell": {"userEnteredFormat": fmt},
+                        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,wrapStrategy,textFormat)",
+                    }
+                }
+            )
+
+        repeat_block(i_sys0, i_sys1, hdr_fmt(rgb(0.11, 0.2, 0.33), rgb(1, 1, 1)))
+        repeat_block(i_form0, i_form1, hdr_fmt(rgb(0.82, 0.95, 0.88), rgb(0.05, 0.22, 0.12)))
+        repeat_block(i_api0, i_api1, hdr_fmt(rgb(1.0, 0.94, 0.78), rgb(0.35, 0.22, 0.05)))
+        repeat_block(i_ctl0, i_ctl1, hdr_fmt(rgb(0.86, 0.89, 0.94), rgb(0.12, 0.16, 0.22)))
+
+        reqs.append(
+            {
+                "updateBorders": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": n,
+                    },
+                    "bottom": {"style": "SOLID_MEDIUM", "color": rgb(0.2, 0.25, 0.32)},
+                }
+            }
+        )
+        for sep in (i_sys1, i_form1, i_api1):
+            if 0 < sep < n:
+                reqs.append(
+                    {
+                        "updateBorders": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,
+                                "endRowIndex": 1,
+                                "startColumnIndex": sep - 1,
+                                "endColumnIndex": sep,
+                            },
+                            "right": {"style": "SOLID", "color": rgb(0.45, 0.48, 0.52)},
+                        }
+                    }
+                )
+
+        sp.batch_update({"requests": reqs})
+    except Exception:
+        return
+
+
 def anexar_linha(
     linha: List[str],
     cabecalho: List[str],
@@ -2808,7 +3053,7 @@ def anexar_linha(
     """
     Garante que a aba existe, cabeçalho na linha 1 alinhado ao layout atual e anexa a linha.
     Atualiza também a aba «Valores fixos (automáticos)» (nome configurável nos Secrets)
-    e a aba «Dicionário» (rótulos × API Salesforce).
+    e a aba «Dicionário» (colunas Corretores × significado Salesforce).
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
@@ -2831,16 +3076,26 @@ def anexar_linha(
         )
 
     existing = ws.get_all_values()
+    atualizou_cabecalho = False
     if not existing or not any(str(cell).strip() for cell in existing[0]):
         ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
+        atualizou_cabecalho = True
     elif _cabecalho_planilha_desalinhado(list(existing[0]), cabecalho):
         ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
+        atualizou_cabecalho = True
     elif len(existing[0]) < len(cabecalho):
         pad = list(existing[0]) + [""] * (len(cabecalho) - len(existing[0]))
         for i, h in enumerate(cabecalho):
             if i >= len(pad) or not str(pad[i] or "").strip():
                 pad[i] = h
         ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
+        atualizou_cabecalho = True
+
+    if atualizou_cabecalho:
+        try:
+            _formatar_visual_aba_corretores(ws, cabecalho)
+        except Exception:
+            pass
 
     ws.append_row(linha, value_input_option="USER_ENTERED")
     return len(ws.get_all_values())
@@ -2854,26 +3109,44 @@ def atualizar_status_envio_salesforce(
     envio: str,
     log_erro: str,
     link: str,
+    payload_final: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Preenche na linha indicada as colunas **Envio?**, **Log / erro** e **Link do contato**
-    (cabeçalhos definidos em corretor_campos.cabecalho_planilha).
+    Atualiza na linha: link Salesforce, **Envio?**, **Log / erro** e, se informado, as colunas de API
+    (valores finais enviados no JSON). Compatível com cabeçalho antigo «Link do contato».
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(worksheet_name)
     headers = ws.row_values(1)
-    mapping = {
-        "Envio?": envio,
-        "Log / erro": (log_erro or "")[:49000],
-        "Link do contato": link or "",
-    }
-    for h, val in mapping.items():
-        if h not in headers:
-            continue
-        col = headers.index(h) + 1
-        cell = f"{_col_letter(col)}{row_1based}"
-        ws.update(cell, [[val]], value_input_option="USER_ENTERED")
+    if not headers:
+        return
+    ncols = len(headers)
+    row_vals = _linha_planilha_padded(ws, row_1based, ncols)
+
+    idx_link = _indice_coluna_link_contato(headers)
+    if idx_link is not None and idx_link < len(row_vals):
+        row_vals[idx_link] = link or ""
+
+    ie = _indice_coluna_por_cabecalho(headers, "Envio?")
+    if ie is not None and ie < len(row_vals):
+        row_vals[ie] = envio
+    il = _indice_coluna_por_cabecalho(headers, "Log / erro")
+    if il is not None and il < len(row_vals):
+        row_vals[il] = (log_erro or "")[:49000]
+
+    if payload_final is not None:
+        for api in cabecalhos_api_salesforce_ordenados():
+            ic = _indice_coluna_por_cabecalho(headers, api)
+            if ic is not None and ic < len(row_vals):
+                row_vals[ic] = _valor_celula_payload_api(payload_final.get(api))
+
+    end_col = _col_letter(ncols)
+    ws.update(
+        f"A{row_1based}:{end_col}{row_1based}",
+        [row_vals],
+        value_input_option="USER_ENTERED",
+    )
 
 
 def listar_nomes_conta_aba_gerentes(
@@ -3309,6 +3582,11 @@ def aplicar_estilo():
         @keyframes fichaShimmer {{
             0% {{ background-position: 0% 50%; }}
             100% {{ background-position: 200% 50%; }}
+        }}
+        /* Modo claro no documento: evita que o navegador (PC/celular) aplique UI escura a inputs, date pickers, etc.
+           quando o sistema está em dark mode. O tema dos componentes Streamlit vem de [theme] base no config.toml. */
+        html, body, :root, [data-testid="stApp"] {{
+            color-scheme: light !important;
         }}
         html, body {{
             font-family: 'Inter', sans-serif;
@@ -4060,8 +4338,9 @@ def _widget_campo(c: dict):
             st.markdown(
                 '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:15px;'
                 'font-weight:400;color:#334155;line-height:1.55;">'
-                'Use o e-mail corporativo: <span style="font-style:italic;color:#04428f;">'
-                "nomesobrenome.direcionalvendas@gmail.com</span></p>",
+                "Obrigatório incluir <strong>.direcionalvendas</strong> no login do e-mail "
+                '(ex.: <span style="font-style:italic;color:#04428f;">'
+                "nomesobrenome.direcionalvendas@gmail.com</span>).</p>",
                 unsafe_allow_html=True,
             )
         return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
@@ -4139,6 +4418,13 @@ def _coletar_dados_formulario() -> dict[str, Any]:
     return out
 
 
+# Picklists que definem visibilidade em outras etapas: se `fld_*` ficar vazio no state
+# (widget desmontado / placeholder) mas o snapshot tem valor válido, usar o snapshot.
+_CROSS_STEP_PICKLIST_KEYS: frozenset[str] = frozenset(
+    {"estado_civil", "unidade_negocio", "possui_creci"}
+)
+
+
 def _coletar_dados_formulario_completo() -> dict[str, Any]:
     """
     Mescla snapshot das etapas já confirmadas (ficha_snap_campos) com o session_state.
@@ -4151,10 +4437,18 @@ def _coletar_dados_formulario_completo() -> dict[str, Any]:
     for c in CAMPOS:
         k = c["key"]
         sk = f"fld_{k}"
+        snap_v = snap.get(k)
         if sk in ss:
-            out[k] = ss[sk]
+            v = ss[sk]
+            if k in _CROSS_STEP_PICKLIST_KEYS:
+                if not _norm_picklist(v) and snap_v is not None and _norm_picklist(snap_v):
+                    out[k] = snap_v
+                else:
+                    out[k] = v
+            else:
+                out[k] = v
         else:
-            out[k] = snap.get(k)
+            out[k] = snap_v
     return out
 
 
@@ -4722,6 +5016,11 @@ def enviar_email_boas_vindas_candidato(
         return False, "E-mail do candidato não informado no formulário."
     if not email_contato_formato_valido(dest):
         return False, "E-mail do cadastro inválido — use formato nome@dominio.com (evite abreviações como uma única letra)."
+    if not email_corporativo_direcionalvendas_obrigatorio(dest):
+        return False, (
+            "E-mail do cadastro deve ser o corporativo com .direcionalvendas no login "
+            "(ex.: nomesobrenome.direcionalvendas@gmail.com)."
+        )
 
     nome = _nome_candidato_ficha(dados)
     tem_pdf = bool(pdf_bytes)
@@ -5340,7 +5639,10 @@ def _processar_envio_cadastro() -> None:
     st.caption("**Carregando…** Aguarde — gravando seu cadastro. Não feche a página.")
     bar_envio = st.progress(0.0)
 
-    linha = linha_planilha(dados)
+    payload, avisos = montar_payload_salesforce(dados)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados))
+    linha = linha_planilha(dados, payload)
     cab = cabecalho_planilha()
 
     try:
@@ -5417,7 +5719,14 @@ def _processar_envio_cadastro() -> None:
     bar_envio.progress(0.58)
     if not _credenciais_salesforce_ok():
         atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).", ""
+            sid,
+            wname,
+            creds,
+            row_num,
+            "Erro",
+            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
+            "",
+            payload_final=payload,
         )
         ss["sf_erro"] = "Salesforce não configurado nos Secrets."
         bar_envio.progress(0.88)
@@ -5429,7 +5738,14 @@ def _processar_envio_cadastro() -> None:
 
     if not _SF_SDK_DISPONIVEL:
         atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "simple_salesforce não instalado.", ""
+            sid,
+            wname,
+            creds,
+            row_num,
+            "Erro",
+            "simple_salesforce não instalado.",
+            "",
+            payload_final=payload,
         )
         ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
         bar_envio.progress(0.88)
@@ -5439,16 +5755,20 @@ def _processar_envio_cadastro() -> None:
         st.rerun()
         return
 
-    payload, avisos = montar_payload_salesforce(dados)
-    avisos = list(avisos)
-    avisos.extend(_enriquecer_mobile_phone(payload, dados))
     bar_envio.progress(0.68)
 
     sf = conectar_salesforce()
     bar_envio.progress(0.78)
     if not sf:
         atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", "Falha ao conectar ao Salesforce (credenciais ou rede).", ""
+            sid,
+            wname,
+            creds,
+            row_num,
+            "Erro",
+            "Falha ao conectar ao Salesforce (credenciais ou rede).",
+            "",
+            payload_final=payload,
         )
         ss["sf_erro"] = "Falha ao conectar ao Salesforce."
         ss["sf_avisos"] = avisos
@@ -5466,7 +5786,9 @@ def _processar_envio_cadastro() -> None:
     link = _url_contact(cid) if cid else ""
 
     if cid:
-        atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Sucesso", "", link)
+        atualizar_status_envio_salesforce(
+            sid, wname, creds, row_num, "Sucesso", "", link, payload_final=payload
+        )
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
         ss.pop("ficha_sf_retry_row", None)
@@ -5474,7 +5796,9 @@ def _processar_envio_cadastro() -> None:
         ss.pop("ficha_sf_retry_wname", None)
     else:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
-        atualizar_status_envio_salesforce(sid, wname, creds, row_num, "Erro", err_full[:49000], "")
+        atualizar_status_envio_salesforce(
+            sid, wname, creds, row_num, "Erro", err_full[:49000], "", payload_final=payload
+        )
         ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
     ss["sf_avisos"] = avisos
@@ -5512,6 +5836,11 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss["sf_erro"] = "Credenciais Google Sheets ausentes — necessárias para atualizar o status na planilha."
         return
 
+    dados_c = dict(dados)
+    payload, avisos = montar_payload_salesforce(dados_c)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados_c))
+
     _aplicar_secrets_sf()
     if not _credenciais_salesforce_ok():
         atualizar_status_envio_salesforce(
@@ -5522,6 +5851,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
             "Erro",
             "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
             "",
+            payload_final=payload,
         )
         ss["sf_erro"] = "Salesforce não configurado nos Secrets."
         return
@@ -5535,14 +5865,10 @@ def _retentar_salesforce_ultimo_envio() -> None:
             "Erro",
             "simple_salesforce não instalado.",
             "",
+            payload_final=payload,
         )
         ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
         return
-
-    dados_c = dict(dados)
-    payload, avisos = montar_payload_salesforce(dados_c)
-    avisos = list(avisos)
-    avisos.extend(_enriquecer_mobile_phone(payload, dados_c))
 
     with st.spinner("Tentando novamente no Salesforce..."):
         sf = conectar_salesforce()
@@ -5555,6 +5881,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
             "Erro",
             "Falha ao conectar ao Salesforce (credenciais ou rede).",
             "",
+            payload_final=payload,
         )
         ss["sf_erro"] = "Falha ao conectar ao Salesforce."
         ss["sf_avisos"] = avisos
@@ -5565,7 +5892,16 @@ def _retentar_salesforce_ultimo_envio() -> None:
     link = _url_contact(cid) if cid else ""
 
     if cid:
-        atualizar_status_envio_salesforce(str(sid), str(wname), creds, int(row_num), "Sucesso", "", link)
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Sucesso",
+            "",
+            link,
+            payload_final=payload,
+        )
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
         ss.pop("ficha_sf_retry_row", None)
@@ -5574,7 +5910,14 @@ def _retentar_salesforce_ultimo_envio() -> None:
     else:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
         atualizar_status_envio_salesforce(
-            str(sid), str(wname), creds, int(row_num), "Erro", err_full[:49000], ""
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            err_full[:49000],
+            "",
+            payload_final=payload,
         )
         ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
