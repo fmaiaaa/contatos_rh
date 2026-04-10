@@ -5335,7 +5335,8 @@ def _render_secao_formulario(secoes: list[str]) -> None:
             unsafe_allow_html=True,
         )
         # Campos que controlam visibilidade de outros devem ficar FORA do st.form: dentro do form
-        # o Streamlit só sincroniza o state no envio, então «Sim» em CRECI não mostraria os demais campos.
+        # o Streamlit só sincroniza o state no envio — ex.: «Sim» em CRECI, rede em Informações,
+        # **Estado civil** em Dados Pessoais (senão «Casado» não atualiza a tempo e o nome do cônjuge some).
         dados_sec = _coletar_dados_formulario_completo()
         if sec == "CRECI/TTI":
             c_pc = next((c for c in CAMPOS if c["key"] == "possui_creci"), None)
@@ -5370,6 +5371,20 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                 c
                 for c in campos_por_secao_visiveis(sec, dados_sec)
                 if c["key"] != "unidade_negocio"
+            ]
+        elif sec == "Dados Pessoais":
+            # Mesma razão do CRECI/rede: estado civil fora do form para o select atualizar o state
+            # antes do submit; nome e nascimento ficam fora só para manter a ordem visual (nome → nasc. → estado).
+            _chaves_fora_form_dados_pessoais = ("nome_completo", "birthdate", "estado_civil")
+            for _k in _chaves_fora_form_dados_pessoais:
+                c0 = next((x for x in CAMPOS if x["key"] == _k and x["sec"] == sec), None)
+                if c0:
+                    _widget_campo(c0)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] not in _chaves_fora_form_dados_pessoais
             ]
         else:
             cols = campos_por_secao_visiveis(sec, dados_sec)
