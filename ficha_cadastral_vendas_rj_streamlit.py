@@ -1996,10 +1996,6 @@ def configurar_layout():
             from {{ opacity: 0; transform: scale(0.97) translateY(12px); }}
             to {{ opacity: 1; transform: scale(1) translateY(0); }}
         }}
-        @keyframes dvSoftPulse {{
-            0%, 100% {{ box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2), 0 4px 20px -4px rgba({RGB_VERMELHO_CSS}, 0.4); }}
-            50% {{ box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), 0 8px 28px -4px rgba({RGB_VERMELHO_CSS}, 0.52); }}
-        }}
         /* Tokens de design (UI contemporânea; usados em sombras, raios e transições) */
         :root {{
             --dv-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
@@ -2247,6 +2243,15 @@ def configurar_layout():
             padding-bottom: 0.5rem !important;
         }}
 
+        @media (prefers-reduced-motion: no-preference) {{
+            .header-container {{
+                animation: dvFadeRise var(--dv-duration-slow) var(--dv-ease-out) both;
+            }}
+            .home-banners-wrap {{
+                animation: dvFadeRise calc(var(--dv-duration-slow) + 0.1s) var(--dv-ease-out) 0.12s both;
+            }}
+        }}
+
         /* Ritmo vertical uniforme entre secções, widgets e colunas */
         .block-container [data-testid="stVerticalBlock"] {{
             display: flex !important;
@@ -2271,12 +2276,14 @@ def configurar_layout():
             ) !important;
         }}
 
-        /* Cards de recomendação: grupo centralizado; scroll horizontal só quando não cabem */
+        /* Cards de recomendação: grupo centralizado; fade nas bordas do carrossel */
         .recommendation-cards-outer {{
             display: flex;
             justify-content: center;
             width: 100%;
             box-sizing: border-box;
+            -webkit-mask-image: linear-gradient(90deg, transparent, #000 2%, #000 98%, transparent);
+            mask-image: linear-gradient(90deg, transparent, #000 2%, #000 98%, transparent);
         }}
         .scrolling-wrapper {{
             display: flex;
@@ -2289,11 +2296,27 @@ def configurar_layout():
             width: max-content;
             max-width: 100%;
             box-sizing: border-box;
+            scroll-behavior: smooth;
+            scrollbar-width: thin;
+            scrollbar-color: rgba({RGB_AZUL_CSS}, 0.35) transparent;
         }}
-        
+        .scrolling-wrapper::-webkit-scrollbar {{
+            height: 6px;
+        }}
+        .scrolling-wrapper::-webkit-scrollbar-thumb {{
+            background: linear-gradient(90deg, rgba({RGB_AZUL_CSS}, 0.25), rgba({RGB_VERMELHO_CSS}, 0.35));
+            border-radius: 99px;
+        }}
+
         .scrolling-wrapper .card-item {{
             flex: 0 0 auto;
             width: 300px;
+            transition: transform var(--dv-duration) var(--dv-ease-out);
+        }}
+        @media (hover: hover) and (prefers-reduced-motion: no-preference) {{
+            .scrolling-wrapper .card-item:hover {{
+                transform: scale(1.015);
+            }}
         }}
 
         h1, h2, h3, h4, h5, h6 {{
@@ -2329,7 +2352,7 @@ def configurar_layout():
         }}
 
         .block-container {{
-            --dv-rhythm: 1.2rem;
+            --dv-rhythm: 1.35rem;
             text-rendering: optimizeLegibility;
             max-width: min(1680px, 100%) !important;
             margin-left: auto !important;
@@ -2493,6 +2516,20 @@ def configurar_layout():
             box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22),
                 0 10px 28px -6px rgba({RGB_VERMELHO_CSS}, 0.48) !important;
         }}
+        @media (hover: hover) and (prefers-reduced-motion: no-preference) {{
+            .stButton button[kind="primary"]:hover {{
+                transform: translateY(-2px) scale(1.01) !important;
+            }}
+            .stButton button:not([kind="primary"]):hover,
+            .stDownloadButton button:hover {{
+                transform: translateY(-1px) !important;
+            }}
+            a[data-testid="stLinkButton"][href*="whatsapp.com"]:hover,
+            a[data-testid="stLinkButton"][href*="wa.me"]:hover,
+            a[data-testid="stLinkButton"][href*="api.whatsapp.com"]:hover {{
+                transform: translateY(-1px) !important;
+            }}
+        }}
 
         /* Botões secundários = branco, texto escuro (primários continuam vermelhos) */
         .stButton button:not([kind="primary"]) {{
@@ -2546,7 +2583,8 @@ def configurar_layout():
             border-radius: var(--dv-radius-sm) !important;
             transition: background-color var(--dv-duration) var(--dv-ease-out),
                 border-color var(--dv-duration) var(--dv-ease-out),
-                box-shadow var(--dv-duration) var(--dv-ease-out) !important;
+                box-shadow var(--dv-duration) var(--dv-ease-out),
+                transform var(--dv-duration) var(--dv-ease-spring) !important;
             background: #ffffff !important;
             background-color: #ffffff !important;
             background-image: none !important;
@@ -2650,6 +2688,29 @@ def configurar_layout():
             align-items: center !important;
             justify-content: center !important;
         }}
+        /* Painel interior dos modais Streamlit: cartão flutuante + entrada */
+        [data-testid="stDialog"] > div > div {{
+            border-radius: var(--dv-radius-xl) !important;
+            border: 1px solid rgba(255, 255, 255, 0.7) !important;
+            box-shadow: 0 25px 60px -15px rgba(15, 23, 42, 0.2), var(--dv-shadow-sm) !important;
+            background: var(--dv-surface-glass-strong) !important;
+            backdrop-filter: blur(14px) saturate(165%) !important;
+            -webkit-backdrop-filter: blur(14px) saturate(165%) !important;
+            overflow: auto !important;
+        }}
+        @media (prefers-reduced-motion: no-preference) {{
+            [data-testid="stDialog"] > div > div {{
+                animation: dvModalShell 0.38s var(--dv-ease-spring) both;
+            }}
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            [data-testid="stDialog"] > div > div {{
+                animation: none !important;
+            }}
+        }}
+        html[data-dv-reduced-motion="1"] [data-testid="stDialog"] > div > div {{
+            animation: none !important;
+        }}
         /* Painel do popup de exportação: largura confortável (o Root continua em tela cheia) */
         [data-testid="stDialog"]:has(#dv-export-resumo-modal-marker) > div > div {{
             max-width: min(920px, 96vw) !important;
@@ -2668,9 +2729,16 @@ def configurar_layout():
             transform: rotate(90deg) !important;
         }}
         div[data-testid="stAlert"] {{
-            border-radius: 8px !important;
-            border: 1px solid #cbd5e1 !important;
-            background: #f8fafc !important;
+            border-radius: var(--dv-radius-md) !important;
+            border: 1px solid rgba(226, 232, 240, 0.95) !important;
+            background: linear-gradient(135deg, rgba(248, 250, 252, 0.98) 0%, rgba(241, 245, 249, 0.95) 100%) !important;
+            box-shadow: var(--dv-shadow-xs) !important;
+            transition: box-shadow var(--dv-duration) var(--dv-ease-out), transform var(--dv-duration) var(--dv-ease-out) !important;
+        }}
+        @media (hover: hover) {{
+            div[data-testid="stAlert"]:hover {{
+                box-shadow: var(--dv-shadow-sm) !important;
+            }}
         }}
         div[data-testid="stAlert"] p,
         div[data-testid="stAlert"] span,
@@ -2737,6 +2805,12 @@ def configurar_layout():
         [data-testid="stExpander"] summary {{
             font-weight: 600 !important;
             letter-spacing: -0.02em !important;
+            cursor: pointer !important;
+            transition: background-color var(--dv-duration) var(--dv-ease-out), color var(--dv-duration) var(--dv-ease-out) !important;
+            border-radius: calc(var(--dv-radius-md) - 2px) !important;
+        }}
+        [data-testid="stExpander"] summary:hover {{
+            background-color: rgba(255, 255, 255, 0.55) !important;
         }}
 
         .header-container {{
@@ -2777,6 +2851,12 @@ def configurar_layout():
             will-change: background-position;
             animation: brandBarGradientShift 22s ease-in-out infinite alternate;
         }}
+        @media (prefers-reduced-motion: no-preference) {{
+            .header-brand-bar-wrap {{
+                animation: dvFadeRise var(--dv-duration-slow) var(--dv-ease-out) 0.08s both,
+                    brandBarGradientShift 22s ease-in-out 0.55s infinite alternate;
+            }}
+        }}
         @media (prefers-reduced-motion: reduce) {{
             .header-brand-bar-wrap {{
                 animation: none !important;
@@ -2788,6 +2868,10 @@ def configurar_layout():
             animation: none !important;
             background-position: 50% 50% !important;
             will-change: auto !important;
+        }}
+        html[data-dv-reduced-motion="1"] .header-container,
+        html[data-dv-reduced-motion="1"] .home-banners-wrap {{
+            animation: none !important;
         }}
         .home-banners-wrap {{
             display: flex;
@@ -3036,6 +3120,13 @@ def configurar_layout():
             height: auto;
             object-fit: contain;
             filter: drop-shadow(0 2px 10px rgba(15, 23, 42, 0.07));
+            transition: transform var(--dv-duration) var(--dv-ease-spring), filter var(--dv-duration) var(--dv-ease-out);
+        }}
+        @media (hover: hover) and (prefers-reduced-motion: no-preference) {{
+            .header-logo-wrap:hover img {{
+                transform: scale(1.02);
+                filter: drop-shadow(0 6px 18px rgba(15, 23, 42, 0.1));
+            }}
         }}
         .header-title {{
             font-family: 'Montserrat', 'Inter', sans-serif;
@@ -3146,27 +3237,37 @@ def configurar_layout():
         .metric-value {{ color: {COR_AZUL_ESC} !important; font-size: 1.8rem; font-weight: 800; font-family: 'Montserrat', 'Inter', sans-serif; }}
 
         .badge-ideal, .badge-seguro, .badge-multi {{
-            background-color: {COR_VERMELHO} !important;
+            background: linear-gradient(135deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
             color: white;
             padding: 6px 14px;
-            border-radius: 20px;
+            border-radius: 999px;
             font-weight: bold;
             font-size: 0.82rem;
             margin-top: 10px;
             letter-spacing: 0.02em;
             line-height: 1.25;
+            box-shadow: 0 2px 10px -2px rgba({RGB_VERMELHO_CSS}, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+            transition: transform var(--dv-duration) var(--dv-ease-spring), box-shadow var(--dv-duration) var(--dv-ease-out);
+        }}
+        @media (hover: hover) and (prefers-reduced-motion: no-preference) {{
+            .badge-ideal:hover, .badge-seguro:hover, .badge-multi:hover {{
+                transform: scale(1.04);
+                box-shadow: 0 6px 18px -4px rgba({RGB_VERMELHO_CSS}, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+            }}
         }}
         
         [data-testid="stSidebar"] {{ background-color: #fff; border-right: 1px solid {COR_BORDA}; }}
 
         .footer {{
             text-align: center;
-            margin-top: var(--dv-rhythm, 1.2rem) !important;
-            padding: var(--dv-rhythm, 1.2rem) 1rem;
+            margin-top: var(--dv-rhythm, 1.35rem) !important;
+            padding: var(--dv-rhythm, 1.35rem) 1rem calc(var(--dv-rhythm, 1.35rem) + 0.25rem);
             font-family: 'Inter', system-ui, sans-serif;
             color: #64748b !important;
             font-size: 0.8rem;
             line-height: 1.5;
+            border-top: 1px solid transparent;
+            border-image: linear-gradient(90deg, transparent, rgba(148, 163, 184, 0.45), transparent) 1;
         }}
         .footer em {{
             display: block;
