@@ -1149,56 +1149,122 @@ def inject_login_password_manager_fields():
 
 
 def inject_home_banner_dialog_modal():
-    """Abre/fecha lightbox com <dialog>.showModal() — top layer na viewport do frame onde o Streamlit renderiza o markdown.
+    """Popup de campanha: overlay criado em JS (o Streamlit sanitiza o markdown e costuma remover <dialog>).
 
-    O conteúdo das campanhas vive no documento do iframe da app; usar só window.parent.document
-    quebrava getElementById e o clique (eventos não sobem do iframe para o parent).
+    Dados vêm de data-dv-src (URL) e data-dv-t64 / data-dv-b64 (título e texto em UTF-8 base64).
     """
     js = r"""
 <script>
 (function () {
-  function wireBannerDialog(doc) {
-    if (!doc || !doc.documentElement) return;
-    if (doc.documentElement.getAttribute("data-dv-home-banner-dialog") === "1") return;
-    doc.documentElement.setAttribute("data-dv-home-banner-dialog", "1");
+  function b64ToUtf8(b64) {
+    if (!b64) return "";
+    try {
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new TextDecoder("utf-8").decode(bytes);
+    } catch (e) {
+      return "";
+    }
+  }
+  function closeDvCampanha(doc) {
+    var root = doc.getElementById("dv-campanha-overlay-root");
+    if (root) root.remove();
+    try {
+      doc.removeEventListener("keydown", doc.__dvCampanhaEscHandler);
+    } catch (e2) {}
+    doc.__dvCampanhaEscHandler = null;
+  }
+  function openDvCampanha(doc, src, titleB64, bodyB64) {
+    closeDvCampanha(doc);
+    var title = b64ToUtf8(titleB64);
+    var body = b64ToUtf8(bodyB64);
+    var root = doc.createElement("div");
+    root.id = "dv-campanha-overlay-root";
+    root.className = "dv-campanha-overlay";
+    root.setAttribute("role", "dialog");
+    root.setAttribute("aria-modal", "true");
+    root.setAttribute("aria-label", "Campanha comercial");
+    var back = doc.createElement("div");
+    back.className = "dv-campanha-overlay-backdrop";
+    var panel = doc.createElement("div");
+    panel.className = "dv-campanha-overlay-panel";
+    var closeBtn = doc.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "dv-campanha-overlay-close";
+    closeBtn.setAttribute("aria-label", "Fechar");
+    closeBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><line x1="2" y1="2" x2="12" y2="12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/><line x1="12" y1="2" x2="2" y2="12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/></svg>';
+    closeBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      closeDvCampanha(doc);
+    });
+    var imgWrap = doc.createElement("div");
+    imgWrap.className = "dv-campanha-overlay-img-wrap";
+    var img = doc.createElement("img");
+    img.className = "dv-campanha-overlay-img";
+    img.alt = "";
+    img.loading = "eager";
+    img.decoding = "async";
+    img.src = src;
+    imgWrap.appendChild(img);
+    var textWrap = doc.createElement("div");
+    textWrap.className = "dv-campanha-overlay-text";
+    if (title) {
+      var h = doc.createElement("h3");
+      h.className = "dv-campanha-overlay-title";
+      h.textContent = title;
+      textWrap.appendChild(h);
+    }
+    if (body) {
+      var p = doc.createElement("div");
+      p.className = "dv-campanha-overlay-body";
+      p.textContent = body;
+      textWrap.appendChild(p);
+    }
+    panel.appendChild(closeBtn);
+    panel.appendChild(imgWrap);
+    if (title || body) panel.appendChild(textWrap);
+    root.appendChild(back);
+    root.appendChild(panel);
+    back.addEventListener("click", function () {
+      closeDvCampanha(doc);
+    });
+    panel.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    doc.body.appendChild(root);
+    doc.__dvCampanhaEscHandler = function (kev) {
+      if (kev.key === "Escape") closeDvCampanha(doc);
+    };
+    doc.addEventListener("keydown", doc.__dvCampanhaEscHandler);
+  }
+  function wire(doc) {
+    if (!doc || !doc.body) return;
+    if (doc.__dvCampanhaPopupWired) return;
+    doc.__dvCampanhaPopupWired = true;
     doc.addEventListener(
       "click",
       function (ev) {
         var t = ev.target;
         if (!t || !t.closest) return;
-        var d = t.ownerDocument || doc;
         var openBtn = t.closest(".home-banner-lb-open");
         if (openBtn) {
           ev.preventDefault();
-          var did = openBtn.getAttribute("data-dv-dialog");
-          if (!did) return;
-          var dlg = d.getElementById(did);
-          if (dlg && dlg.tagName === "DIALOG" && typeof dlg.showModal === "function") {
-            try {
-              dlg.showModal();
-            } catch (err) {}
-          }
-          return;
-        }
-        var closeBtn = t.closest(".home-banner-lb-dialog-close");
-        if (closeBtn) {
-          var dClose = closeBtn.closest("dialog");
-          if (dClose) dClose.close();
-          return;
-        }
-        if (t.tagName === "DIALOG" && t.classList.contains("home-banner-lb-dialog")) {
-          t.close();
+          var src = openBtn.getAttribute("data-dv-src");
+          if (!src) return;
+          var d = openBtn.ownerDocument || doc;
+          openDvCampanha(
+            d,
+            src,
+            openBtn.getAttribute("data-dv-t64") || "",
+            openBtn.getAttribute("data-dv-b64") || ""
+          );
         }
       },
       true
     );
   }
-  wireBannerDialog(document);
-  try {
-    if (window.parent && window.parent !== window && window.parent.document) {
-      wireBannerDialog(window.parent.document);
-    }
-  } catch (e) {}
+  wire(document);
 })();
 </script>
 """
@@ -1236,9 +1302,17 @@ def inject_modern_ui_runtime():
 # 1. CARREGAMENTO DE DADOS
 # =============================================================================
 
-_COLS_HOME_BANNERS = ("Ordem", "URL_Imagem", "Titulo", "Ativo", "Tela_Cheia", "Descricao")
+_COLS_HOME_BANNERS = (
+    "Ordem",
+    "URL_Imagem",
+    "Titulo",
+    "Ativo",
+    "Tela_Cheia",
+    "Descricao",
+    "Chave_Campanha",
+)
 _WS_CAMPANHAS_TEXTO = "BD Campanhas Texto"
-_COLS_CAMPANHAS_TEXTO = ("Ordem", "Titulo", "Texto", "Ativo")
+_COLS_CAMPANHAS_TEXTO = ("Ordem", "Titulo", "Texto", "Ativo", "Chave_Campanha")
 
 
 def normalizar_df_campanhas_texto(df: pd.DataFrame | None) -> pd.DataFrame:
@@ -1254,6 +1328,11 @@ def normalizar_df_campanhas_texto(df: pd.DataFrame | None) -> pd.DataFrame:
         "titulo": "Titulo",
         "texto": "Texto",
         "ativo": "Ativo",
+        "chave": "Chave_Campanha",
+        "Chave": "Chave_Campanha",
+        "chave campanha": "Chave_Campanha",
+        "Chave campanha": "Chave_Campanha",
+        "chave_campanha": "Chave_Campanha",
     }
     for a, b in list(ren.items()):
         if a in out.columns and a != b:
@@ -1283,6 +1362,11 @@ def normalizar_df_home_banners(df: pd.DataFrame | None) -> pd.DataFrame:
         "Descrição": "Descricao",
         "descricao": "Descricao",
         "desc": "Descricao",
+        "chave": "Chave_Campanha",
+        "Chave": "Chave_Campanha",
+        "chave campanha": "Chave_Campanha",
+        "Chave campanha": "Chave_Campanha",
+        "chave_campanha": "Chave_Campanha",
     }
     for a, b in list(ren.items()):
         if a in out.columns and a != b:
@@ -1298,16 +1382,6 @@ def login_row_is_adm(row: pd.Series) -> bool:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return False
     return str(v).strip().upper() == "SIM"
-
-
-# Botão fechar do popup: X preto em SVG (fundo branco no CSS)
-_SVG_LB_FECHAR = (
-    '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" '
-    'class="home-banner-lb-close-icon" aria-hidden="true" focusable="false">'
-    '<line x1="2" y1="2" x2="12" y2="12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/>'
-    '<line x1="12" y1="2" x2="2" y2="12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/>'
-    "</svg>"
-)
 
 
 def _img_url_seguro_https(url: str) -> str | None:
@@ -1362,38 +1436,67 @@ def _html_campanhas_texto_bloco(df_texto: pd.DataFrame) -> str:
     )
 
 
+def _utf8_base64_attr(s: str) -> str:
+    """UTF-8 → base64 (ASCII) para data-* no HTML (evita aspas quebradas)."""
+    return base64.b64encode((s or "").encode("utf-8")).decode("ascii")
+
+
+def _mapa_texto_campanha_por_chave(df_texto: pd.DataFrame) -> dict[str, tuple[str, str]]:
+    """Chave_Campanha (planilha texto) → (Título, Texto) para o popup; última linha vence se repetir chave."""
+    df = normalizar_df_campanhas_texto(df_texto)
+    out: dict[str, tuple[str, str]] = {}
+    if df.empty:
+        return out
+    for _, row in df.iterrows():
+        k = str(row.get("Chave_Campanha", "") or "").strip()
+        if not k:
+            continue
+        tit = str(row.get("Titulo", "") or "").strip()
+        body = str(row.get("Texto", "") or "").strip()
+        out[k] = (tit, body)
+    return out
+
+
 def render_secao_campanhas_comerciais(
     df_banners: pd.DataFrame,
     df_texto_campanhas: pd.DataFrame | None = None,
 ) -> None:
-    """Faixa de miniaturas fixas (clique = imagem em tela cheia na viewport) + texto em lista abaixo."""
+    """Faixa de miniaturas (clique = popup com imagem + texto) + texto em lista abaixo."""
     df_bn = normalizar_df_home_banners(df_banners).reset_index(drop=True)
+    mapa_chave = _mapa_texto_campanha_por_chave(
+        df_texto_campanhas if df_texto_campanhas is not None else pd.DataFrame()
+    )
     copy_html = _html_campanhas_texto_bloco(
         df_texto_campanhas if df_texto_campanhas is not None else pd.DataFrame()
     )
     cards: list[str] = []
     if not df_bn.empty:
-        lb_idx = 0
         for _, row in df_bn.iterrows():
+            atv = str(row.get("Ativo", "SIM") or "").strip().upper()
+            if atv in ("NÃO", "NAO", "N", "NO", "FALSE", "0"):
+                continue
             src = _img_url_seguro_https(str(row.get("URL_Imagem", "") or ""))
             if not src:
                 continue
-            cid = f"dv-home-banner-dlg-{lb_idx}"
-            lb_idx += 1
+            chave = str(row.get("Chave_Campanha", "") or "").strip()
+            tit_pop = str(row.get("Titulo", "") or "").strip()
+            body_pop = str(row.get("Descricao", "") or "").strip()
+            if chave and chave in mapa_chave:
+                t_map, b_map = mapa_chave[chave]
+                if t_map:
+                    tit_pop = t_map
+                if b_map:
+                    body_pop = b_map
+            t64 = _utf8_base64_attr(tit_pop)
+            b64 = _utf8_base64_attr(body_pop)
             cards.append(
                 f'<div class="home-banner-lb-root">'
                 f'<button type="button" class="home-banner-card home-banner-card--fs home-banner-card--thumb home-banner-lb-open" '
-                f'data-dv-dialog="{cid}" title="Ampliar em tela cheia" aria-label="Ampliar imagem da campanha em tela cheia">'
+                f'data-dv-src="{src}" data-dv-t64="{html_std.escape(t64, quote=True)}" data-dv-b64="{html_std.escape(b64, quote=True)}" '
+                f'title="Ver campanha" aria-label="Abrir campanha em destaque">'
                 f'<span class="home-banner-thumb-frame">'
                 f'<img src="{src}" alt="" loading="lazy" decoding="async" />'
-                f"</span></button>"
-                f'<dialog id="{cid}" class="home-banner-lb-dialog" aria-label="Imagem ampliada">'
-                f'<div class="home-banner-lb-dialog-inner">'
-                f'<div class="home-banner-lb-popup">'
-                f'<button type="button" class="home-banner-lb-close home-banner-lb-dialog-close" '
-                f'aria-label="Fechar" title="Fechar">{_SVG_LB_FECHAR}</button>'
-                f'<img class="home-banner-lb-img" src="{src}" alt="" loading="lazy" decoding="async" />'
-                f"</div></div></dialog></div>"
+                f"</span></button></div>"
             )
     if not cards and not copy_html:
         return
@@ -1415,8 +1518,14 @@ def render_secao_campanhas_comerciais(
     )
 
 
-def gravar_nova_linha_home_banner(url_imagem: str) -> tuple[bool, str]:
-    """Anexa linha na aba BD Home Banners: ordem automática, sempre ativo/tela cheia na planilha (legado)."""
+def gravar_nova_linha_home_banner(
+    url_imagem: str,
+    *,
+    chave_campanha: str = "",
+    titulo: str = "",
+    descricao: str = "",
+) -> tuple[bool, str]:
+    """Anexa linha na aba BD Home Banners. Use a mesma Chave_Campanha na aba de textos para juntar popup."""
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
         df_raw = conn.read(spreadsheet=ID_GERAL, worksheet="BD Home Banners")
@@ -1428,10 +1537,11 @@ def gravar_nova_linha_home_banner(url_imagem: str) -> tuple[bool, str]:
                 {
                     "Ordem": prox,
                     "URL_Imagem": url_imagem.strip(),
-                    "Titulo": "",
+                    "Titulo": (titulo or "").strip(),
                     "Ativo": "SIM",
                     "Tela_Cheia": "SIM",
-                    "Descricao": "",
+                    "Descricao": (descricao or "").strip(),
+                    "Chave_Campanha": (chave_campanha or "").strip(),
                 }
             ]
         )
@@ -1442,7 +1552,12 @@ def gravar_nova_linha_home_banner(url_imagem: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def gravar_nova_linha_campanha_texto(titulo: str, texto: str) -> tuple[bool, str]:
+def gravar_nova_linha_campanha_texto(
+    titulo: str,
+    texto: str,
+    *,
+    chave_campanha: str = "",
+) -> tuple[bool, str]:
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
         df_raw = conn.read(spreadsheet=ID_GERAL, worksheet=_WS_CAMPANHAS_TEXTO)
@@ -1456,6 +1571,7 @@ def gravar_nova_linha_campanha_texto(titulo: str, texto: str) -> tuple[bool, str
                     "Titulo": (titulo or "").strip(),
                     "Texto": (texto or "").strip(),
                     "Ativo": "SIM",
+                    "Chave_Campanha": (chave_campanha or "").strip(),
                 }
             ]
         )
@@ -1507,7 +1623,9 @@ def _rotulo_opcao_excluir_banner(df_bn: pd.DataFrame, i: int) -> str:
     r = df_bn.iloc[i]
     url = str(r.get("URL_Imagem", "") or "").strip()
     snip = (url[:56] + "…") if len(url) > 57 else url
-    return f"Linha {i + 1} · {snip or '(sem URL)'}"
+    ck = str(r.get("Chave_Campanha", "") or "").strip()
+    suf = f" · chave «{ck}»" if ck else ""
+    return f"Linha {i + 1} · {snip or '(sem URL)'}{suf}"
 
 
 def _rotulo_opcao_excluir_campanha_texto(df_ct: pd.DataFrame, i: int) -> str:
@@ -1516,7 +1634,9 @@ def _rotulo_opcao_excluir_campanha_texto(df_ct: pd.DataFrame, i: int) -> str:
     tit = (tit[:48] + "…") if len(tit) > 49 else tit
     snip = str(r.get("Texto", "") or "").strip().replace("\n", " ")
     snip = (snip[:36] + "…") if len(snip) > 37 else snip
-    return f"Linha {i + 1} · {tit or '(sem título)'}{' — ' + snip if snip else ''}"
+    ck = str(r.get("Chave_Campanha", "") or "").strip()
+    suf = f" · chave «{ck}»" if ck else ""
+    return f"Linha {i + 1} · {tit or '(sem título)'}{' — ' + snip if snip else ''}{suf}"
 
 
 _COLS_LOGINS = ["Email", "Senha", "Nome", "Cargo", "Imobiliaria", "Telefone", "Adm"]
@@ -1881,6 +2001,115 @@ class MotorRecomendacao:
 
     def calcular_poder_compra(self, renda, finan, fgts_sub, val_ps_limite):
         return (2 * renda) + finan + fgts_sub + val_ps_limite, val_ps_limite
+
+
+def _ps_max_estoque_row_cliente(row: pd.Series, d: dict) -> float:
+    """PS máximo da linha de estoque conforme política e ranking em `d` (mesma regra da recomendação)."""
+    pol = d.get("politica", "Direcional")
+    rank = d.get("ranking", "DIAMANTE")
+    if pol == "Emcash":
+        try:
+            return float(row.get("PS_EmCash", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    col_rank = f"PS_{rank.title()}" if rank else "PS_Diamante"
+    if rank == "AÇO":
+        col_rank = "PS_Aco"
+    try:
+        return float(row.get(col_rank, 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _calcular_poder_compra_linha_estoque(
+    row: pd.Series, d: dict, df_politicas: pd.DataFrame, prem: dict
+) -> pd.Series:
+    """Poder de compra por linha (alinhado à ETAPA Recomendação)."""
+    try:
+        v_venda = float(row.get("Valor de Venda", 0) or 0)
+    except (TypeError, ValueError):
+        v_venda = 0.0
+    fin = float(d.get("finan_usado", 0) or 0)
+    sub = float(d.get("fgts_sub_usado", 0) or 0)
+    ren = float(d.get("renda", 0) or 0)
+    ps_stock = max(0.0, _ps_max_estoque_row_cliente(row, d))
+    ps_eff = 0.0
+    if ps_stock <= 1e-9:
+        ps_eff = 0.0
+    else:
+        try:
+            mps = metricas_pro_soluto(
+                ren,
+                v_venda,
+                str(d.get("politica", "Direcional")),
+                str(d.get("ranking", "DIAMANTE")),
+                prem,
+                df_politicas,
+                ps_cap_estoque=ps_stock,
+            )
+            ps_eff = float(mps.get("ps_max_efetivo", 0) or 0)
+        except Exception:
+            ps_eff = float(ps_stock)
+    poder = (2.0 * ren) + fin + sub + max(0.0, ps_eff)
+    cobertura = (poder / v_venda) * 100.0 if v_venda > 0 else 0.0
+    return pd.Series([poder, cobertura, fin, sub])
+
+
+def df_estoque_com_poder_compra(
+    df: pd.DataFrame, d: dict, df_politicas: pd.DataFrame, prem: dict
+) -> pd.DataFrame:
+    """Anexa Poder_Compra, Cobertura, Finan_Unid, Sub_Unid (cópia do dataframe)."""
+    out = df.copy()
+    if out.empty:
+        return out
+    out[["Poder_Compra", "Cobertura", "Finan_Unid", "Sub_Unid"]] = out.apply(
+        lambda r: _calcular_poder_compra_linha_estoque(r, d, df_politicas, prem),
+        axis=1,
+    )
+    return out
+
+
+def candidatos_df_recomendados(df_pool: pd.DataFrame) -> pd.DataFrame:
+    """
+    Subconjunto «recomendado» (cards IDEAL / MENOR PREÇO): exige colunas Valor de Venda e Poder_Compra.
+    """
+    if df_pool.empty or "Valor de Venda" not in df_pool.columns:
+        return pd.DataFrame()
+    if "Poder_Compra" not in df_pool.columns:
+        return pd.DataFrame()
+    vv = pd.to_numeric(df_pool["Valor de Venda"], errors="coerce").fillna(0.0)
+    pc = pd.to_numeric(df_pool["Poder_Compra"], errors="coerce").fillna(0.0)
+    mask_fit = (vv > 0) & (vv <= pc)
+    fit_sub = df_pool[mask_fit]
+    if not fit_sub.empty:
+        max_p = pd.to_numeric(fit_sub["Valor de Venda"], errors="coerce").max()
+        return fit_sub[
+            pd.to_numeric(fit_sub["Valor de Venda"], errors="coerce") == max_p
+        ]
+    pool_pos = df_pool[vv > 0]
+    if pool_pos.empty:
+        return pd.DataFrame()
+    min_v = pd.to_numeric(pool_pos["Valor de Venda"], errors="coerce").min()
+    return pool_pos[pd.to_numeric(pool_pos["Valor de Venda"], errors="coerce") == min_v]
+
+
+def ids_unidades_recomendadas_empreendimento(
+    df_estoque: pd.DataFrame,
+    nome_empreendimento: str,
+    d: dict,
+    df_politicas: pd.DataFrame,
+    prem: dict,
+) -> set[str]:
+    """Identificadores recomendados (normalizados em str) — mesma regra dos cards por empreendimento."""
+    sub = df_estoque[df_estoque["Empreendimento"] == nome_empreendimento].copy()
+    if sub.empty or "Identificador" not in sub.columns:
+        return set()
+    sub = df_estoque_com_poder_compra(sub, d, df_politicas, prem)
+    cand = candidatos_df_recomendados(sub)
+    if cand.empty:
+        return set()
+    return {str(x).strip() for x in cand["Identificador"].unique() if x is not None and str(x).strip() != ""}
+
 
 _DIR_SIM_APP = Path(__file__).resolve().parent
 
@@ -3056,107 +3285,89 @@ def configurar_layout():
             outline: 2px solid {COR_AZUL_ESC};
             outline-offset: 3px;
         }}
-        /* <dialog>.showModal(): cobre o viewport do frame (evitar max-width pequeno no próprio dialog) */
-        .home-banner-lb-dialog {{
-            border: none;
-            padding: 0;
-            margin: 0 !important;
-            background: transparent;
+        /* Popup campanha (overlay JS — não usar <dialog> no markdown; Streamlit remove) */
+        .dv-campanha-overlay {{
             position: fixed !important;
             inset: 0 !important;
-            top: 0 !important;
-            left: 0 !important;
-            right: 0 !important;
-            bottom: 0 !important;
-            width: 100vw !important;
-            max-width: none !important;
-            min-height: 100vh !important;
-            min-height: 100dvh !important;
-            height: 100vh !important;
-            height: 100dvh !important;
-            max-height: none !important;
-            box-sizing: border-box;
-            overflow: hidden;
+            z-index: 999999 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            padding: clamp(0.5rem, 3vw, 1.25rem) !important;
+            box-sizing: border-box !important;
+            pointer-events: auto !important;
         }}
-        .home-banner-lb-dialog::backdrop {{
-            position: fixed !important;
+        .dv-campanha-overlay-backdrop {{
+            position: absolute !important;
             inset: 0 !important;
-            width: 100vw !important;
-            height: 100vh !important;
-            min-height: 100dvh !important;
-            margin: 0 !important;
             background: rgba(15, 23, 42, 0.92) !important;
-            cursor: pointer;
+            cursor: pointer !important;
         }}
-        .home-banner-lb-dialog-inner {{
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 100%;
-            height: 100%;
-            min-height: 100dvh;
-            padding: clamp(0.75rem, 3vw, 1.75rem);
-            margin: 0;
-            box-sizing: border-box;
-            max-width: none;
-            max-height: none;
-        }}
-        .home-banner-lb-popup {{
-            position: relative;
-            width: max-content;
-            max-width: min(96vw, 100%);
-            max-height: min(92dvh, 92vh);
-            line-height: 0;
-            border-radius: 12px;
-            overflow: visible;
-            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
-        }}
-        .home-banner-lb-img {{
-            display: block;
-            margin: 0;
-            max-width: min(94vw, 100%);
-            max-height: min(88dvh, 88vh);
-            width: auto;
-            height: auto;
-            object-fit: contain;
-            object-position: center center;
-            border-radius: 10px;
-            vertical-align: bottom;
-        }}
-        button.home-banner-lb-close {{
-            position: absolute;
-            top: max(0.35rem, env(safe-area-inset-top, 0px));
-            right: max(0.35rem, env(safe-area-inset-right, 0px));
-            z-index: 3;
-            width: 2.45rem;
-            height: 2.45rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            line-height: 0;
-            cursor: pointer;
-            border-radius: 4px;
+        .dv-campanha-overlay-panel {{
+            position: relative !important;
+            z-index: 1 !important;
+            max-width: min(640px, 96vw) !important;
+            width: 100% !important;
+            max-height: min(92dvh, 92vh) !important;
+            overflow: auto !important;
             background: #ffffff !important;
-            border: 1px solid rgba(15, 23, 42, 0.18);
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-            padding: 0;
-            margin: 0;
-            color: inherit;
-            box-sizing: border-box;
+            border-radius: 14px !important;
+            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45) !important;
+            border: 1px solid rgba(255, 255, 255, 0.5) !important;
+            padding: clamp(0.65rem, 2vw, 1rem) !important;
+            box-sizing: border-box !important;
         }}
-        .home-banner-lb-close:focus-visible {{
-            outline: 2px solid {COR_AZUL_ESC};
-            outline-offset: 2px;
+        .dv-campanha-overlay-close {{
+            position: absolute !important;
+            top: max(0.35rem, env(safe-area-inset-top, 0px)) !important;
+            right: max(0.35rem, env(safe-area-inset-right, 0px)) !important;
+            z-index: 4 !important;
+            width: 2.45rem !important;
+            height: 2.45rem !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            cursor: pointer !important;
+            border-radius: 8px !important;
+            background: #ffffff !important;
+            border: 1px solid rgba(15, 23, 42, 0.18) !important;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15) !important;
+            padding: 0 !important;
+            margin: 0 !important;
         }}
-        .home-banner-lb-close-icon {{
-            display: block;
-            flex-shrink: 0;
-            transition: transform 0.3s ease;
-            transform: rotate(0deg);
+        .dv-campanha-overlay-img-wrap {{
+            text-align: center !important;
+            line-height: 0 !important;
+            margin-bottom: 0.75rem !important;
         }}
-        .home-banner-lb-close:hover .home-banner-lb-close-icon,
-        .home-banner-lb-close:focus-visible .home-banner-lb-close-icon {{
-            transform: rotate(90deg);
+        .dv-campanha-overlay-img {{
+            display: inline-block !important;
+            max-width: 100% !important;
+            max-height: min(48dvh, 48vh) !important;
+            width: auto !important;
+            height: auto !important;
+            object-fit: contain !important;
+            border-radius: 10px !important;
+            vertical-align: middle !important;
+        }}
+        .dv-campanha-overlay-text {{
+            color: #1e293b !important;
+            font-size: 0.95rem !important;
+            line-height: 1.55 !important;
+            text-align: left !important;
+            padding: 0 0.25rem 0.35rem !important;
+        }}
+        .dv-campanha-overlay-title {{
+            margin: 0 0 0.5rem 0 !important;
+            font-size: 1.1rem !important;
+            font-weight: 700 !important;
+            color: {COR_AZUL_ESC} !important;
+            font-family: 'Montserrat', 'Inter', sans-serif !important;
+        }}
+        .dv-campanha-overlay-body {{
+            margin: 0 !important;
+            white-space: pre-wrap !important;
+            word-break: break-word !important;
         }}
         .header-logo-wrap {{
             display: flex;
@@ -3925,16 +4136,31 @@ def aba_simulador_automacao(
         df_home_banners if df_home_banners is not None else pd.DataFrame(),
         df_campanhas_texto if df_campanhas_texto is not None else pd.DataFrame(),
     )
+    inject_home_banner_dialog_modal()
     if st.session_state.get("user_is_adm"):
         with st.expander("Miniaturas — campanhas comerciais (administrador)", expanded=False):
             st.caption(
-                "Aba **BD Home Banners** na planilha geral. Informe só a **URL https** da imagem; a ordem na galeria segue a ordem das linhas na planilha (último lançamento = última miniatura). "
-                "Ao clicar, a imagem abre em **tela cheia no navegador**, mantendo a proporção original."
+                "Aba **BD Home Banners**. **URL https** da imagem; ordem da galeria = ordem das linhas. "
+                "**Chave da campanha** (opcional): use o **mesmo texto** na aba de textos e na miniatura para o popup mostrar **título + descrição** junto com a imagem. "
+                "Sem chave: o popup usa **Título** e **Descrição** desta linha na planilha (se preenchidos)."
             )
             with st.form("form_novo_home_banner"):
                 bn_url = st.text_input(
                     "Endereço da imagem (URL)",
                     placeholder="https://i.postimg.cc/...",
+                )
+                bn_chave = st.text_input(
+                    "Chave da campanha (opcional — igual à da aba de textos)",
+                    placeholder="Ex.: carnaval_2026",
+                )
+                bn_titulo = st.text_input(
+                    "Título no popup (se não houver linha de texto com a mesma chave)",
+                    placeholder="Ex.: Campanha de verão",
+                )
+                bn_desc = st.text_area(
+                    "Descrição no popup (se não houver linha de texto com a mesma chave)",
+                    placeholder="Texto curto que aparece abaixo da imagem…",
+                    height=72,
                 )
                 enviar_bn = st.form_submit_button("Gravar nova imagem na aba Banners da home", type="primary")
             if enviar_bn:
@@ -3942,7 +4168,12 @@ def aba_simulador_automacao(
                 if not url_t.startswith("https://"):
                     st.error("A URL da imagem deve começar com https:// (use o link direto do Postimages).")
                 else:
-                    ok, err = gravar_nova_linha_home_banner(url_t)
+                    ok, err = gravar_nova_linha_home_banner(
+                        url_t,
+                        chave_campanha=(bn_chave or "").strip(),
+                        titulo=(bn_titulo or "").strip(),
+                        descricao=(bn_desc or "").strip(),
+                    )
                     if ok:
                         st.cache_data.clear()
                         st.success("Imagem gravada na planilha. Recarregando…")
@@ -3983,10 +4214,15 @@ def aba_simulador_automacao(
 
         with st.expander("Textos — campanhas comerciais (administrador)", expanded=False):
             st.caption(
-                f"Aba **{_WS_CAMPANHAS_TEXTO}** (Titulo, Texto; colunas Ordem e Ativo são preenchidas automaticamente como SIM). "
-                "Na página, os textos ficam **abaixo das miniaturas**; cada item é um marcador com o **campo Título** em negrito/azul (mesmo estilo de antes) e, na sequência, o **Texto**."
+                f"Aba **{_WS_CAMPANHAS_TEXTO}** (Titulo, Texto, **Chave_Campanha** opcional; Ordem e Ativo automáticos). "
+                "Os textos continuam **abaixo das miniaturas** na página. Com **Chave da campanha** igual à da linha em **BD Home Banners**, "
+                "o **clique na miniatura** abre o popup com imagem + este título e texto."
             )
             with st.form("form_novo_campanha_texto"):
+                ct_chave = st.text_input(
+                    "Chave da campanha (opcional — igual à da miniatura)",
+                    placeholder="Ex.: carnaval_2026",
+                )
                 ct_titulo = st.text_input(
                     "Título",
                     placeholder='Ex.: "Campanha de Carnaval"',
@@ -4006,6 +4242,7 @@ def aba_simulador_automacao(
                     ok_ct, err_ct = gravar_nova_linha_campanha_texto(
                         (ct_titulo or "").strip(),
                         (ct_texto or "").strip(),
+                        chave_campanha=(ct_chave or "").strip(),
                     )
                     if ok_ct:
                         st.cache_data.clear()
@@ -4269,61 +4506,11 @@ def aba_simulador_automacao(
         d = st.session_state.dados_cliente
         st.markdown("### Recomendação de Imóveis")
 
-        df_disp_total = df_estoque.copy()
+        df_disp_total = df_estoque_com_poder_compra(df_estoque.copy(), d, df_politicas, _prem)
 
         if df_disp_total.empty:
             st.markdown('<div class="custom-alert">Sem estoque carregado para recomendações.</div>', unsafe_allow_html=True)
         else:
-            def _ps_max_estoque_row(row):
-                pol = d.get("politica", "Direcional")
-                rank = d.get("ranking", "DIAMANTE")
-                if pol == "Emcash":
-                    try:
-                        return float(row.get("PS_EmCash", 0) or 0)
-                    except (TypeError, ValueError):
-                        return 0.0
-                col_rank = f"PS_{rank.title()}" if rank else "PS_Diamante"
-                if rank == "AÇO":
-                    col_rank = "PS_Aco"
-                try:
-                    return float(row.get(col_rank, 0) or 0)
-                except (TypeError, ValueError):
-                    return 0.0
-
-            def calcular_poder_compra_linha(row):
-                """Dobro da renda + financiamento + subsídio + Pro Soluto efetivo (comparador, políticas e teto do estoque)."""
-                try:
-                    v_venda = float(row.get("Valor de Venda", 0) or 0)
-                except (TypeError, ValueError):
-                    v_venda = 0.0
-                fin = float(d.get("finan_usado", 0) or 0)
-                sub = float(d.get("fgts_sub_usado", 0) or 0)
-                ren = float(d.get("renda", 0) or 0)
-                ps_stock = max(0.0, _ps_max_estoque_row(row))
-                ps_eff = 0.0
-                if ps_stock <= 1e-9:
-                    ps_eff = 0.0
-                else:
-                    try:
-                        mps = metricas_pro_soluto(
-                            ren,
-                            v_venda,
-                            str(d.get("politica", "Direcional")),
-                            str(d.get("ranking", "DIAMANTE")),
-                            _prem,
-                            df_politicas,
-                            ps_cap_estoque=ps_stock,
-                        )
-                        ps_eff = float(mps.get("ps_max_efetivo", 0) or 0)
-                    except Exception:
-                        ps_eff = float(ps_stock)
-                poder = (2.0 * ren) + fin + sub + max(0.0, ps_eff)
-                cobertura = (poder / v_venda) * 100.0 if v_venda > 0 else 0.0
-                return pd.Series([poder, cobertura, fin, sub])
-
-            df_disp_total[["Poder_Compra", "Cobertura", "Finan_Unid", "Sub_Unid"]] = df_disp_total.apply(
-                calcular_poder_compra_linha, axis=1
-            )
             df_disp_total = df_disp_total.sort_values(["Valor de Venda", "Identificador"], ascending=[True, True])
 
             st.markdown("<br>", unsafe_allow_html=True)
@@ -4339,28 +4526,16 @@ def aba_simulador_automacao(
                 st.markdown('<div class="custom-alert">Nenhuma unidade encontrada para o filtro.</div>', unsafe_allow_html=True)
             else:
                 final_cards = []
-                vv = pd.to_numeric(df_pool["Valor de Venda"], errors="coerce").fillna(0.0)
-                pc = pd.to_numeric(df_pool["Poder_Compra"], errors="coerce").fillna(0.0)
-                # 100% do poder de compra por unidade (PS e teto já entram em Poder_Compra / linha)
-                mask_fit = (vv > 0) & (vv <= pc)
-                fit_sub = df_pool[mask_fit]
-                if not fit_sub.empty:
-                    max_p = pd.to_numeric(fit_sub["Valor de Venda"], errors="coerce").max()
-                    cand_rec = fit_sub[
-                        pd.to_numeric(fit_sub["Valor de Venda"], errors="coerce") == max_p
-                    ]
+                cand_rec = candidatos_df_recomendados(df_pool)
+                vv_l = pd.to_numeric(df_pool["Valor de Venda"], errors="coerce").fillna(0.0)
+                pc_l = pd.to_numeric(df_pool["Poder_Compra"], errors="coerce").fillna(0.0)
+                alguma_cabe = ((vv_l > 0) & (vv_l <= pc_l)).any()
+                if alguma_cabe:
                     label_rec, css_rec = "IDEAL", "badge-ideal"
+                elif (vv_l > 0).any():
+                    label_rec, css_rec = "MENOR PREÇO", "badge-seguro"
                 else:
-                    pool_pos = df_pool[vv > 0]
-                    if pool_pos.empty:
-                        cand_rec = pd.DataFrame()
-                        label_rec, css_rec = "IDEAL", "badge-ideal"
-                    else:
-                        min_v = pd.to_numeric(pool_pos["Valor de Venda"], errors="coerce").min()
-                        cand_rec = pool_pos[
-                            pd.to_numeric(pool_pos["Valor de Venda"], errors="coerce") == min_v
-                        ]
-                        label_rec, css_rec = "MENOR PREÇO", "badge-seguro"
+                    label_rec, css_rec = "IDEAL", "badge-ideal"
 
                 def add_cards_group(label, df_group, css_class):
                     if df_group is None or df_group.empty:
@@ -4432,13 +4607,32 @@ def aba_simulador_automacao(
             if unidades_disp.empty:
                 st.warning("Sem unidades disponíveis.")
             else:
-                uni_ordered = unidades_disp.drop_duplicates(subset=['Identificador'], keep='first')
-                current_uni_ids = uni_ordered['Identificador'].tolist()
+                _rec_ids_emp = ids_unidades_recomendadas_empreendimento(
+                    df_disponiveis, emp_escolhido, d, df_politicas, _prem
+                )
+                uni_ordered = unidades_disp.drop_duplicates(subset=['Identificador'], keep='first').copy()
+                uni_ordered["_vv_sort"] = pd.to_numeric(
+                    uni_ordered["Valor de Venda"], errors="coerce"
+                ).fillna(0.0)
+                uni_ordered["_id_norm"] = uni_ordered["Identificador"].map(
+                    lambda x: str(x).strip() if x is not None else ""
+                )
+                uo_rec = uni_ordered[uni_ordered["_id_norm"].isin(_rec_ids_emp)].sort_values(
+                    ["_vv_sort", "Identificador"], ascending=[True, True]
+                )
+                uo_out = uni_ordered[~uni_ordered["_id_norm"].isin(_rec_ids_emp)].sort_values(
+                    ["_vv_sort", "Identificador"], ascending=[True, True]
+                )
+                current_uni_ids = uo_rec["Identificador"].tolist() + uo_out["Identificador"].tolist()
                 idx_uni = 0
                 if 'unidade_id' in st.session_state.dados_cliente:
                     try:
-                        if st.session_state.dados_cliente['unidade_id'] in current_uni_ids:
-                            idx_uni = current_uni_ids.index(st.session_state.dados_cliente['unidade_id'])
+                        _uid_sv = st.session_state.dados_cliente['unidade_id']
+                        _u_norm = str(_uid_sv).strip()
+                        for _k, _cid in enumerate(current_uni_ids):
+                            if str(_cid).strip() == _u_norm:
+                                idx_uni = _k
+                                break
                     except Exception:
                         pass
 
@@ -4454,12 +4648,16 @@ def aba_simulador_automacao(
                     except (TypeError, ValueError):
                         v_vc = 0.0
                     v_vc_fmt = fmt_br(v_vc)
-                    return (
-                        f"{uid} | Avaliação: R$ {v_aval} | Venda: R$ {v_venda} | Desconto Volta ao Caixa: R$ {v_vc_fmt}"
+                    corpo = (
+                        f"{uid} | Avaliação: R$ {v_aval} | Venda: R$ {v_venda} | "
+                        f"Desconto Volta ao Caixa: R$ {v_vc_fmt}"
                     )
+                    if str(uid).strip() in _rec_ids_emp:
+                        return f"RECOMENDADA: {corpo}"
+                    return corpo
 
                 uni_escolhida_id = st.selectbox(
-                    "Escolha a Unidade (do menor ao maior preço):",
+                    "Escolha a Unidade (recomendadas primeiro; depois por preço crescente):",
                     options=current_uni_ids,
                     index=idx_uni,
                     format_func=label_uni,
@@ -5065,7 +5263,6 @@ def main():
     configurar_layout()
     inject_modern_ui_runtime()
     inject_enter_confirma_campo()
-    inject_home_banner_dialog_modal()
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
 
