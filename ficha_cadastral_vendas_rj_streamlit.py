@@ -1149,51 +1149,56 @@ def inject_login_password_manager_fields():
 
 
 def inject_home_banner_dialog_modal():
-    """Abre/fecha lightbox com <dialog>.showModal() — top layer do navegador, centralizado na tela (não no scroll do app). Sem mover nós no DOM (compatível com React do Streamlit)."""
+    """Abre/fecha lightbox com <dialog>.showModal() — top layer na viewport do frame onde o Streamlit renderiza o markdown.
+
+    O conteúdo das campanhas vive no documento do iframe da app; usar só window.parent.document
+    quebrava getElementById e o clique (eventos não sobem do iframe para o parent).
+    """
     js = r"""
 <script>
 (function () {
-  var doc = document;
+  function wireBannerDialog(doc) {
+    if (!doc || !doc.documentElement) return;
+    if (doc.documentElement.getAttribute("data-dv-home-banner-dialog") === "1") return;
+    doc.documentElement.setAttribute("data-dv-home-banner-dialog", "1");
+    doc.addEventListener(
+      "click",
+      function (ev) {
+        var t = ev.target;
+        if (!t || !t.closest) return;
+        var d = t.ownerDocument || doc;
+        var openBtn = t.closest(".home-banner-lb-open");
+        if (openBtn) {
+          ev.preventDefault();
+          var did = openBtn.getAttribute("data-dv-dialog");
+          if (!did) return;
+          var dlg = d.getElementById(did);
+          if (dlg && dlg.tagName === "DIALOG" && typeof dlg.showModal === "function") {
+            try {
+              dlg.showModal();
+            } catch (err) {}
+          }
+          return;
+        }
+        var closeBtn = t.closest(".home-banner-lb-dialog-close");
+        if (closeBtn) {
+          var dClose = closeBtn.closest("dialog");
+          if (dClose) dClose.close();
+          return;
+        }
+        if (t.tagName === "DIALOG" && t.classList.contains("home-banner-lb-dialog")) {
+          t.close();
+        }
+      },
+      true
+    );
+  }
+  wireBannerDialog(document);
   try {
     if (window.parent && window.parent !== window && window.parent.document) {
-      doc = window.parent.document;
+      wireBannerDialog(window.parent.document);
     }
-  } catch (e) {
-    doc = document;
-  }
-  var root = doc.documentElement;
-  if (!root || root.getAttribute("data-dv-home-banner-dialog") === "1") return;
-  root.setAttribute("data-dv-home-banner-dialog", "1");
-  doc.addEventListener(
-    "click",
-    function (ev) {
-      var t = ev.target;
-      if (!t || !t.closest) return;
-      var openBtn = t.closest(".home-banner-lb-open");
-      if (openBtn) {
-        ev.preventDefault();
-        var did = openBtn.getAttribute("data-dv-dialog");
-        if (!did) return;
-        var dlg = doc.getElementById(did);
-        if (dlg && dlg.tagName === "DIALOG" && typeof dlg.showModal === "function") {
-          try {
-            dlg.showModal();
-          } catch (err) {}
-        }
-        return;
-      }
-      var closeBtn = t.closest(".home-banner-lb-dialog-close");
-      if (closeBtn) {
-        var dClose = closeBtn.closest("dialog");
-        if (dClose) dClose.close();
-        return;
-      }
-      if (t.tagName === "DIALOG" && t.classList.contains("home-banner-lb-dialog")) {
-        t.close();
-      }
-    },
-    true
-  );
+  } catch (e) {}
 })();
 </script>
 """
@@ -1987,10 +1992,10 @@ def configurar_layout():
             0% {{ background-position: 0% 50%; }}
             100% {{ background-position: 200% 50%; }}
         }}
-        /* Entrada do cartão principal (fichaFadeIn) */
+        /* Entrada do cartão principal (só opacity: transform no ancestor prende position:fixed do <dialog> das campanhas) */
         @keyframes fichaFadeIn {{
-            from {{ opacity: 0; transform: translateY(18px); }}
-            to {{ opacity: 1; transform: translateY(0); }}
+            from {{ opacity: 0; }}
+            to {{ opacity: 1; }}
         }}
         /* Entradas suaves (só sem prefers-reduced-motion) */
         @keyframes dvFadeRise {{
@@ -3051,16 +3056,27 @@ def configurar_layout():
             outline: 2px solid {COR_AZUL_ESC};
             outline-offset: 3px;
         }}
-        /* <dialog>.showModal() = top layer do navegador: centro na viewport real, não no fluxo do app */
+        /* <dialog>.showModal(): cobre o viewport do frame (evitar max-width pequeno no próprio dialog) */
         .home-banner-lb-dialog {{
             border: none;
             padding: 0;
-            margin: auto;
+            margin: 0 !important;
             background: transparent;
-            max-width: min(96vw, 100%);
-            max-height: min(94dvh, 100%);
+            position: fixed !important;
+            inset: 0 !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: 100vw !important;
+            max-width: none !important;
+            min-height: 100vh !important;
+            min-height: 100dvh !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+            max-height: none !important;
             box-sizing: border-box;
-            overflow: visible;
+            overflow: hidden;
         }}
         .home-banner-lb-dialog::backdrop {{
             position: fixed !important;
@@ -3076,17 +3092,20 @@ def configurar_layout():
             display: flex;
             align-items: center;
             justify-content: center;
+            width: 100%;
+            height: 100%;
+            min-height: 100dvh;
             padding: clamp(0.75rem, 3vw, 1.75rem);
             margin: 0;
             box-sizing: border-box;
-            max-width: min(96vw, 100vw);
-            max-height: min(92dvh, 100vh);
+            max-width: none;
+            max-height: none;
         }}
         .home-banner-lb-popup {{
             position: relative;
             width: max-content;
-            max-width: min(92vw, 100%);
-            max-height: min(88dvh, 88vh);
+            max-width: min(96vw, 100%);
+            max-height: min(92dvh, 92vh);
             line-height: 0;
             border-radius: 12px;
             overflow: visible;
@@ -3095,8 +3114,8 @@ def configurar_layout():
         .home-banner-lb-img {{
             display: block;
             margin: 0;
-            max-width: min(90vw, 100%);
-            max-height: min(85vh, 100%);
+            max-width: min(94vw, 100%);
+            max-height: min(88dvh, 88vh);
             width: auto;
             height: auto;
             object-fit: contain;
