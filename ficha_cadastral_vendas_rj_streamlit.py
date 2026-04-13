@@ -1981,11 +1981,16 @@ def configurar_layout():
     bg_url = _css_url_fundo_simulador().replace("&", "&amp;")
     st.markdown(f"""
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Montserrat:wght@600;700;800&display=swap');
-        /* Barra institucional: gradiente azul ↔ vermelho; deslocamento suave (sem “dois blocos”) */
-        @keyframes brandBarGradientShift {{
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Montserrat:wght@400;600;700;800;900&display=swap');
+        /* Shimmer da barra (alinhado à Ficha Vendas RJ — ficha-hero-bar) */
+        @keyframes fichaBarShimmer {{
             0% {{ background-position: 0% 50%; }}
-            100% {{ background-position: 100% 50%; }}
+            100% {{ background-position: 200% 50%; }}
+        }}
+        /* Entrada do cartão principal (fichaFadeIn) */
+        @keyframes fichaFadeIn {{
+            from {{ opacity: 0; transform: translateY(18px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
         }}
         /* Entradas suaves (só sem prefers-reduced-motion) */
         @keyframes dvFadeRise {{
@@ -2065,20 +2070,22 @@ def configurar_layout():
             background: transparent !important;
             background-color: transparent !important;
         }}
+        /* Fundo estilo Ficha Credenciamento Vendas RJ: degradê diagonal marca + foto */
         .stApp,
         [data-testid="stApp"] {{
-            /* Fundo leve: véu mais claro + gradiente suave (respiração visual) */
-            background-color: rgba(252, 253, 255, 0.97) !important;
+            background-color: transparent !important;
             background-image: linear-gradient(
-                165deg,
-                rgba(255, 255, 255, 0.97) 0%,
-                rgba(248, 250, 253, 0.95) 45%,
-                rgba(241, 245, 249, 0.93) 100%
-            ), url("{bg_url}") !important;
-            background-size: 100% 100%, cover !important;
-            background-position: center center, center center !important;
-            background-attachment: fixed !important;
-            background-repeat: no-repeat !important;
+                    135deg,
+                    rgba({RGB_AZUL_CSS}, 0.82) 0%,
+                    rgba(30, 58, 95, 0.55) 38%,
+                    rgba({RGB_VERMELHO_CSS}, 0.22) 72%,
+                    rgba(15, 23, 42, 0.45) 100%
+                ),
+                url("{bg_url}") !important;
+            background-size: auto, cover !important;
+            background-position: center, center center !important;
+            background-attachment: scroll, scroll !important;
+            background-repeat: no-repeat, no-repeat !important;
             animation: none !important;
         }}
         /* SO em dark: mantém UI clara (inputs, texto, popovers Base Web) */
@@ -2125,25 +2132,31 @@ def configurar_layout():
         @media (max-width: 768px) {{
             .stApp,
             [data-testid="stApp"] {{
-                background-attachment: scroll !important;
+                background-attachment: scroll, scroll !important;
             }}
             [data-testid="stMain"] {{
-                padding-left: max(6px, env(safe-area-inset-left, 0px)) !important;
-                padding-right: max(6px, env(safe-area-inset-right, 0px)) !important;
-                padding-top: max(4px, env(safe-area-inset-top, 0px)) !important;
-                padding-bottom: max(8px, env(safe-area-inset-bottom, 0px)) !important;
+                padding-left: max(clamp(10px, 4vw, 28px), env(safe-area-inset-left, 0px)) !important;
+                padding-right: max(clamp(10px, 4vw, 28px), env(safe-area-inset-right, 0px)) !important;
+                padding-top: max(clamp(8px, 2.5vh, 24px), env(safe-area-inset-top, 0px)) !important;
+                padding-bottom: max(clamp(10px, 3vh, 28px), env(safe-area-inset-bottom, 0px)) !important;
             }}
             .block-container {{
                 max-width: 100% !important;
                 width: 100% !important;
-                padding: 0.85rem clamp(0.65rem, 3.5vw, 1rem) !important;
-                margin-left: 0 !important;
-                margin-right: 0 !important;
-                border-radius: 0 !important;
-                background: transparent !important;
-                box-shadow: none !important;
-                backdrop-filter: none !important;
-                -webkit-backdrop-filter: none !important;
+                padding: 1.1rem clamp(0.75rem, 3.5vw, 1.15rem) !important;
+                margin-left: auto !important;
+                margin-right: auto !important;
+                margin-top: clamp(4px, 1.5vw, 10px) !important;
+                margin-bottom: clamp(4px, 1.5vw, 10px) !important;
+                border-radius: 20px !important;
+                background: rgba(255, 255, 255, 0.82) !important;
+                border: 1px solid rgba(255, 255, 255, 0.5) !important;
+                box-shadow:
+                    0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.05),
+                    0 16px 36px -10px rgba({RGB_AZUL_CSS}, 0.14),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.5) !important;
+                backdrop-filter: blur(14px) saturate(1.1) !important;
+                -webkit-backdrop-filter: blur(14px) saturate(1.1) !important;
             }}
             .header-brand-bar-wrap {{
                 width: 100%;
@@ -2215,27 +2228,40 @@ def configurar_layout():
             border: none !important;
             border-bottom: none !important;
             box-shadow: none !important;
+            color: rgba(255, 255, 255, 0.92) !important;
         }}
         [data-testid="stToolbar"] button,
         [data-testid="stToolbar"] a,
         [data-testid="stToolbar"] [data-testid] {{
-            color: #475569 !important;
+            color: rgba(255, 255, 255, 0.92) !important;
+            background: transparent !important;
+            background-color: transparent !important;
         }}
         [data-testid="stHeader"] button,
         [data-testid="stHeader"] a {{
-            color: #475569 !important;
+            color: rgba(255, 255, 255, 0.92) !important;
+            background: transparent !important;
+            background-color: transparent !important;
         }}
         [data-testid="stToolbar"] svg,
         [data-testid="stHeader"] svg {{
-            fill: #475569 !important;
-            color: #475569 !important;
+            fill: currentColor !important;
+            color: inherit !important;
+        }}
+        [data-testid="stToolbar"] svg path[stroke],
+        [data-testid="stHeader"] svg path[stroke] {{
+            stroke: currentColor !important;
+        }}
+        [data-testid="stToolbar"] button:hover,
+        [data-testid="stToolbar"] a:hover,
+        [data-testid="stHeader"] button:hover {{
+            background: rgba(255, 255, 255, 0.12) !important;
         }}
         [data-testid="stMain"] {{
-            /* Margem mínima em relação à viewport (antes: clamp alto em vh/vw) */
-            padding-left: max(8px, env(safe-area-inset-left, 0px)) !important;
-            padding-right: max(8px, env(safe-area-inset-right, 0px)) !important;
-            padding-top: max(6px, env(safe-area-inset-top, 0px)) !important;
-            padding-bottom: max(10px, env(safe-area-inset-bottom, 0px)) !important;
+            padding-left: max(clamp(14px, 5vw, 56px), env(safe-area-inset-left, 0px)) !important;
+            padding-right: max(clamp(14px, 5vw, 56px), env(safe-area-inset-right, 0px)) !important;
+            padding-top: max(clamp(12px, 3.5vh, 40px), env(safe-area-inset-top, 0px)) !important;
+            padding-bottom: max(clamp(14px, 4vh, 44px), env(safe-area-inset-bottom, 0px)) !important;
             box-sizing: border-box !important;
         }}
         section.main > div {{
@@ -2351,25 +2377,41 @@ def configurar_layout():
             text-wrap: balance;
         }}
 
+        /* Cartão de vidro — mesma linguagem da Ficha Credenciamento (max-width largo para o simulador) */
         .block-container {{
             --dv-rhythm: 1.35rem;
             text-rendering: optimizeLegibility;
             max-width: min(1680px, 100%) !important;
             margin-left: auto !important;
             margin-right: auto !important;
-            margin-top: 0.25rem !important;
-            margin-bottom: 0.35rem !important;
-            padding: var(--dv-rhythm) clamp(0.75rem, 1.5vw, 1.35rem) !important;
-            /* Sem cartão: conteúdo direto sobre o fundo único da app */
-            background: transparent !important;
-            backdrop-filter: none !important;
-            -webkit-backdrop-filter: none !important;
-            border-radius: 0 !important;
-            border: none !important;
-            box-shadow: none !important;
+            margin-top: clamp(4px, 1vh, 14px) !important;
+            margin-bottom: clamp(4px, 1vh, 14px) !important;
+            padding: 1.45rem clamp(1.1rem, 2.8vw, 2.25rem) 1.55rem clamp(1.1rem, 2.8vw, 2.25rem) !important;
+            background: rgba(255, 255, 255, 0.78) !important;
+            backdrop-filter: blur(18px) saturate(1.15) !important;
+            -webkit-backdrop-filter: blur(18px) saturate(1.15) !important;
+            border-radius: 24px !important;
+            border: 1px solid rgba(255, 255, 255, 0.45) !important;
+            box-shadow:
+                0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.06),
+                0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.18),
+                inset 0 1px 0 rgba(255, 255, 255, 0.55) !important;
+        }}
+        @media (prefers-reduced-motion: no-preference) {{
+            .block-container {{
+                animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+            }}
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            .block-container {{
+                animation: none !important;
+            }}
+        }}
+        html[data-dv-reduced-motion="1"] .block-container {{
+            animation: none !important;
         }}
         [data-testid="stVerticalBlockBorderWrapper"] {{
-            border-radius: 8px !important;
+            border-radius: 16px !important;
             background: transparent !important;
             border: none !important;
             box-shadow: none !important;
@@ -2729,7 +2771,7 @@ def configurar_layout():
             transform: rotate(90deg) !important;
         }}
         div[data-testid="stAlert"] {{
-            border-radius: var(--dv-radius-md) !important;
+            border-radius: 14px !important;
             border: 1px solid rgba(226, 232, 240, 0.95) !important;
             background: linear-gradient(135deg, rgba(248, 250, 252, 0.98) 0%, rgba(241, 245, 249, 0.95) 100%) !important;
             box-shadow: var(--dv-shadow-xs) !important;
@@ -2820,7 +2862,7 @@ def configurar_layout():
             max-width: 1100px;
             position: relative;
         }}
-        /* Barra: mesma largura útil dos demais widgets (coluna dentro do .block-container); gradiente azul ↔ vermelho */
+        /* Barra tipo pill + shimmer (Ficha Vendas RJ — ficha-hero-bar) */
         .header-brand-bar-wrap {{
             width: 100%;
             max-width: 100%;
@@ -2832,29 +2874,21 @@ def configurar_layout():
             margin-bottom: 1.75rem;
             margin-top: 0;
             box-sizing: border-box;
-            height: 5px;
-            border-radius: 0;
+            height: 4px;
+            border-radius: 999px;
             overflow: hidden;
-            background: linear-gradient(
-                90deg,
-                {COR_AZUL_ESC} 0%,
-                #1a4a86 20%,
-                #5c2d52 45%,
-                {COR_VERMELHO} 50%,
-                #5c2d52 55%,
-                #1a4a86 80%,
-                {COR_AZUL_ESC} 100%
-            );
-            background-size: 240% 100%;
+            background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
+            background-size: 200% 100%;
             background-repeat: no-repeat;
             background-position: 0% 50%;
             will-change: background-position;
-            animation: brandBarGradientShift 22s ease-in-out infinite alternate;
+            box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.12);
+            animation: fichaBarShimmer 4s ease-in-out infinite alternate;
         }}
         @media (prefers-reduced-motion: no-preference) {{
             .header-brand-bar-wrap {{
                 animation: dvFadeRise var(--dv-duration-slow) var(--dv-ease-out) 0.08s both,
-                    brandBarGradientShift 22s ease-in-out 0.55s infinite alternate;
+                    fichaBarShimmer 4s ease-in-out 0.45s infinite alternate;
             }}
         }}
         @media (prefers-reduced-motion: reduce) {{
