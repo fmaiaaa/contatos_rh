@@ -1169,7 +1169,14 @@ def inject_home_banner_dialog_modal():
   }
   function closeDvCampanha(doc) {
     var root = doc.getElementById("dv-campanha-overlay-root");
-    if (root) root.remove();
+    if (root) {
+      try {
+        if (root.__dvCampanhaResize) {
+          window.removeEventListener("resize", root.__dvCampanhaResize);
+        }
+      } catch (e0) {}
+      root.remove();
+    }
     try {
       doc.removeEventListener("keydown", doc.__dvCampanhaEscHandler);
     } catch (e2) {}
@@ -1221,11 +1228,32 @@ def inject_home_banner_dialog_modal():
       p.textContent = body;
       textWrap.appendChild(p);
     }
+    var inner = doc.createElement("div");
+    inner.className = "dv-campanha-overlay-inner";
+    inner.appendChild(imgWrap);
+    if (title || body) inner.appendChild(textWrap);
     panel.appendChild(closeBtn);
-    panel.appendChild(imgWrap);
-    if (title || body) panel.appendChild(textWrap);
+    panel.appendChild(inner);
     root.appendChild(back);
     root.appendChild(panel);
+    function layoutCampanhaPopup() {
+      try {
+        var w = img.clientWidth;
+        if (w > 0 && textWrap && inner.contains(textWrap)) {
+          textWrap.style.width = w + "px";
+          textWrap.style.maxWidth = w + "px";
+        }
+      } catch (e3) {}
+    }
+    img.addEventListener("load", layoutCampanhaPopup);
+    if (img.complete) {
+      requestAnimationFrame(layoutCampanhaPopup);
+    }
+    var rz = function () {
+      requestAnimationFrame(layoutCampanhaPopup);
+    };
+    window.addEventListener("resize", rz);
+    root.__dvCampanhaResize = rz;
     back.addEventListener("click", function () {
       closeDvCampanha(doc);
     });
@@ -3285,7 +3313,7 @@ def configurar_layout():
             outline: 2px solid {COR_AZUL_ESC};
             outline-offset: 3px;
         }}
-        /* Popup campanha (overlay JS — não usar <dialog> no markdown; Streamlit remove) */
+        /* Popup campanha: largura/altura seguem a imagem + margem pequena; descrição abaixo com a mesma largura */
         .dv-campanha-overlay {{
             position: fixed !important;
             inset: 0 !important;
@@ -3293,7 +3321,7 @@ def configurar_layout():
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;
-            padding: clamp(0.5rem, 3vw, 1.25rem) !important;
+            padding: 8px !important;
             box-sizing: border-box !important;
             pointer-events: auto !important;
         }}
@@ -3306,21 +3334,33 @@ def configurar_layout():
         .dv-campanha-overlay-panel {{
             position: relative !important;
             z-index: 1 !important;
-            max-width: min(640px, 96vw) !important;
-            width: 100% !important;
-            max-height: min(92dvh, 92vh) !important;
-            overflow: auto !important;
+            display: inline-block !important;
+            width: max-content !important;
+            max-width: calc(100vw - 16px) !important;
+            max-height: calc(100dvh - 16px) !important;
+            overflow: hidden !important;
             background: #ffffff !important;
-            border-radius: 14px !important;
+            border-radius: 12px !important;
             box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45) !important;
             border: 1px solid rgba(255, 255, 255, 0.5) !important;
-            padding: clamp(0.65rem, 2vw, 1rem) !important;
+            padding: 10px !important;
             box-sizing: border-box !important;
+            vertical-align: top !important;
+        }}
+        .dv-campanha-overlay-inner {{
+            display: inline-block !important;
+            vertical-align: top !important;
+            max-width: calc(100vw - 36px) !important;
+            max-height: calc(100dvh - 52px) !important;
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+            box-sizing: border-box !important;
+            text-align: center !important;
         }}
         .dv-campanha-overlay-close {{
             position: absolute !important;
-            top: max(0.35rem, env(safe-area-inset-top, 0px)) !important;
-            right: max(0.35rem, env(safe-area-inset-right, 0px)) !important;
+            top: max(6px, env(safe-area-inset-top, 0px)) !important;
+            right: max(6px, env(safe-area-inset-right, 0px)) !important;
             z-index: 4 !important;
             width: 2.45rem !important;
             height: 2.45rem !important;
@@ -3336,26 +3376,28 @@ def configurar_layout():
             margin: 0 !important;
         }}
         .dv-campanha-overlay-img-wrap {{
-            text-align: center !important;
+            display: inline-block !important;
             line-height: 0 !important;
-            margin-bottom: 0.75rem !important;
+            margin: 0 !important;
+            max-width: 100% !important;
         }}
         .dv-campanha-overlay-img {{
-            display: inline-block !important;
-            max-width: 100% !important;
-            max-height: min(48dvh, 48vh) !important;
+            display: block !important;
             width: auto !important;
             height: auto !important;
+            max-width: calc(100vw - 36px) !important;
             object-fit: contain !important;
             border-radius: 10px !important;
-            vertical-align: middle !important;
+            vertical-align: top !important;
         }}
         .dv-campanha-overlay-text {{
             color: #1e293b !important;
             font-size: 0.95rem !important;
             line-height: 1.55 !important;
             text-align: left !important;
-            padding: 0 0.25rem 0.35rem !important;
+            margin-top: 10px !important;
+            padding: 0 2px 2px !important;
+            box-sizing: border-box !important;
         }}
         .dv-campanha-overlay-title {{
             margin: 0 0 0.5rem 0 !important;
