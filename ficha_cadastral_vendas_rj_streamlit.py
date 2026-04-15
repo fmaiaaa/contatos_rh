@@ -580,7 +580,7 @@ def _campos_def() -> List[Campo]:
             label="Gerente de vendas *",
             sec="Informações para contato",
             tipo="select",
-            sf=DEFAULT_SF_CAMPO_GERENTE_VENDAS,
+            sf="Gerente_de_Vendas__c",
             opcoes=["--Nenhum--"],
             req=True,
             help="Selecione o gerente de vendas conforme a aba Gerentes da planilha.",
