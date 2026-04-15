@@ -18,6 +18,7 @@ import re
 import smtplib
 import sys
 import time
+import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape_para_pdf
@@ -71,7 +72,10 @@ def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
         res = sf.Contact.create(payload)
         return res.get("id"), None
     except Exception as e:
-        return None, str(e)
+        err_msg = str(e)
+        err_trace = traceback.format_exc()
+        err_kind = type(e).__name__
+        return None, f"[{err_kind}] {err_msg}\n\n{err_trace}"
 
 
 def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
@@ -101,6 +105,22 @@ def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
 def _html_erro_salesforce_multilinha(msg: Any) -> str:
     """Escape HTML e preserva quebras para _alert_vermelho_html."""
     return html.escape(str(msg)).replace("\n", "<br/>")
+
+
+def _registrar_debug_envio(etapa: str, detalhe: Any = "") -> None:
+    """Armazena trilha de debug do envio para inspeção em tela."""
+    ss = st.session_state
+    trilha = list(ss.get("ficha_debug_envio") or [])
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    txt = str(detalhe or "").strip()
+    trilha.append(
+        {
+            "ts": stamp,
+            "etapa": str(etapa or "").strip() or "evento",
+            "detalhe": txt[:8000],
+        }
+    )
+    ss["ficha_debug_envio"] = trilha[-120:]
 
 
 # =============================================================================
@@ -134,21 +154,22 @@ def email_contato_formato_valido(val: Any) -> bool:
     return bool(_EMAIL_CONTATO_RE.match(s))
 
 
-# Trecho obrigatório no login do e-mail corporativo Vendas RJ (ex.: nomesobrenome.direcionalvendas@gmail.com).
-_EMAIL_CORP_DIRECIONAL_MARKER = ".direcionalvendas"
+# Trechos permitidos no login do e-mail corporativo Vendas RJ.
+_EMAIL_CORP_MARKERS = (".direcionalvendas", ".rivavendas")
 
 _MSG_EMAIL_CORPORATIVO_OBRIGATORIO = (
-    "E-mail * — use o **e-mail corporativo** com **.direcionalvendas** no login "
+    "E-mail * — use o **e-mail corporativo** com **.direcionalvendas** ou **.rivavendas** no login "
     "(ex.: nomesobrenome.direcionalvendas@gmail.com)."
 )
 
 
 def email_corporativo_direcionalvendas_obrigatorio(val: Any) -> bool:
-    """Formato válido e trecho corporativo `.direcionalvendas` no endereço (case-insensitive)."""
+    """Formato válido e trecho corporativo `.direcionalvendas` ou `.rivavendas` no endereço."""
     if not email_contato_formato_valido(val):
         return False
     s = (str(val).strip() if val is not None else "") or ""
-    return _EMAIL_CORP_DIRECIONAL_MARKER in s.lower()
+    s_low = s.lower()
+    return any(marker in s_low for marker in _EMAIL_CORP_MARKERS)
 
 
 def record_type_id_contato_payload_e_aviso() -> Tuple[str, str]:
@@ -555,6 +576,16 @@ def _campos_def() -> List[Campo]:
             help="Id do usuário proprietário (opcional).",
         ),
         _z(
+            key="gerente_vendas",
+            label="Gerente de vendas *",
+            sec="Informações para contato",
+            tipo="select",
+            sf=DEFAULT_SF_CAMPO_GERENTE_VENDAS,
+            opcoes=["--Nenhum--"],
+            req=True,
+            help="Selecione o gerente de vendas conforme a aba Gerentes da planilha.",
+        ),
+        _z(
             key="nome_completo",
             label="Nome completo *",
             sec="Dados Pessoais",
@@ -833,7 +864,8 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Email",
             req=True,
-            help="Obrigatório: e-mail corporativo com **.direcionalvendas** no login (ex.: nomesobrenome.direcionalvendas@gmail.com). "
+            help="Obrigatório: e-mail corporativo com **.direcionalvendas** ou **.rivavendas** no login "
+            "(ex.: nomesobrenome.direcionalvendas@gmail.com). "
             "Sem isso não é possível avançar nem enviar a ficha.",
         ),
         # ——— Dados Familiares (filiação e filhos; cônjuge fica em Dados Pessoais junto ao estado civil) ———
@@ -1349,7 +1381,7 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     if em:
         if not email_contato_formato_valido(em):
             erros.append(
-                "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
+                "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com ou nomesobrenome.rivavendas@gmail.com)"
             )
         elif not email_corporativo_direcionalvendas_obrigatorio(em):
             erros.append(_MSG_EMAIL_CORPORATIVO_OBRIGATORIO)
@@ -1400,7 +1432,7 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
         if em:
             if not email_contato_formato_valido(em):
                 erros.append(
-                    "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com)"
+                    "E-mail * (use um endereço válido; corporativo: nomesobrenome.direcionalvendas@gmail.com ou nomesobrenome.rivavendas@gmail.com)"
                 )
             elif not email_corporativo_direcionalvendas_obrigatorio(em):
                 erros.append(_MSG_EMAIL_CORPORATIVO_OBRIGATORIO)
@@ -1621,6 +1653,8 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         key = c["key"]
         sf = c.get("sf")
         raw = dados.get(key)
+        if key == "gerente_vendas":
+            sf = _campo_api_gerente_vendas()
 
         if not _incluir_campo_creci_detalhe_no_payload(dados, key):
             continue
@@ -2338,6 +2372,8 @@ DEFAULT_DICIONARIO_WORKSHEET = "Dicionário"
 # Aba com a lista de nomes de conta para o formulário (coluna de cabeçalho na linha 1)
 DEFAULT_GERENTES_WORKSHEET = "Gerentes"
 DEFAULT_COL_NOME_CONTA = "Nome da Conta"
+DEFAULT_COL_GERENTE_VENDAS = "Gerente de Vendas"
+DEFAULT_SF_CAMPO_GERENTE_VENDAS = "Gerente_de_Vendas__c"
 # Pasta raiz no Google Drive para documento de identidade (compartilhar com o e-mail da service account do JSON).
 # Padrão: pasta na conta pessoal indicada pelo time; sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
 DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1x2vGhf3Fnt_rtykdrU3nqJD7kh_pnrSv"
@@ -3324,7 +3360,13 @@ def honeypot_ok() -> bool:
     v = st.session_state.get("ficha_hp_website")
     if v is None:
         return True
-    if isinstance(v, str) and v.strip():
+    if isinstance(v, str):
+        # Autofill de navegador pode inserir lixo curto no campo oculto; só bloqueia padrão claro de URL.
+        txt = v.strip()
+        if not txt:
+            return True
+        if len(txt) <= 8 and "http" not in txt.lower() and "." not in txt:
+            return True
         return False
     return True
 
@@ -3340,7 +3382,7 @@ def verificar_antes_envio() -> tuple[bool, str]:
     if not ok:
         return False, msg
     if not honeypot_ok():
-        return False, "Não foi possível concluir o envio. Atualize a página e tente novamente."
+        return False, "Não foi possível concluir o envio porque um campo de validação automática foi preenchido. Revise o formulário e tente novamente."
     ok, msg = limite_taxa_ok()
     if not ok:
         return False, msg
@@ -3570,7 +3612,6 @@ def _credenciais_salesforce_ok() -> bool:
 
 
 def aplicar_estilo():
-    bg_url = _css_url_fundo_cadastro()
     st.markdown(
         f"""
         <style>
@@ -3590,23 +3631,19 @@ def aplicar_estilo():
         }}
         html, body {{
             font-family: 'Inter', sans-serif;
-            color: {COR_TEXTO_LABEL};
-            background: transparent !important;
-            background-color: transparent !important;
+            color: #111111 !important;
+            background: #ffffff !important;
+            background-color: #ffffff !important;
         }}
-        /* Degradê + imagem no app inteiro: o header fica acima do stAppViewContainer; se só o container
-           tiver fundo, o topo fica branco. Com fundo no stApp, o header 100% transparente mostra o mesmo visual. */
+        /* Fundo claro forçado: evita combinação texto branco/fundo branco em dark mode do dispositivo. */
         .stApp,
         [data-testid="stApp"] {{
-            background:
-                linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
-                url("{bg_url}") center / cover no-repeat !important;
-            background-attachment: scroll !important;
-            background-color: transparent !important;
+            background: #ffffff !important;
+            background-color: #ffffff !important;
         }}
         [data-testid="stAppViewContainer"] {{
-            background: transparent !important;
-            background-color: transparent !important;
+            background: #ffffff !important;
+            background-color: #ffffff !important;
         }}
         /* Cabeçalho e barra (share, GitHub, estrela, lápis): totalmente transparentes — sem tarja branca do tema */
         header[data-testid="stHeader"],
@@ -3682,7 +3719,7 @@ def aplicar_estilo():
             margin-top: clamp(4px, 1vh, 14px) !important;
             margin-bottom: clamp(4px, 1vh, 14px) !important;
             padding: 1.45rem 2.25rem 1.55rem 2.25rem !important;
-            background: rgba(255, 255, 255, 0.78) !important;
+            background: #ffffff !important;
             backdrop-filter: blur(18px) saturate(1.15);
             -webkit-backdrop-filter: blur(18px) saturate(1.15);
             border-radius: 24px !important;
@@ -3693,7 +3730,7 @@ def aplicar_estilo():
                 inset 0 1px 0 rgba(255, 255, 255, 0.55) !important;
             animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
         }}
-        h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
+        h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: #111111 !important; }}
         .ficha-logo-wrap {{
             text-align: center;
             padding: 0.1rem 0 0.45rem 0;
@@ -4187,10 +4224,10 @@ def _cabecalho_pagina(*, com_intro_formulario: bool = False) -> None:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _nomes_conta_coluna_gerentes_cached(
+def _valores_coluna_gerentes_cached(
     spreadsheet_id: str,
     worksheet_gerentes: str,
-    coluna_nome_conta: str,
+    coluna: str,
     creds_json: str,
 ) -> tuple[str, ...]:
     """Cache por planilha/aba/coluna/credencial (JSON estável) — evita ler a aba a cada rerun."""
@@ -4200,7 +4237,7 @@ def _nomes_conta_coluna_gerentes_cached(
             spreadsheet_id,
             creds,
             worksheet_name=worksheet_gerentes,
-            column_header=coluna_nome_conta,
+            column_header=coluna,
         )
         return tuple(nomes)
     except Exception:
@@ -4236,7 +4273,7 @@ def _opcoes_nome_conta() -> list[str]:
             creds_json = json.dumps(creds, sort_keys=True)
         except (TypeError, ValueError):
             creds_json = "{}"
-        tupla = _nomes_conta_coluna_gerentes_cached(sid, ws_g, col_nc, creds_json)
+        tupla = _valores_coluna_gerentes_cached(sid, ws_g, col_nc, creds_json)
         if tupla:
             return list(tupla)
 
@@ -4270,6 +4307,70 @@ def _nome_conta_rh_padrao() -> str:
     if NOMES_CONTA_FIXOS:
         return str(NOMES_CONTA_FIXOS[0])
     return "RH"
+
+
+def _campo_api_gerente_vendas() -> str:
+    """Campo API Salesforce para o gerente de vendas (configurável por Secrets)."""
+    val = DEFAULT_SF_CAMPO_GERENTE_VENDAS
+    try:
+        if hasattr(st, "secrets"):
+            sf = st.secrets.get("salesforce")
+            if isinstance(sf, dict):
+                cand = str(
+                    sf.get("GERENTE_VENDAS_FIELD")
+                    or sf.get("gerente_vendas_field")
+                    or sf.get("GERENTE_DE_VENDAS_FIELD")
+                    or ""
+                ).strip()
+                if cand:
+                    val = cand
+    except Exception:
+        pass
+    return val
+
+
+def _opcoes_gerente_vendas() -> list[str]:
+    """
+    Opções do select «Gerente de vendas»: valores únicos da coluna «Gerente de Vendas»
+    na aba Gerentes; se falhar, tenta fallback de [ficha_defaults] ou usa somente --Nenhum--.
+    """
+    base = ["--Nenhum--"]
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if creds:
+        gs: dict[str, Any] = {}
+        if hasattr(st, "secrets"):
+            try:
+                gs = dict(st.secrets.get("google_sheets", {}))
+            except Exception:
+                gs = {}
+        sid = str(gs.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)).strip()
+        ws_g = str(
+            gs.get("GERENTES_WORKSHEET")
+            or gs.get("gerentes_worksheet")
+            or DEFAULT_GERENTES_WORKSHEET
+        ).strip() or DEFAULT_GERENTES_WORKSHEET
+        col_g = str(
+            gs.get("GERENTE_VENDAS_COLUMN")
+            or gs.get("gerente_vendas_column")
+            or DEFAULT_COL_GERENTE_VENDAS
+        ).strip() or DEFAULT_COL_GERENTE_VENDAS
+        try:
+            creds_json = json.dumps(creds, sort_keys=True)
+        except (TypeError, ValueError):
+            creds_json = "{}"
+        tupla = _valores_coluna_gerentes_cached(sid, ws_g, col_g, creds_json)
+        if tupla:
+            return base + [x for x in tupla if x and x != "--Nenhum--"]
+    fd = _ficha_defaults_de_secrets()
+    raw = fd.get("gerentes_vendas")
+    if isinstance(raw, (list, tuple)) and raw:
+        fallback = [str(x).strip() for x in raw if str(x).strip()]
+        if fallback:
+            return base + [x for x in fallback if x != "--Nenhum--"]
+    one = str(fd.get("gerente_vendas", "")).strip()
+    if one:
+        return base + [one]
+    return base
 
 
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
@@ -4338,7 +4439,7 @@ def _widget_campo(c: dict):
             st.markdown(
                 '<p class="ficha-email-corporativo-hint" style="margin:0 0 8px 0;font-size:15px;'
                 'font-weight:400;color:#334155;line-height:1.55;">'
-                "Obrigatório incluir <strong>.direcionalvendas</strong> no login do e-mail "
+                "Obrigatório incluir <strong>.direcionalvendas</strong> ou <strong>.rivavendas</strong> no login do e-mail "
                 '(ex.: <span style="font-style:italic;color:#04428f;">'
                 "nomesobrenome.direcionalvendas@gmail.com</span>).</p>",
                 unsafe_allow_html=True,
@@ -4379,6 +4480,8 @@ def _widget_campo(c: dict):
         opts = c.get("opcoes") or [""]
         if k == "atividade":
             opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
+        if k == "gerente_vendas":
+            opts = _opcoes_gerente_vendas()
         if k == "possui_creci":
             opts = ["Sim", "Não"]
             return st.selectbox(
@@ -5516,6 +5619,7 @@ def _limpar_session_formulario():
         "ficha_sf_retry_row",
         "ficha_sf_retry_sid",
         "ficha_sf_retry_wname",
+        "ficha_debug_envio",
         "ficha_creci_carteira_upload",
         "ficha_creci_drive_link",
         "ficha_creci_drive_erro",
@@ -5607,9 +5711,12 @@ def _ativar_cenario_teste_design() -> None:
 def _processar_envio_cadastro() -> None:
     """Grava planilha, tenta Salesforce e define tela de sucesso."""
     ss = st.session_state
+    ss["ficha_debug_envio"] = []
+    _registrar_debug_envio("início_envio", "Fluxo principal iniciado.")
     ss.pop("ficha_erros_envio", None)
     ok_sec, msg_sec = verificar_antes_envio()
     if not ok_sec:
+        _registrar_debug_envio("bloqueio_pré_envio", msg_sec)
         ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
         return
     secoes_env = secoes_com_campos_visiveis()
@@ -5627,6 +5734,7 @@ def _processar_envio_cadastro() -> None:
     if not ss.get("fld_lgpd_ficha"):
         erros.append("Concordância LGPD *")
     if erros:
+        _registrar_debug_envio("falha_validação", "; ".join(str(x) for x in erros))
         ss["ficha_erros_envio"] = {"kind": "validation", "items": erros}
         return
 
@@ -5634,6 +5742,7 @@ def _processar_envio_cadastro() -> None:
 
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
+        _registrar_debug_envio("erro_google_credentials", "SERVICE_ACCOUNT_JSON ausente/inválido.")
         _LOG_FICHA.error(
             "Ficha cadastro: envio indisponível (mensagem genérica ao usuário) — "
             "credenciais Google ausentes ou SERVICE_ACCOUNT_JSON inválido/ausente em "
@@ -5655,6 +5764,10 @@ def _processar_envio_cadastro() -> None:
     bar_envio = st.progress(0.0)
 
     payload, avisos = montar_payload_salesforce(dados)
+    _registrar_debug_envio(
+        "payload_salesforce_montado",
+        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+    )
     avisos = list(avisos)
     avisos.extend(_enriquecer_mobile_phone(payload, dados))
     linha = linha_planilha(dados, payload)
@@ -5663,6 +5776,7 @@ def _processar_envio_cadastro() -> None:
     try:
         bar_envio.progress(0.15)
         row_num = anexar_linha(linha, cab, sid, wname, creds, gs)
+        _registrar_debug_envio("planilha_append_ok", f"linha={row_num} planilha={sid} aba={wname}")
         bar_envio.progress(0.38)
     except Exception as e:
         erro_txt = str(e or "").strip()
@@ -5690,6 +5804,7 @@ def _processar_envio_cadastro() -> None:
             type(e).__name__,
             erro_txt or repr(e),
         )
+        _registrar_debug_envio("planilha_append_erro", f"{type(e).__name__}: {e}")
         ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
         return
 
@@ -5733,6 +5848,7 @@ def _processar_envio_cadastro() -> None:
     _aplicar_secrets_sf()
     bar_envio.progress(0.58)
     if not _credenciais_salesforce_ok():
+        _registrar_debug_envio("sf_config_ausente", "Secrets USER/PASSWORD/TOKEN ausentes.")
         atualizar_status_envio_salesforce(
             sid,
             wname,
@@ -5752,6 +5868,7 @@ def _processar_envio_cadastro() -> None:
         return
 
     if not _SF_SDK_DISPONIVEL:
+        _registrar_debug_envio("sf_sdk_indisponivel", "simple_salesforce não instalado.")
         atualizar_status_envio_salesforce(
             sid,
             wname,
@@ -5775,6 +5892,7 @@ def _processar_envio_cadastro() -> None:
     sf = conectar_salesforce()
     bar_envio.progress(0.78)
     if not sf:
+        _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
         atualizar_status_envio_salesforce(
             sid,
             wname,
@@ -5795,12 +5913,17 @@ def _processar_envio_cadastro() -> None:
         return
 
     _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
+    _registrar_debug_envio(
+        "payload_sf_enriquecido",
+        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+    )
     bar_envio.progress(0.85)
     cid, err = criar_contato_payload(sf, payload)
     bar_envio.progress(0.93)
     link = _url_contact(cid) if cid else ""
 
     if cid:
+        _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
         atualizar_status_envio_salesforce(
             sid, wname, creds, row_num, "Sucesso", "", link, payload_final=payload
         )
@@ -5811,12 +5934,15 @@ def _processar_envio_cadastro() -> None:
         ss.pop("ficha_sf_retry_wname", None)
     else:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        _registrar_debug_envio("sf_create_erro", err_full)
         atualizar_status_envio_salesforce(
             sid, wname, creds, row_num, "Erro", err_full[:49000], "", payload_final=payload
         )
         ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
     ss["sf_avisos"] = avisos
+    if avisos:
+        _registrar_debug_envio("avisos_fluxo", " | ".join(str(x) for x in avisos))
     bar_envio.progress(0.96)
     _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
     bar_envio.progress(1.0)
@@ -6165,6 +6291,14 @@ def main():
             _alert_vermelho(FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO)
         elif kind == "text":
             _alert_vermelho(fe.get("text") or "")
+
+    trilha = list(ss.get("ficha_debug_envio") or [])
+    if trilha:
+        with st.expander("Debug do envio (planilha e Salesforce)", expanded=False):
+            st.caption(
+                "Use este painel para diagnóstico quando houver divergência entre planilha e Salesforce."
+            )
+            st.json(trilha)
 
 
 if __name__ == "__main__":
