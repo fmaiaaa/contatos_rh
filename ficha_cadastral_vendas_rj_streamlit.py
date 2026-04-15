@@ -4595,8 +4595,8 @@ def _campo_api_gerente_vendas() -> str:
 
 def _opcoes_gerente_vendas() -> list[str]:
     """
-    Opções do select «Gerente de vendas»: valores únicos da coluna «Gerente de Vendas»
-    na aba Gerentes; se falhar, tenta fallback de [ficha_defaults] ou usa somente --Nenhum--.
+    Opções do select «Gerente de vendas»: valores de «Nome da Conta».
+    Prioridade: coluna Nome da Conta na aba Gerentes -> lista fixa definida no código.
     """
     base = ["--Nenhum--"]
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
@@ -4613,11 +4613,7 @@ def _opcoes_gerente_vendas() -> list[str]:
             or gs.get("gerentes_worksheet")
             or DEFAULT_GERENTES_WORKSHEET
         ).strip() or DEFAULT_GERENTES_WORKSHEET
-        col_g = str(
-            gs.get("GERENTE_VENDAS_COLUMN")
-            or gs.get("gerente_vendas_column")
-            or DEFAULT_COL_GERENTE_VENDAS
-        ).strip() or DEFAULT_COL_GERENTE_VENDAS
+        col_g = str(gs.get("NOME_CONTA_COLUMN") or gs.get("nome_conta_column") or DEFAULT_COL_NOME_CONTA).strip() or DEFAULT_COL_NOME_CONTA
         try:
             creds_json = json.dumps(creds, sort_keys=True)
         except (TypeError, ValueError):
@@ -4625,16 +4621,7 @@ def _opcoes_gerente_vendas() -> list[str]:
         tupla = _valores_coluna_gerentes_cached(sid, ws_g, col_g, creds_json)
         if tupla:
             return base + [x for x in tupla if x and x != "--Nenhum--"]
-    fd = _ficha_defaults_de_secrets()
-    raw = fd.get("gerentes_vendas")
-    if isinstance(raw, (list, tuple)) and raw:
-        fallback = [str(x).strip() for x in raw if str(x).strip()]
-        if fallback:
-            return base + [x for x in fallback if x != "--Nenhum--"]
-    one = str(fd.get("gerente_vendas", "")).strip()
-    if one:
-        return base + [one]
-    return base
+    return base + [x for x in GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS if x and x != "--Nenhum--"]
 
 
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
