@@ -580,10 +580,10 @@ def _campos_def() -> List[Campo]:
             label="Gerente de vendas *",
             sec="Informações para contato",
             tipo="select",
-            sf="Gerente_de_Vendas__c",
+            sf="AccountId",
             opcoes=["--Nenhum--"],
             req=True,
-            help="Selecione o gerente de vendas conforme a aba Gerentes da planilha.",
+            help="Selecione o Nome da Conta (gerente de vendas) para vínculo no campo AccountId do Salesforce.",
         ),
         _z(
             key="nome_completo",
@@ -1623,12 +1623,15 @@ def _aplicar_enriquecimentos_payload_sf(
     """
     payload["Origem__c"] = "RH"
 
-    if not (payload.get("AccountId") or "").strip():
-        aid = _resolver_account_id_por_nome(sf, str(dados.get("account_name") or ""))
+    conta_escolhida_gerente = _norm_picklist(dados.get("gerente_vendas"))
+    nome_conta_ref = conta_escolhida_gerente or str(dados.get("account_name") or "").strip()
+
+    if not (payload.get("AccountId") or "").strip() or conta_escolhida_gerente:
+        aid = _resolver_account_id_por_nome(sf, nome_conta_ref)
         if aid:
             payload["AccountId"] = aid
         else:
-            nconta = (str(dados.get("account_name") or "").strip())
+            nconta = nome_conta_ref
             if nconta:
                 avisos.append(f"Nome da conta não localizado no Salesforce: {nconta}")
 
@@ -1653,8 +1656,6 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         key = c["key"]
         sf = c.get("sf")
         raw = dados.get(key)
-        if key == "gerente_vendas":
-            sf = _campo_api_gerente_vendas()
 
         if not _incluir_campo_creci_detalhe_no_payload(dados, key):
             continue
@@ -1716,6 +1717,9 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
         if tipo == "select":
             s = _norm_picklist(raw)
+            if key == "gerente_vendas":
+                # O select traz Nome da Conta; o AccountId real é resolvido no enriquecimento final.
+                continue
             if key == "unidade_negocio":
                 if s:
                     # Mapeamento explícito para o valor exato do picklist Salesforce (evita troca Riva/Direcional).
