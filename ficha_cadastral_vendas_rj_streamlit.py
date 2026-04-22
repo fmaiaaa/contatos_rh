@@ -311,7 +311,7 @@ _SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO = frozenset({"Estagiário"})
 DEFAULT_CRECI_NUMERO_FALLBACK = 1
 DEFAULT_NOME_RESPONSAVEL_CRECI_FALLBACK = "Lucas Maia"
 
-TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Telefone", "Chave aleatória"]
+TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Celular", "Chave aleatória"]
 
 ESTADOS_UF = [
     "--Nenhum--",
@@ -1720,6 +1720,10 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if key == "gerente_vendas":
                 # O select traz Nome da Conta; o AccountId real é resolvido no enriquecimento final.
                 continue
+            if key == "tipo_pix":
+                # Compatibilidade com valor legado do formulário antes da revisão de picklist.
+                if s == "Telefone":
+                    s = "Celular"
             if key == "unidade_negocio":
                 if s:
                     # Mapeamento explícito para o valor exato do picklist Salesforce (evita troca Riva/Direcional).
@@ -4920,7 +4924,7 @@ def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> 
         return avisos
     tipo = (dados.get("tipo_pix") or "").strip()
     dp = str(dados.get("dados_pix") or "")
-    if tipo == "Telefone":
+    if tipo in ("Telefone", "Celular"):
         mt = _somente_digitos(dp)
         if len(mt) >= 10:
             payload["MobilePhone"] = mt[:11]
