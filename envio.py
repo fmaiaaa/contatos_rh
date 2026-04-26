@@ -30,6 +30,8 @@ COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
 COR_VERMELHO_ESCURO = "#9e0828"
 URL_LOGO_DIRECIONAL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
+LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
+FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
 
 def _hex_rgb_triplet(hex_color: str) -> str:
     x = hex_color.lstrip("#")
@@ -66,6 +68,17 @@ def aplicar_estilo_gestao():
         }}
         
         h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
+        
+        .ficha-logo-wrap {{
+            text-align: center;
+            padding: 0.1rem 0 0.45rem 0;
+        }}
+        .ficha-logo-wrap img {{
+            max-height: 72px; width: auto;
+            max-width: min(280px, 85vw); height: auto;
+            object-fit: contain; display: inline-block;
+        }}
+
         .ficha-hero-bar {{
             height: 4px; width: 100%; border-radius: 999px;
             background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
@@ -80,6 +93,25 @@ def aplicar_estilo_gestao():
         }}
         </style>
     """, unsafe_allow_html=True)
+
+def _resolver_png_raiz(nome: str) -> Path | None:
+    for base in (_DIR_APP, _DIR_APP.parent):
+        p = base / nome
+        if p.is_file(): return p
+    return None
+
+def _exibir_logo_topo() -> None:
+    """Logo centralizada no topo: arquivo local ou URL de backup."""
+    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
+    try:
+        if path:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            st.markdown(f'<div class="ficha-logo-wrap"><img src="data:image/png;base64,{b64}" alt="Direcional" /></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
+    except:
+        st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
 
 def conectar_salesforce():
     sf_sec = st.secrets.get("salesforce", {})
@@ -118,8 +150,6 @@ def ler_base_pendente():
             
     df = pd.DataFrame(raw_data[1:], columns=new_headers)
     
-    # Filtro: Mostrar apenas quem não possui link na coluna "Link do contato (Salesforce)"
-    # Assumindo que o cabeçalho original é o que mapeamos
     col_link = "Link do contato (Salesforce)"
     if col_link in df.columns:
         df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
@@ -131,8 +161,6 @@ def ler_base_pendente():
 def formatar_e_limpar_planilha(ws: Any):
     """Aplica cores, bordas e organiza a aba conforme as seções solicitadas."""
     try:
-        # Exemplo de formatação via API gspread-formatting (simplificado via Batch Update nativo)
-        # Note: Para manter o código curto, focamos na limpeza e organização básica de colunas
         pass 
     except: pass
 
@@ -153,10 +181,11 @@ def atualizar_status_planilha(ws: Any, df_idx: int, status: str, log: str, link:
     if idx_link and link: ws.update_cell(row_num, idx_link, link)
 
 def main():
-    st.set_page_config(page_title="Dashboard | Direcional", layout="wide")
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav) if fav else None, layout="wide")
     aplicar_estilo_gestao()
     
-    st.markdown(f'<div style="text-align:center"><img src="{URL_LOGO_DIRECIONAL}" width="160"></div>', unsafe_allow_html=True)
+    _exibir_logo_topo()
     st.markdown('<p style="font-family:\'Montserrat\'; font-size:1.8rem; font-weight:900; color:#04428f; text-align:center; margin:0;">Gestão de Integração Salesforce</p>', unsafe_allow_html=True)
     st.markdown('<div class="ficha-hero-bar"></div>', unsafe_allow_html=True)
 
@@ -167,15 +196,15 @@ def main():
         return
 
     if df.empty:
-        st.success("✨ Todos os cadastros já foram integrados ao Salesforce!")
+        st.success("Todos os cadastros já foram integrados ao Salesforce!")
         if st.button("Recarregar Dados"): st.rerun()
         return
 
-    st.subheader(f"📋 Cadastros Pendentes ({len(df)})")
+    st.subheader(f"Cadastros Pendentes ({len(df)})")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🚀 Processar e Enviar Todos os Pendentes", type="primary", use_container_width=True):
+    if st.button("Processar e Enviar Todos os Pendentes", type="primary", use_container_width=True):
         sf = conectar_salesforce()
         if not sf:
             st.error("Falha na autenticação com Salesforce. Verifique Secrets.")
@@ -183,16 +212,17 @@ def main():
 
         prog_bar = st.progress(0.0)
         log_container = st.empty()
+        detailed_logs = st.container()
         
         sucesso_count = 0
         erro_count = 0
 
         for i, (idx, row) in enumerate(df.iterrows()):
             nome = row.get("Nome completo *", "Candidato")
-            log_container.markdown(f"⏳ **Integrando ({i+1}/{len(df)}):** {nome}")
+            status_msg = f"Integrando ({i+1}/{len(df)}): {nome}"
+            log_container.markdown(f"**Status:** {status_msg}")
             
             try:
-                # Lógica de montagem de payload
                 partes = str(nome).strip().split(None, 1)
                 fname = partes[0][:40]
                 lname = (partes[1] if len(partes) > 1 else partes[0])[:80]
@@ -214,22 +244,22 @@ def main():
                     link = f"https://direcional.lightning.force.com/lightning/r/Contact/{cid}/view"
                     atualizar_status_planilha(ws, idx, "Sucesso", "OK", link)
                     sucesso_count += 1
+                    detailed_logs.write(f"Sucesso: {nome}")
                 else:
                     atualizar_status_planilha(ws, idx, "Erro", "Salesforce não retornou ID")
                     erro_count += 1
+                    detailed_logs.error(f"Erro: {nome} (Salesforce não retornou ID)")
             
             except Exception as e:
                 err_msg = str(e)[:250]
                 atualizar_status_planilha(ws, idx, "Erro", err_msg)
                 erro_count += 1
-                st.error(f"Falha em {nome}: {err_msg}")
+                detailed_logs.error(f"Falha em {nome}: {err_msg}")
             
-            # Pausa para visualização dos logs conforme solicitado
             time.sleep(1.2)
             prog_bar.progress((i + 1) / len(df))
         
-        log_container.success(f"✨ Processamento Concluído! Sucessos: {sucesso_count} | Erros: {erro_count}")
-        st.balloons()
+        log_container.success(f"Processamento Concluído! Sucessos: {sucesso_count} | Erros: {erro_count}")
         time.sleep(3)
         st.rerun()
 
