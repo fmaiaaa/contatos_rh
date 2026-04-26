@@ -3,6 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 2: GESTÃO E INTEGRAÇÃO SALESFORCE
 Design Premium Unificado, Logs Persistentes, Seleção Total e Processamento em Lote.
+Ajustado para garantir paridade de campos e correção de autenticação.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import streamlit as st
 import pandas as pd
 import time
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 from pathlib import Path
@@ -31,6 +33,22 @@ COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
 COR_VERMELHO_ESCURO = "#9e0828"
 URL_LOGO_DIRECIONAL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
+
+# Mapeamento de Naturalidade (Capitais por UF)
+CAPITAIS_MAP = {
+    "AC": "Rio Branco", "AL": "Maceió", "AM": "Manaus", "AP": "Macapá", "BA": "Salvador", "CE": "Fortaleza", 
+    "DF": "Brasília", "ES": "Vitória", "GO": "Goiânia", "MA": "São Luís", "MG": "Belo Horizonte", "MS": "Campo Grande", 
+    "MT": "Cuiabá", "PA": "Belém", "PB": "João Pessoa", "PE": "Recife", "PI": "Teresina", "PR": "Curitiba", 
+    "RJ": "Rio de Janeiro", "RN": "Natal", "RO": "Porto Velho", "RR": "Boa Vista", "RS": "Porto Alegre", 
+    "SC": "Florianópolis", "SE": "Aracaju", "SP": "São Paulo", "TO": "Palmas",
+}
+
+def normalize_text(text: Any) -> str:
+    """Remove acentos, espaços extras e converte para maiúsculas para paridade."""
+    if text is None: return ""
+    s = str(text).strip().upper()
+    s = "".join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    return re.sub(r'[^A-Z0-9]', '', s) # Mantém apenas alfanuméricos para comparação de chaves
 
 def _hex_rgb_triplet(hex_color: str) -> str:
     x = hex_color.lstrip("#")
@@ -87,33 +105,35 @@ def ler_base_pendente():
     from google.oauth2.service_account import Credentials
     gs_sec = st.secrets["google_sheets"]
     creds_dict = json.loads(gs_sec["SERVICE_ACCOUNT_JSON"])
-    gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, ["https://www.googleapis.com/auth/spreadsheets"]))
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    # Ajuste: Passando scopes como argumento nomeado para evitar erro de múltiplos argumentos posicionais
+    gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=scopes))
     sh = gc.open_by_key(gs_sec["SPREADSHEET_ID"])
     ws = sh.worksheet(gs_sec.get("WORKSHEET_NAME", "Corretores"))
     
     all_vals = ws.get_all_values()
-    if len(all_vals) < 3: return pd.DataFrame(), ws, [] # Precisa de Row 1, Row 2 e Dados
+    if len(all_vals) < 3: return pd.DataFrame(), ws, []
     
     labels = all_vals[0]
     api_names = all_vals[1]
     data = all_vals[2:]
     
     df = pd.DataFrame(data, columns=labels)
-    # Filtro: Mostrar somente quem não tem o Link do contato (Salesforce)
     col_link = "Link do contato (Salesforce)"
-    df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
+    if col_link in df.columns:
+        df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
+    else:
+        df_pendentes = df
     
     return df_pendentes, ws, api_names
 
 def atualizar_linha_base(ws: Any, df_idx_orig: int, status: str, log: str, link: str = ""):
-    row_num = df_idx_orig + 3 # +1 header1, +1 header2, +1 index0
+    row_num = df_idx_orig + 3
     headers = ws.row_values(1)
-    
     try:
         col_envio = headers.index("Envio?") + 1
         col_log = headers.index("Log / erro") + 1
         col_link = headers.index("Link do contato (Salesforce)") + 1
-        
         ws.update_cell(row_num, col_envio, status)
         ws.update_cell(row_num, col_log, log)
         if link: ws.update_cell(row_num, col_link, link)
@@ -164,31 +184,41 @@ def main():
 
             prog = st.progress(0.0)
             status_t = st.empty()
-            
             sucessos, falhas = 0, 0
             
-            # Mapeamento do cabeçalho para APIs (Row 1 -> Row 2)
-            map_api = {label: api for label, api in zip(df.columns, api_names)}
+            # Normalização de rótulos para garantir paridade na associação
+            map_api = {normalize_text(label): api for label, api in zip(df.columns, api_names)}
 
             for i, (idx_df, row) in enumerate(selecionados.iterrows()):
-                nome = row.get("Nome completo *", "Candidato")
+                nome = row.get("Nome completo *") or row.get("Nome completo") or "Candidato"
                 status_t.markdown(f"**Integrando:** {nome}")
                 
                 try:
-                    # Montagem dinâmica do Payload usando Row 2 da planilha
                     payload = {}
+                    estado_civil_normal = normalize_text(row.get("Estado Civil *") or row.get("Estado Civil"))
+                    uf_nasc_raw = str(row.get("UF Naturalidade *") or row.get("UF Naturalidade") or "").strip().upper()
+
                     for col_label, val in row.items():
                         if col_label == "Selecionar": continue
-                        api_key = map_api.get(col_label)
+                        norm_col = normalize_text(col_label)
+                        api_key = map_api.get(norm_col)
+                        
                         if api_key and api_key not in ["Timestamp", "Salesforce_Link", "Status_Envio", "Log_Erro", "N/A"]:
-                            # Tratamento Especial: CPF
-                            if "CPF" in col_label: val = formatar_cpf_mascara(val)
-                            # Tratamento Especial: Regional
-                            if "Regional" in col_label and val == "RH": val = "RJ"
+                            # Lógica: Nome do Cônjuge só se for Casado
+                            if "CONJUGE" in norm_col or "Nome_do_Conjuge__c" == api_key:
+                                if "CASADO" not in estado_civil_normal:
+                                    continue
+                            
+                            # Lógica: Naturalidade fixa por UF
+                            if "NATURALIDADE" in norm_col and "UF" not in norm_col:
+                                if uf_nasc_raw in CAPITAIS_MAP:
+                                    val = CAPITAIS_MAP[uf_nasc_raw]
+
+                            if "CPF" in norm_col: val = formatar_cpf_mascara(val)
+                            if "REGIONAL" in norm_col and normalize_text(val) == "RH": val = "RJ"
                             
                             payload[api_key] = str(val)
 
-                    # Ajuste de Nome para Contato Salesforce
                     partes = str(nome).split(None, 1)
                     payload["FirstName"] = partes[0][:40]
                     payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
@@ -211,7 +241,7 @@ def main():
                     st.session_state['gestao_logs'].append({"status": "erro", "msg": f"Falha: {nome} - {msg_erro}"})
                     falhas += 1
                 
-                time.sleep(1.0) # Pausa para log
+                time.sleep(0.5)
                 prog.progress((i + 1) / len(selecionados))
 
             status_t.success(f"Fim do lote. Sucessos: {sucessos} | Falhas: {falhas}")
