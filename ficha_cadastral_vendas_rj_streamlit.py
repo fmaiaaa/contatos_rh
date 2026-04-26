@@ -85,7 +85,6 @@ SEC_ORDER: Tuple[str, ...] = (
     "Preferência de contato",
 )
 
-# ... (Lista de Picklists idêntica ao original) ...
 REGIONAIS = ["--Nenhum--", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
 ORIGENS = ["--Nenhum--", "RH", "Indicação", "Gerente", "Diretor", "DiRi Talent", "Coordenador", "Gupy", "MARINHA", "Creci", "Parceria Estácio"]
 STATUS_CORRETOR = ["--Nenhum--", "Ativo", "Inativo", "Pré credenciado", "Reativado"]
@@ -170,11 +169,6 @@ def email_contato_formato_valido(val: Any) -> bool:
     s = (str(val).strip() if val is not None else "")
     return bool(re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", s))
 
-def email_corporativo_direcionalvendas_obrigatorio(val: Any) -> bool:
-    if not email_contato_formato_valido(val): return False
-    s = str(val).lower()
-    return any(marker in s for marker in (".direcionalvendas", ".rivavendas"))
-
 def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
     try:
         gs = st_secrets.get("google_sheets")
@@ -183,10 +177,8 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
         return json.loads(raw)
     except: return None
 
-# ... (Funções de segurança Honeypot e Rate Limit mantidas do original) ...
-
 # =============================================================================
-# DESIGN E ESTILOS (RESTAURAÇÃO COMPLETA DO DESIGN PREMIUM ANTERIOR)
+# DESIGN E ESTILOS (RESTAURAÇÃO COMPLETA + REMOÇÃO DA BARRA BRANCA)
 # =============================================================================
 def _hex_rgb_triplet(hex_color: str) -> str:
     x = hex_color.lstrip("#")
@@ -200,6 +192,20 @@ def aplicar_estilo():
     st.markdown(f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;900&family=Inter:wght@400;600&display=swap');
+        
+        /* Remover a barra branca e o menu superior do Streamlit */
+        header[data-testid="stHeader"], 
+        [data-testid="stHeader"], 
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"] {{
+            display: none !important;
+            visibility: hidden !important;
+            height: 0px !important;
+        }}
+        
+        #MainMenu {{ visibility: hidden; }}
+        footer {{ visibility: hidden; }}
+
         @keyframes fichaFadeIn {{ from {{ opacity: 0; transform: translateY(18px); }} to {{ opacity: 1; transform: translateY(0); }} }}
         @keyframes fichaShimmer {{ 0% {{ background-position: 0% 50%; }} 100% {{ background-position: 200% 50%; }} }}
         
@@ -207,41 +213,79 @@ def aplicar_estilo():
             background: linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba({RGB_VERMELHO_CSS}, 0.22) 100%),
                         url("{bg_url}") center / cover no-repeat !important;
         }}
+        
+        /* Ajuste de margem superior devido à remoção do header */
         .block-container {{
             max-width: 920px !important;
-            padding: 2rem !important;
+            padding-top: 2rem !important;
+            padding-bottom: 2rem !important;
             background: rgba(255, 255, 255, 0.82) !important;
             backdrop-filter: blur(18px);
             border-radius: 24px !important;
             border: 1px solid rgba(255, 255, 255, 0.45);
             box-shadow: 0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.18);
             animation: fichaFadeIn 0.7s ease-out both;
+            margin-top: 20px !important;
         }}
+        
         h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
+        
+        .ficha-logo-wrap {{
+            text-align: center;
+            padding: 0.1rem 0 0.45rem 0;
+        }}
+        .ficha-logo-wrap img {{
+            max-height: 72px; width: auto;
+            max-width: min(280px, 85vw); height: auto;
+            object-fit: contain; display: inline-block;
+        }}
+
         .ficha-hero-bar {{
             height: 4px; width: 100%; border-radius: 999px;
             background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
             background-size: 200% 100%; animation: fichaShimmer 4s infinite alternate;
             margin: 1.2rem 0;
         }}
+        
         .section-head {{
             font-family: 'Montserrat', sans-serif; font-size: 0.8rem; color: {COR_AZUL_ESC};
             text-align: center; text-transform: uppercase; letter-spacing: 0.1em;
             font-weight: 800; border-bottom: 2px solid #eef2f6; padding-bottom: 0.5rem; margin-bottom: 1rem;
         }}
+        
         .stButton button[kind="primary"] {{
             background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
             border: none !important; border-radius: 12px !important; font-weight: 700 !important;
         }}
+        
         .ficha-input-label {{ font-size: 0.875rem; font-weight: 600; color: {COR_TEXTO_LABEL}; margin-bottom: 0.35rem; }}
         .ficha-star-req {{ color: {COR_VERMELHO}; font-weight: 800; margin-left: 0.12em; }}
         </style>
     """, unsafe_allow_html=True)
 
+def _resolver_png_raiz(nome: str) -> Path | None:
+    for base in (_DIR_APP, _DIR_APP.parent):
+        p = base / nome
+        if p.is_file(): return p
+    return None
+
+def _exibir_logo_topo() -> None:
+    """Logo centralizada no topo: arquivo local ou URL de backup."""
+    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
+    try:
+        if path:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            st.markdown(f'<div class="ficha-logo-wrap"><img src="data:image/png;base64,{b64}" alt="Direcional" /></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL_EMAIL}" alt="Direcional" /></div>', unsafe_allow_html=True)
+    except:
+        st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL_EMAIL}" alt="Direcional" /></div>', unsafe_allow_html=True)
+
 def _cabecalho_pagina(com_intro_formulario: bool = False):
-    st.markdown(f'<div style="text-align:center"><img src="{URL_LOGO_DIRECIONAL_EMAIL}" width="180"></div>', unsafe_allow_html=True)
+    _exibir_logo_topo()
     st.markdown(f"""
-        <div style="text-align:center; margin-top: 1rem;">
+        <div style="text-align:center; margin-top: 0.5rem;">
             <p style="font-family:'Montserrat'; font-size:1.7rem; font-weight:900; color:{COR_AZUL_ESC}; margin:0;">Credenciamento Direcional Vendas RJ</p>
             <p style="color:#475569; font-size:0.95rem;">Seu próximo passo começa aqui.</p>
         </div>
@@ -286,8 +330,6 @@ def _processar_envio_cadastro():
         ws = sh.worksheet(wname)
         bar.progress(0.4)
 
-        # Preparar linha seguindo o cabeçalho original
-        # Ordem: Data, Link SF (vazio), Campos..., Envio? (Pendente), Log
         row = [datetime.now().strftime("%d/%m/%Y %H:%M:%S"), ""]
         for c in CAMPOS:
             val = dados.get(c["key"], "")
@@ -322,7 +364,8 @@ def _widget_campo(c):
     elif tipo == "textarea": st.text_area(label, key=sk, label_visibility=lv)
 
 def main():
-    st.set_page_config(page_title="Credenciamento | Direcional RJ", layout="centered")
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(page_title="Credenciamento | Direcional RJ", page_icon=str(fav) if fav else None, layout="centered")
     aplicar_estilo()
 
     ss = st.session_state
@@ -335,7 +378,7 @@ def main():
         st.balloons()
         st.markdown(f"""
             <div style="border: 2px solid {COR_AZUL_ESC}; background: #fff; padding: 20px; border-radius: 15px;">
-                <h3 style="margin-top:0">✓ Cadastro Realizado!</h3>
+                <h3 style="margin-top:0; color:{COR_AZUL_ESC}">✓ Cadastro Realizado!</h3>
                 <p>Seus dados foram salvos com sucesso em nossa base de análise.</p>
                 <p>Nossa equipe de gestão irá revisar seu perfil. Assista ao vídeo de boas-vindas do nosso RH abaixo:</p>
             </div>
