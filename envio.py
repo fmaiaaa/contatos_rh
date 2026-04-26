@@ -3,7 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 2: GESTÃO E INTEGRAÇÃO SALESFORCE
 Exibição de pendentes, seleção múltipla e persistência de logs.
-Ajustado para formatar CPF com máscara antes do envio.
+Ajustado para formatar CPF com máscara e exibir logs com separadores.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 _DIR_APP = Path(__file__).resolve().parent
 
-# --- Salesforce Integration ---
+# --- Integração Salesforce ---
 try:
     from simple_salesforce import Salesforce, SalesforceAuthenticationFailed
 except ImportError:
@@ -62,7 +62,7 @@ def aplicar_estilo_gestao():
         .block-container {{
             max-width: 1200px !important;
             padding-top: 2rem !important;
-            background: rgba(255, 255, 255, 0.85) !important;
+            background: rgba(255, 255, 255, 0.88) !important;
             backdrop-filter: blur(20px);
             border-radius: 24px !important;
             border: 1px solid rgba(255, 255, 255, 0.45);
@@ -74,10 +74,11 @@ def aplicar_estilo_gestao():
         
         .ficha-logo-wrap {{
             text-align: center;
-            padding: 0.1rem 0 0.45rem 0;
+            padding: 0.5rem 0 1rem 0;
+            width: 100%;
         }}
         .ficha-logo-wrap img {{
-            max-height: 65px; width: auto;
+            max-height: 80px; width: auto;
             object-fit: contain; display: inline-block;
         }}
 
@@ -97,17 +98,19 @@ def aplicar_estilo_gestao():
         }}
 
         .log-container {{
-            background: rgba(248, 250, 252, 0.9);
-            border: 1px solid #e2e8f0;
+            background: #ffffff;
+            border: 1px solid {COR_BORDA};
             border-radius: 12px;
-            padding: 15px;
-            margin-top: 20px;
+            padding: 20px;
+            margin-top: 25px;
             font-family: 'Inter', sans-serif;
-            max-height: 400px;
+            max-height: 500px;
             overflow-y: auto;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.05);
         }}
         
-        .log-entry {{ padding: 5px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }}
+        .log-entry {{ padding: 10px 0; font-size: 13px; line-height: 1.5; }}
+        .log-divider {{ border: 0; border-top: 1px solid #f1f5f9; margin: 10px 0; }}
         .log-success {{ color: #16a34a; font-weight: 600; }}
         .log-error {{ color: #dc2626; font-weight: 600; }}
         </style>
@@ -120,7 +123,7 @@ def _resolver_png_raiz(nome: str) -> Path | None:
     return None
 
 def _exibir_logo_topo() -> None:
-    """Logo centralizada no topo: arquivo local ou URL de backup."""
+    """Exibe a logo centralizada no topo."""
     path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
     try:
         if path:
@@ -133,10 +136,10 @@ def _exibir_logo_topo() -> None:
         st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
 
 def formatar_cpf_mascara(val: Any) -> str:
-    """Garante o formato XXX.XXX.XXX-XX para validação do Salesforce."""
-    digits = re.sub(r"\D", "", str(val or ""))
-    if len(digits) != 11:
-        return digits # Retorna original se não tiver 11 dígitos para evitar erro de f-string
+    """Formata o CPF para o padrão aceito pelo Salesforce (000.000.000-00)."""
+    if not val: return ""
+    digits = re.sub(r"\D", "", str(val))
+    if len(digits) != 11: return str(val)
     return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
 
 def conectar_salesforce():
@@ -226,8 +229,7 @@ def main():
         return
 
     st.markdown("### Cadastros Pendentes")
-    col_sel_all, col_info = st.columns([1, 4])
-    
+    col_sel_all, col_empty = st.columns([1, 4])
     with col_sel_all:
         selecionar_todos = st.toggle("Selecionar todos", value=False)
 
@@ -268,13 +270,12 @@ def main():
                     fname = partes[0][:40]
                     lname = (partes[1] if len(partes) > 1 else partes[0])[:80]
                     
-                    # Formatação do CPF com máscara para evitar erro de validação
                     cpf_bruto = row.get("CPF *") or row.get("CPF")
                     cpf_formatado = formatar_cpf_mascara(cpf_bruto)
                     
-                    # Tratamento da Regional (Removendo "RH" se for enviado indevidamente)
                     regional_val = row.get("Regional *") or row.get("Regional")
-                    if regional_val == "RH": regional_val = "RJ" # Fallback para opção válida
+                    # Correção: Se a regional for "RH", altera para "RJ" pois "RH" é inválido no Salesforce
+                    if regional_val == "RH": regional_val = "RJ"
 
                     payload = {
                         "FirstName": fname,
@@ -311,16 +312,21 @@ def main():
             status_text.success(f"Processamento concluído. Sucessos: {sucessos} | Erros: {erros}")
             st.rerun()
 
+    # Exibição dos Logs Persistentes dentro de uma caixa branca estilizada
     if st.session_state['gestao_logs']:
-        st.markdown("### Logs de Processamento")
-        with st.container():
-            st.markdown('<div class="log-container">', unsafe_allow_html=True)
-            for log in reversed(st.session_state['gestao_logs']):
-                clase = "log-success" if log['status'] == "sucesso" else "log-error"
-                st.markdown(f'<div class="log-entry {clase}">{log["msg"]}</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("### Histórico de Processamento")
+        log_html = '<div class="log-container">'
+        for i, log in enumerate(reversed(st.session_state['gestao_logs'])):
+            clase = "log-success" if log['status'] == "sucesso" else "log-error"
+            log_html += f'<div class="log-entry {clase}">{log["msg"]}</div>'
+            if i < len(st.session_state['gestao_logs']) - 1:
+                log_html += '<hr class="log-divider">'
+        log_html += '</div>'
         
-        if st.button("Limpar logs e realizar novo envio", use_container_width=True):
+        st.markdown(log_html, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Limpar histórico e realizar nova consulta", use_container_width=True):
             st.session_state['gestao_logs'] = []
             st.rerun()
 
