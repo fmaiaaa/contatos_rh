@@ -3,7 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 2: GESTÃO E INTEGRAÇÃO SALESFORCE
 Design Premium Unificado, Logs Persistentes, Seleção Total e Processamento em Lote.
-Ajustado para garantir paridade de campos e correção de autenticação.
+Corrigido erro de colunas duplicadas e garantida paridade de campos.
 """
 from __future__ import annotations
 
@@ -32,7 +32,10 @@ except ImportError:
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
 COR_VERMELHO_ESCURO = "#9e0828"
+COR_BORDA = "#eef2f6"
 URL_LOGO_DIRECIONAL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
+LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
+FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
 
 # Mapeamento de Naturalidade (Capitais por UF)
 CAPITAIS_MAP = {
@@ -82,11 +85,36 @@ def aplicar_estilo_gestao():
         .log-divider {{ border: 0; border-top: 1px solid #f1f5f9; margin: 10px 0; }}
         .log-success {{ color: #16a34a; font-weight: 600; }}
         .log-error {{ color: #dc2626; font-weight: 600; }}
+        
+        .ficha-logo-wrap {{
+            text-align: center;
+            padding: 0.5rem 0 1rem 0;
+            width: 100%;
+        }}
+        .ficha-logo-wrap img {{
+            max-height: 80px; width: auto;
+            object-fit: contain; display: inline-block;
+        }}
         </style>
     """, unsafe_allow_html=True)
 
+def _resolver_png_raiz(nome: str) -> Path | None:
+    for base in (_DIR_APP, _DIR_APP.parent):
+        p = base / nome
+        if p.is_file(): return p
+    return None
+
 def _exibir_logo_topo():
-    st.markdown(f'<div style="text-align:center; padding-bottom:1rem;"><img src="{URL_LOGO_DIRECIONAL}" width="180"></div>', unsafe_allow_html=True)
+    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
+    try:
+        if path:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            st.markdown(f'<div class="ficha-logo-wrap"><img src="data:image/png;base64,{b64}" alt="Direcional" /></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
+    except:
+        st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
 
 def formatar_cpf_mascara(val: Any) -> str:
     digits = re.sub(r"\D", "", str(val or ""))
@@ -106,7 +134,6 @@ def ler_base_pendente():
     gs_sec = st.secrets["google_sheets"]
     creds_dict = json.loads(gs_sec["SERVICE_ACCOUNT_JSON"])
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    # Ajuste: Passando scopes como argumento nomeado para evitar erro de múltiplos argumentos posicionais
     gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=scopes))
     sh = gc.open_by_key(gs_sec["SPREADSHEET_ID"])
     ws = sh.worksheet(gs_sec.get("WORKSHEET_NAME", "Corretores"))
@@ -118,9 +145,23 @@ def ler_base_pendente():
     api_names = all_vals[1]
     data = all_vals[2:]
     
-    df = pd.DataFrame(data, columns=labels)
-    col_link = "Link do contato (Salesforce)"
-    if col_link in df.columns:
+    # Tratamento de duplicatas nos cabeçalhos para evitar erro no st.data_editor
+    seen = {}
+    new_labels = []
+    for h in labels:
+        h_str = str(h).strip() if h else "Vazio"
+        if h_str in seen:
+            seen[h_str] += 1
+            new_labels.append(f"{h_str}_{seen[h_str]}")
+        else:
+            seen[h_str] = 0
+            new_labels.append(h_str)
+    
+    df = pd.DataFrame(data, columns=new_labels)
+    
+    # Identificar coluna de link (buscando pelo rótulo original ou normalizado)
+    col_link = next((c for c in df.columns if "Link do contato (Salesforce)" in c), None)
+    if col_link:
         df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
     else:
         df_pendentes = df
@@ -140,7 +181,8 @@ def atualizar_linha_base(ws: Any, df_idx_orig: int, status: str, log: str, link:
     except: pass
 
 def main():
-    st.set_page_config(page_title="Gestão | Direcional", layout="wide")
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav) if fav else None, layout="wide")
     aplicar_estilo_gestao()
     _exibir_logo_topo()
     st.markdown('<p style="text-align:center; font-family:Montserrat; font-weight:900; font-size:1.8rem; color:#04428f; margin:0;">Dashboard de Integração Salesforce</p>', unsafe_allow_html=True)
@@ -156,12 +198,12 @@ def main():
 
     if df.empty:
         st.info("Nenhum cadastro pendente encontrado.")
-        if st.button("Limpar Histórico e Recarregar"):
+        if st.button("Limpar historico e realizar nova consulta"):
             st.session_state['gestao_logs'] = []
             st.rerun()
         return
 
-    st.markdown(f"### Cadastros sem Link Salesforce ({len(df)})")
+    st.markdown(f"### Cadastros pendentes ({len(df)})")
     sel_total = st.toggle("Selecionar todos os pendentes", value=False)
 
     df_sel = df.copy()
@@ -176,43 +218,50 @@ def main():
     selecionados = edited_df[edited_df["Selecionar"] == True]
 
     if not selecionados.empty:
-        if st.button(f"Processar envio de {len(selecionados)} corretores", type="primary", use_container_width=True):
+        if st.button(f"Realizar envio de {len(selecionados)} corretores selecionados", type="primary", use_container_width=True):
             sf = conectar_salesforce()
             if not sf:
-                st.error("Erro no Salesforce. Verifique os Secrets.")
+                st.error("Falha na autenticacao com Salesforce. Verifique os Secrets.")
                 return
 
             prog = st.progress(0.0)
             status_t = st.empty()
             sucessos, falhas = 0, 0
             
-            # Normalização de rótulos para garantir paridade na associação
-            map_api = {normalize_text(label): api for label, api in zip(df.columns, api_names)}
+            # Map API names using original labels (ignoring the deduplication suffix for mapping)
+            # Row 1 Labels correspond to Row 2 API Names
+            original_labels = ws.row_values(1)
+            map_api = {normalize_text(label): api for label, api in zip(original_labels, api_names)}
 
             for i, (idx_df, row) in enumerate(selecionados.iterrows()):
-                nome = row.get("Nome completo *") or row.get("Nome completo") or "Candidato"
+                # Use normalized key access to handle deduplicated column names
+                nome_key = next((k for k in row.index if "Nome completo" in k), "Nome completo *")
+                nome = row.get(nome_key) or "Candidato"
                 status_t.markdown(f"**Integrando:** {nome}")
                 
                 try:
                     payload = {}
-                    estado_civil_normal = normalize_text(row.get("Estado Civil *") or row.get("Estado Civil"))
-                    uf_nasc_raw = str(row.get("UF Naturalidade *") or row.get("UF Naturalidade") or "").strip().upper()
+                    ec_key = next((k for k in row.index if "Estado Civil" in k), "Estado Civil *")
+                    estado_civil_normal = normalize_text(row.get(ec_key))
+                    
+                    uf_key = next((k for k in row.index if "UF Naturalidade" in k), "UF Naturalidade *")
+                    uf_nasc_raw = normalize_text(row.get(uf_key))
 
                     for col_label, val in row.items():
                         if col_label == "Selecionar": continue
-                        norm_col = normalize_text(col_label)
+                        # Remove deduplication suffix for lookup
+                        clean_label = re.sub(r'_\d+$', '', col_label)
+                        norm_col = normalize_text(clean_label)
                         api_key = map_api.get(norm_col)
                         
-                        if api_key and api_key not in ["Timestamp", "Salesforce_Link", "Status_Envio", "Log_Erro", "N/A"]:
-                            # Lógica: Nome do Cônjuge só se for Casado
+                        if api_key and api_key not in ["Timestamp", "Link_SF", "Status_Envio", "Log_Erro", "N/A"]:
+                            # Logica: Nome do Conjuge so se for Casado
                             if "CONJUGE" in norm_col or "Nome_do_Conjuge__c" == api_key:
-                                if "CASADO" not in estado_civil_normal:
-                                    continue
+                                if "CASADO" not in estado_civil_normal: continue
                             
-                            # Lógica: Naturalidade fixa por UF
+                            # Logica: Naturalidade fixa por UF
                             if "NATURALIDADE" in norm_col and "UF" not in norm_col:
-                                if uf_nasc_raw in CAPITAIS_MAP:
-                                    val = CAPITAIS_MAP[uf_nasc_raw]
+                                if uf_nasc_raw in CAPITAIS_MAP: val = CAPITAIS_MAP[uf_nasc_raw]
 
                             if "CPF" in norm_col: val = formatar_cpf_mascara(val)
                             if "REGIONAL" in norm_col and normalize_text(val) == "RH": val = "RJ"
@@ -229,11 +278,12 @@ def main():
                     
                     if cid:
                         link = f"https://direcional.lightning.force.com/lightning/r/Contact/{cid}/view"
-                        atualizar_linha_base(ws, idx_df, "Sucesso", "OK", link)
-                        st.session_state['gestao_logs'].append({"status": "sucesso", "msg": f"Sucesso: {nome} enviado."})
+                        atualizar_linha_base(ws, idx_df, "Sucesso", "Integrado com sucesso", link)
+                        st.session_state['gestao_logs'].append({"status": "sucesso", "msg": f"Sucesso: {nome} integrado com sucesso."})
                         sucessos += 1
                     else:
-                        atualizar_linha_base(ws, idx_df, "Erro", "Sem ID")
+                        atualizar_linha_base(ws, idx_df, "Erro", "Salesforce nao retornou ID")
+                        st.session_state['gestao_logs'].append({"status": "erro", "msg": f"Erro: {nome} - Salesforce nao retornou ID."})
                         falhas += 1
                 except Exception as e:
                     msg_erro = str(e)[:300]
@@ -244,19 +294,23 @@ def main():
                 time.sleep(0.5)
                 prog.progress((i + 1) / len(selecionados))
 
-            status_t.success(f"Fim do lote. Sucessos: {sucessos} | Falhas: {falhas}")
+            status_t.success(f"Processamento concluido. Sucessos: {sucessos} | Falhas: {falhas}")
             st.rerun()
 
     if st.session_state['gestao_logs']:
-        st.markdown("### Histórico de Processamento")
-        l_html = '<div class="log-container">'
+        st.markdown("### Historico de Processamento")
+        log_html = '<div class="log-container">'
         for i, log in enumerate(reversed(st.session_state['gestao_logs'])):
-            cls = "log-success" if log['status'] == "sucesso" else "log-error"
-            l_html += f'<div class="log-entry {cls}">{log["msg"]}</div>'
-            if i < len(st.session_state['gestao_logs']) - 1: l_html += '<hr class="log-divider">'
-        l_html += '</div>'
-        st.markdown(l_html, unsafe_allow_html=True)
-        if st.button("Limpar histórico e realizar nova consulta", use_container_width=True):
+            clase = "log-success" if log['status'] == "sucesso" else "log-error"
+            log_html += f'<div class="log-entry {clase}">{log["msg"]}</div>'
+            if i < len(st.session_state['gestao_logs']) - 1:
+                log_html += '<hr class="log-divider">'
+        log_html += '</div>'
+        
+        st.markdown(log_html, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Limpar historico e realizar nova consulta", use_container_width=True):
             st.session_state['gestao_logs'] = []
             st.rerun()
 
