@@ -3,7 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 2: GESTÃO E INTEGRAÇÃO SALESFORCE
 Design Premium Unificado, Logs Persistentes, Seleção Total e Processamento em Lote.
-Corrigido erro de colunas duplicadas e garantida paridade de campos.
+Corrigido erro de mapeamento de API (No such column URL).
 """
 from __future__ import annotations
 
@@ -28,14 +28,12 @@ try:
 except ImportError:
     Salesforce = None
 
-# --- Constantes de Design (Idênticas ao App 1) ---
+# --- Constantes de Design (Sincronizadas com App 1) ---
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
 COR_VERMELHO_ESCURO = "#9e0828"
 COR_BORDA = "#eef2f6"
 URL_LOGO_DIRECIONAL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
-LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
-FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
 
 # Mapeamento de Naturalidade (Capitais por UF)
 CAPITAIS_MAP = {
@@ -51,7 +49,7 @@ def normalize_text(text: Any) -> str:
     if text is None: return ""
     s = str(text).strip().upper()
     s = "".join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-    return re.sub(r'[^A-Z0-9]', '', s) # Mantém apenas alfanuméricos para comparação de chaves
+    return re.sub(r'[^A-Z0-9]', '', s)
 
 def _hex_rgb_triplet(hex_color: str) -> str:
     x = hex_color.lstrip("#")
@@ -74,7 +72,7 @@ def aplicar_estilo_gestao():
         }}
         .block-container {{
             max-width: 1200px !important; padding: 2rem !important; background: rgba(255, 255, 255, 0.88) !important;
-            backdrop-filter: blur(20px); border-radius: 24px !important; box-shadow: 0 24px 48px -12px rgba(4,66,143,0.25);
+            backdrop-filter: blur(20px); border-radius: 24px !important; box-shadow: 0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.25);
             margin-top: 20px !important;
         }}
         h1, h2, h3 {{ font-family: 'Montserrat' !important; color: {COR_AZUL_ESC} !important; }}
@@ -98,23 +96,8 @@ def aplicar_estilo_gestao():
         </style>
     """, unsafe_allow_html=True)
 
-def _resolver_png_raiz(nome: str) -> Path | None:
-    for base in (_DIR_APP, _DIR_APP.parent):
-        p = base / nome
-        if p.is_file(): return p
-    return None
-
 def _exibir_logo_topo():
-    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
-    try:
-        if path:
-            with open(path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            st.markdown(f'<div class="ficha-logo-wrap"><img src="data:image/png;base64,{b64}" alt="Direcional" /></div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
-    except:
-        st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
 
 def formatar_cpf_mascara(val: Any) -> str:
     digits = re.sub(r"\D", "", str(val or ""))
@@ -134,6 +117,7 @@ def ler_base_pendente():
     gs_sec = st.secrets["google_sheets"]
     creds_dict = json.loads(gs_sec["SERVICE_ACCOUNT_JSON"])
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    # Ajuste: Passando scopes nominalmente
     gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=scopes))
     sh = gc.open_by_key(gs_sec["SPREADSHEET_ID"])
     ws = sh.worksheet(gs_sec.get("WORKSHEET_NAME", "Corretores"))
@@ -145,7 +129,7 @@ def ler_base_pendente():
     api_names = all_vals[1]
     data = all_vals[2:]
     
-    # Tratamento de duplicatas nos cabeçalhos para evitar erro no st.data_editor
+    # Tratamento de duplicatas nos cabeçalhos
     seen = {}
     new_labels = []
     for h in labels:
@@ -159,7 +143,7 @@ def ler_base_pendente():
     
     df = pd.DataFrame(data, columns=new_labels)
     
-    # Identificar coluna de link (buscando pelo rótulo original ou normalizado)
+    # Filtro: Mostrar somente quem não tem o Link do contato (Salesforce)
     col_link = next((c for c in df.columns if "Link do contato (Salesforce)" in c), None)
     if col_link:
         df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
@@ -181,8 +165,7 @@ def atualizar_linha_base(ws: Any, df_idx_orig: int, status: str, log: str, link:
     except: pass
 
 def main():
-    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
-    st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav) if fav else None, layout="wide")
+    st.set_page_config(page_title="Dashboard | Direcional", layout="wide")
     aplicar_estilo_gestao()
     _exibir_logo_topo()
     st.markdown('<p style="text-align:center; font-family:Montserrat; font-weight:900; font-size:1.8rem; color:#04428f; margin:0;">Dashboard de Integração Salesforce</p>', unsafe_allow_html=True)
@@ -228,13 +211,11 @@ def main():
             status_t = st.empty()
             sucessos, falhas = 0, 0
             
-            # Map API names using original labels (ignoring the deduplication suffix for mapping)
-            # Row 1 Labels correspond to Row 2 API Names
+            # Normalização de rótulos para associação
             original_labels = ws.row_values(1)
             map_api = {normalize_text(label): api for label, api in zip(original_labels, api_names)}
 
             for i, (idx_df, row) in enumerate(selecionados.iterrows()):
-                # Use normalized key access to handle deduplicated column names
                 nome_key = next((k for k in row.index if "Nome completo" in k), "Nome completo *")
                 nome = row.get(nome_key) or "Candidato"
                 status_t.markdown(f"**Integrando:** {nome}")
@@ -249,17 +230,18 @@ def main():
 
                     for col_label, val in row.items():
                         if col_label == "Selecionar": continue
-                        # Remove deduplication suffix for lookup
                         clean_label = re.sub(r'_\d+$', '', col_label)
                         norm_col = normalize_text(clean_label)
                         api_key = map_api.get(norm_col)
                         
-                        if api_key and api_key not in ["Timestamp", "Link_SF", "Status_Envio", "Log_Erro", "N/A"]:
-                            # Logica: Nome do Conjuge so se for Casado
-                            if "CONJUGE" in norm_col or "Nome_do_Conjuge__c" == api_key:
-                                if "CASADO" not in estado_civil_normal: continue
+                        # Defesa: Se a api_key for link ou invalida, ignora
+                        if not api_key or str(api_key).startswith("http") or len(str(api_key)) > 60: continue
+
+                        if api_key not in ["Timestamp", "Link_SF", "Status_Envio", "Log_Erro", "N/A"]:
+                            # Nome Conjuge
+                            if "CONJUGE" in norm_col and "CASADO" not in estado_civil_normal: continue
                             
-                            # Logica: Naturalidade fixa por UF
+                            # Naturalidade
                             if "NATURALIDADE" in norm_col and "UF" not in norm_col:
                                 if uf_nasc_raw in CAPITAIS_MAP: val = CAPITAIS_MAP[uf_nasc_raw]
 
@@ -268,6 +250,7 @@ def main():
                             
                             payload[api_key] = str(val)
 
+                    # Ajuste de Nome para Contato
                     partes = str(nome).split(None, 1)
                     payload["FirstName"] = partes[0][:40]
                     payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
@@ -283,7 +266,6 @@ def main():
                         sucessos += 1
                     else:
                         atualizar_linha_base(ws, idx_df, "Erro", "Salesforce nao retornou ID")
-                        st.session_state['gestao_logs'].append({"status": "erro", "msg": f"Erro: {nome} - Salesforce nao retornou ID."})
                         falhas += 1
                 except Exception as e:
                     msg_erro = str(e)[:300]
