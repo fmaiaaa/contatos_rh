@@ -3,7 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 1: FORMULÁRIO DE ENTRADA DE DADOS (DESIGN ORIGINAL)
 Cabeçalho de duas linhas: Rótulo (Linha 1) e API Name (Linha 2).
-Ajustado para evitar duplicatas, formatar CPF e automatizar naturalidade.
+Configurado para a aba: Split App.
 """
 from __future__ import annotations
 
@@ -64,7 +64,6 @@ def normalize_text(text: Any) -> str:
     """Normaliza texto para garantir paridade em comparações."""
     if text is None: return ""
     s = str(text).strip().upper()
-    # Remove acentos
     s = "".join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
     return s
 
@@ -98,9 +97,8 @@ ESTADOS_UF = ["--Nenhum--"] + [u for u in REGIONAIS if u != "--Nenhum--"]
 def _z(**kw) -> Dict[str, Any]: return kw
 
 def _campos_def() -> List[Dict[str, Any]]:
-    # Esta lista define a ordem das colunas na planilha e o mapeamento de API
     return [
-        _z(key="nome_completo", label="Nome completo *", sec="Dados Pessoais", tipo="text", sf="FirstName", req=True), # FirstName sera tratado no split
+        _z(key="nome_completo", label="Nome completo *", sec="Dados Pessoais", tipo="text", sf="FirstName", req=True),
         _z(key="birthdate", label="Data de nascimento *", sec="Dados Pessoais", tipo="date", sf="Birthdate", req=True),
         _z(key="estado_civil", label="Estado Civil *", sec="Dados Pessoais", tipo="select", sf="EstadoCivil__c", opcoes=["--Nenhum--", "Solteiro", "Casado", "Divorciado", "Viúvo"], req=True),
         _z(key="nome_conjuge", label="Nome do Cônjuge", sec="Dados Pessoais", tipo="text", sf="Nome_do_Conjuge__c", req=False),
@@ -129,62 +127,35 @@ def _campos_def() -> List[Dict[str, Any]]:
         _z(key="banco", label="Banco *", sec="Dados Bancários Pessoa Física", tipo="select", sf="Banco__c", opcoes=["--Nenhum--", "001 – Banco do Brasil S.A.", "033 – Banco Santander (Brasil) S.A.", "104 – Caixa Econômica Federal", "237 – Banco Bradesco S.A."], req=True),
         _z(key="conta_bancaria", label="Conta Bancária *", sec="Dados Bancários Pessoa Física", tipo="text", sf="Conta_Banc_ria__c", req=True),
         _z(key="agencia_bancaria", label="Agência Bancária *", sec="Dados Bancários Pessoa Física", tipo="text", sf="Ag_ncia_Banc_ria__c", req=True),
-        _z(key="retorno_integracao_bancaria", label="Retorno integração conta bancária", sec="Dados Bancários Pessoa Física", tipo="text", sf="RetornoIntegracaoContaBancaria__c", req=False),
-        _z(key="tipo_conta", label="Tipo de Conta", sec="Dados Bancários Pessoa Física", tipo="select", sf="Tipo_de_Conta__c", opcoes=["--Nenhum--", "Corrente", "Poupança"], req=False),
-        _z(key="account_id", label="Nome da conta — Id (Account)", sec="Informações para contato", tipo="text", sf="AccountId", req=False),
-        _z(key="owner_id", label="Proprietário do contato", sec="Informações para contato", tipo="text", sf="OwnerId", req=False),
         _z(key="gerente_vendas", label="Gerente de vendas *", sec="Informações para contato", tipo="select", sf="Gerente_de_Vendas__c", req=True),
-        _z(key="salutation", label="Tratamento", sec="Informações para contato", tipo="select", sf="Salutation", opcoes=["--Nenhum--", "Sr.", "Sra."], req=False),
-        _z(key="apelido", label="Apelido", sec="Informações para contato", tipo="text", sf="Apelido__c", req=False),
-        _z(key="status_corretor", label="Status Corretor *", sec="Informações para contato", tipo="select", sf="Status_Corretor__c", opcoes=["--Nenhum--", "Pré credenciado", "Ativo"], req=True),
         _z(key="regional", label="Regional *", sec="Informações para contato", tipo="select", sf="Regional__c", opcoes=REGIONAIS, req=True),
-        _z(key="origem", label="Origem *", sec="Informações para contato", tipo="text", sf="Origem__c", req=True),
         _z(key="sexo", label="Sexo *", sec="Informações para contato", tipo="select", sf="Sexo__c", opcoes=SEXOS, req=True),
         _z(key="camiseta", label="Camiseta *", sec="Informações para contato", tipo="select", sf="Camiseta__c", opcoes=CAMISETAS, req=True),
         _z(key="unidade_negocio", label="Fará parte de qual rede? *", sec="Informações para contato", tipo="select", sf="Unidade_Negocio__c", opcoes=UNIDADES_NEGOCIO, req=True),
         _z(key="atividade", label="Função na operação *", sec="Informações para contato", tipo="select", sf="Atividade__c", opcoes=ATIVIDADE_VENDAS_RJ_OPTS, req=True),
-        _z(key="escolaridade", label="Escolaridade", sec="Informações para contato", tipo="select", sf="Escolaridade__c", opcoes=["--Nenhum--", "Ensino Médio", "Superior Completo"], req=False),
-        _z(key="data_entrevista", label="Data da Entrevista", sec="Informações para contato", tipo="date", sf="Data_da_Entrevista__c", req=False),
         _z(key="possui_creci", label="Possui CRECI? *", sec="CRECI/TTI", tipo="select", sf="Possui_CRECI__c", opcoes=["Sim", "Não"], req=True),
-        _z(key="data_matricula_tti", label="Data Matrícula - TTI", sec="CRECI/TTI", tipo="date", sf="Data_Matricula_TTI__c", req=False),
-        _z(key="status_creci", label="Status CRECI", sec="CRECI/TTI", tipo="select", sf="Status_CRECI__c", opcoes=["--Nenhum--", "Definitivo", "Estágio", "Pendente"], req=False),
-        _z(key="data_conclusao", label="Data de conclusão", sec="CRECI/TTI", tipo="date", sf="Data_de_conclusao__c", req=False),
         _z(key="creci", label="CRECI", sec="CRECI/TTI", tipo="text", sf="CRECI__c", req=False),
-        _z(key="observacoes_creci", label="Observações", sec="CRECI/TTI", tipo="text", sf="Observacoes__c", req=False),
-        _z(key="validade_creci", label="Validade CRECI", sec="CRECI/TTI", tipo="date", sf="Validade_CRECI__c", req=False),
-        _z(key="nome_responsavel", label="Nome do Responsável", sec="CRECI/TTI", tipo="text", sf="Nome_do_Responsavel__c", req=False),
-        _z(key="creci_responsavel", label="CRECI do Responsável", sec="CRECI/TTI", tipo="text", sf="CRECI_do_Responsavel__c", req=False),
-        _z(key="tipo_comissionamento", label="Tipo de Comissionamento", sec="CRECI/TTI", tipo="text", sf="N/A", req=False),
-        _z(key="preferred_contact_method", label="Preferência de contato", sec="Preferência de contato", tipo="text", sf="Preferred_Contact_Method__c", req=False),
-        _z(key="multiplicador_nivel", label="Multiplicador de Nível", sec="Dados de Usuário", tipo="text", sf="Multiplicador__c", req=False),
-        _z(key="multiplicador_regime", label="Multiplicador de Regime", sec="Dados de Usuário", tipo="text", sf="Multiplicador_de_Regime__c", req=False),
-        _z(key="tipo_corretor", label="Tipo Corretor *", sec="Dados Integração", tipo="text", sf="Tipo_Corretor__c", req=False),
-        _z(key="data_contrato", label="Data Contrato", sec="Dados Integração", tipo="date", sf="Data_Contrato__c", req=False),
-        _z(key="data_credenciamento", label="Data Credenciamento", sec="Dados Integração", tipo="date", sf="Data_Credenciamento__c", req=False),
-        _z(key="codigo_pessoa_uau", label="Código Pessoa UAU", sec="Dados Integração", tipo="text", sf="C_digo_Pessoa_UAU__c", req=False),
-        _z(key="erro_integracao_uau", label="Erro Integração UAU", sec="Dados Integração", tipo="text", sf="ErroIntegracaoUAU__c", req=False),
-        _z(key="retorno_integracao_pessoa", label="Retorno Integração Pessoa", sec="Dados Integração", tipo="text", sf="RetornoIntegracaoPessoa__c", req=False),
+        _z(key="status_creci", label="Status CRECI", sec="CRECI/TTI", tipo="select", sf="Status_CRECI__c", opcoes=["--Nenhum--", "Definitivo", "Estágio", "Pendente"], req=False),
     ]
 
 CAMPOS = _campos_def()
-CAMPOS_OCULTOS_FORMULARIO = frozenset({"multiplicador_nivel", "multiplicador_regime", "tipo_corretor", "data_contrato", "data_credenciamento", "codigo_pessoa_uau", "erro_integracao_uau", "retorno_integracao_pessoa", "retorno_integracao_bancaria", "apelido", "salutation", "data_entrevista"})
+CAMPOS_OCULTOS_FORMULARIO = frozenset({"salutation", "apelido", "data_entrevista", "data_contrato", "data_credenciamento"})
 
 # =============================================================================
-# LÓGICA DE FORMATAÇÃO E ORGANIZAÇÃO DA BASE (CRIAR E LIMPAR)
+# LÓGICA DE FORMATAÇÃO E ORGANIZAÇÃO DA BASE (Aba: Split App)
 # =============================================================================
 def _aplicar_organizacao_planilha(ws: Any):
-    """Garante cabeçalho de duas linhas e cores por seção na base sem duplicatas."""
+    """Garante cabeçalho de duas linhas e cores por seção na base Split App."""
     headers_row1 = ["Data e hora do envio", "Link do contato (Salesforce)"] + [c["label"] for c in CAMPOS] + ["Envio?", "Log / erro"]
     headers_row2 = ["Timestamp", "Link_SF"] + [c["sf"] if c["sf"] else "N/A" for c in CAMPOS] + ["Status_Envio", "Log_Erro"]
     
-    # Limpeza e reset se necessário (ou apenas garante cabeçalho)
-    try:
-        ws.update("A1", [headers_row1, headers_row2])
-    except: pass
+    current_values = ws.get_all_values()
+    # Sempre garante que as duas primeiras linhas são o cabeçalho técnico
+    ws.update("A1:ZZ2", [headers_row1, headers_row2])
     
     try:
-        from gspread_formatting import format_cell_range, CellFormat, Color, TextFormat, Border, BorderStyle
-        # Azul Direcional para cabeçalho
+        from gspread_formatting import format_cell_range, CellFormat, Color, TextFormat
+        # Estilo cabeçalho: Azul Direcional
         fmt = CellFormat(backgroundColor=Color(0.01, 0.25, 0.56), textFormat=TextFormat(foregroundColor=Color(1, 1, 1), bold=True))
         format_cell_range(ws, "A1:ZZ2", fmt)
     except: pass
@@ -203,7 +174,7 @@ def aplicar_estilo():
         }}
         .block-container {{
             max-width: 920px !important; padding: 2rem !important; background: rgba(255, 255, 255, 0.85) !important;
-            backdrop-filter: blur(18px); border-radius: 24px !important; box-shadow: 0 24px 48px -12px rgba(4,66,143,0.25);
+            backdrop-filter: blur(18px); border-radius: 24px !important; box-shadow: 0 24px 48px -12px rgba(4,66,143,0.18);
             margin-top: 20px !important;
         }}
         h1, h2, h3 {{ font-family: 'Montserrat' !important; color: {COR_AZUL_ESC} !important; }}
@@ -225,7 +196,7 @@ def _exibir_logo_topo():
     st.markdown(f'<div style="text-align:center; padding-bottom:1rem;"><img src="{URL_LOGO_DIRECIONAL_EMAIL}" width="180"></div>', unsafe_allow_html=True)
 
 # =============================================================================
-# BACKEND (SALVAMENTO NA BASE)
+# BACKEND (SALVAMENTO NA ABA SPLIT APP)
 # =============================================================================
 def _processar_envio_cadastro():
     ss = st.session_state
@@ -243,18 +214,14 @@ def _processar_envio_cadastro():
         from google.oauth2.service_account import Credentials
         gs_cfg = st.secrets["google_sheets"]
         creds_dict = json.loads(gs_cfg["SERVICE_ACCOUNT_JSON"])
-        # Correção: Passando scopes nominalmente
         gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]))
         
         sh = gc.open_by_key(gs_cfg["SPREADSHEET_ID"])
-        ws = sh.worksheet(gs_cfg.get("WORKSHEET_NAME", "Corretores"))
+        # Agora utiliza a aba Split App
+        ws = sh.worksheet("Split App")
         
         _aplicar_organizacao_planilha(ws)
         
-        # Paridade: Nome do Conjuge apenas se Casado
-        est_civil = normalize_text(dados.get("estado_civil", ""))
-        if "CASADO" not in est_civil: dados["nome_conjuge"] = ""
-            
         # Paridade: Naturalidade Fixa por UF
         uf_nasc = str(dados.get("uf_naturalidade", "")).strip().upper()
         if uf_nasc in CAPITAIS_MAP: dados["naturalidade"] = CAPITAIS_MAP[uf_nasc]
@@ -264,7 +231,11 @@ def _processar_envio_cadastro():
         for c in CAMPOS:
             v = dados.get(c["key"], "")
             if c["key"] == "cpf": v = formatar_cpf_mascara(v)
+            # Se for Conjuge e nao for Casado, limpa
+            if c["key"] == "nome_conjuge" and "CASADO" not in normalize_text(dados.get("estado_civil", "")):
+                v = ""
             linha.append(str(v) if v is not None else "")
+            
         linha.extend(["Pendente", "Aguardando envio via Dashboard"])
         
         ws.append_row(linha, value_input_option="USER_ENTERED")
@@ -284,7 +255,7 @@ def main():
 
     if ss["ficha_sucesso"]:
         _exibir_logo_topo()
-        st.success("✓ Cadastro realizado com sucesso na base de dados!")
+        st.success("✓ Cadastro realizado com sucesso na base Split App!")
         st.video(URL_YOUTUBE_BOAS_VINDAS_RH_EMBED)
         if st.button("Fazer novo cadastro"):
             for k in list(ss.keys()): del ss[k]
@@ -305,7 +276,7 @@ def main():
         st.markdown(f'<p class="section-head">{sec}</p>', unsafe_allow_html=True)
         cols_vis = [c for c in CAMPOS if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO]
         
-        # Ocultar Nome do Cônjuge dinamicamente
+        # Ocultar Nome do Cônjuge se não for Casado
         est_civil_atual = normalize_text(ss.get("fld_estado_civil", ""))
         if "CASADO" not in est_civil_atual:
             cols_vis = [c for c in cols_vis if c["key"] != "nome_conjuge"]
