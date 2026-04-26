@@ -3,6 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 1: FORMULÁRIO DE ENTRADA DE DADOS (DESIGN ORIGINAL)
 Removido upload de arquivo CRECI. Organização visual da planilha restaurada.
+Corrigida a limitação da data de nascimento.
 """
 from __future__ import annotations
 
@@ -328,7 +329,11 @@ def _widget_campo(c):
     
     if tipo == "text": st.text_input(label, key=sk, label_visibility=lv)
     elif tipo == "select": st.selectbox(label, options=c.get("opcoes", []), key=sk, label_visibility=lv)
-    elif tipo == "date": st.date_input(label, key=sk, format="DD/MM/YYYY", label_visibility=lv)
+    elif tipo == "date":
+        # Corrigida a limitação de data de nascimento (mínimo de 1900 até hoje)
+        min_d = date(1900, 1, 1)
+        max_d = date.today()
+        st.date_input(label, key=sk, format="DD/MM/YYYY", label_visibility=lv, min_value=min_d, max_value=max_d)
 
 def main():
     st.set_page_config(page_title="Credenciamento | Direcional", layout="centered")
@@ -371,7 +376,7 @@ def main():
                     _widget_campo(c1)
             
             if idx == len(secoes) - 1:
-                st.checkbox("Declaro que li e aceito os termos da LGPD. *", key="fld_lgpd_ficha")
+                st.checkbox("Declaro que li e aceito os termos de uso de dados conforme a LGPD. *", key="fld_lgpd_ficha")
             
             st.markdown("<br>", unsafe_allow_html=True)
             col_b, col_n = st.columns(2)
