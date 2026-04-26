@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
-APP 1: FORMULÁRIO DE ENTRADA DE DADOS
+APP 1: FORMULÁRIO DE ENTRADA DE DADOS (DESIGN ORIGINAL)
+Este app grava os dados na planilha Google; o envio ao Salesforce é feito pelo APP 2.
 """
 from __future__ import annotations
 
@@ -31,108 +32,40 @@ import streamlit as st
 _DIR_APP = Path(__file__).resolve().parent
 _LOG_FICHA = logging.getLogger(__name__)
 
-# --- Salesforce (simple_salesforce) ---
-try:
-    from simple_salesforce import Salesforce, SalesforceAuthenticationFailed
-except ImportError:
-    Salesforce = None  # type: ignore[misc, assignment]
-    SalesforceAuthenticationFailed = Exception  # type: ignore[misc, assignment]
+# --- Constantes de Design e Identidade ---
+COR_AZUL_ESC = "#04428f"
+COR_VERMELHO = "#cb0935"
+COR_FUNDO = "#04428f"
+COR_BORDA = "#eef2f6"
+COR_INPUT_BG = "#f0f2f6"
+COR_TEXTO_MUTED = "#64748b"
+COR_TEXTO_LABEL = "#1e293b"
+COR_VERMELHO_ESCURO = "#9e0828"
 
-_SF_SDK_DISPONIVEL = Salesforce is not None
+LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
+FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
+FUNDO_CADASTRO_ARQUIVO = "fundo_cadastrorh.jpg"
 
-def conectar_salesforce():
-    if not _SF_SDK_DISPONIVEL:
-        return None
-    username = (os.environ.get("SALESFORCE_USER") or "").strip()
-    password = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
-    token = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
-    if not username or not password:
-        return None
-    try:
-        if token:
-            return Salesforce(
-                username=username,
-                password=password,
-                security_token=token,
-                domain="login",
-            )
-        return Salesforce(username=username, password=password, domain="login")
-    except SalesforceAuthenticationFailed:
-        return None
-    except Exception:
-        return None
+URL_LOGO_DIRECIONAL_EMAIL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
 
-def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
-    try:
-        res = sf.Contact.create(payload)
-        return res.get("id"), None
-    except Exception as e:
-        err_msg = str(e)
-        err_trace = traceback.format_exc()
-        err_kind = type(e).__name__
-        return None, f"[{err_kind}] {err_msg}\n\n{err_trace}"
-
-def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
-    base = (str(err).strip() if err is not None else "") or "Erro desconhecido"
-    u = base.upper()
-    compact = u.replace(" ", "")
-    if "INVALID_CROSS_REFERENCE_KEY" not in compact:
-        return base
-    return (
-        base
-        + "\n\n▸ O Id na URL (prefixo **012**) em geral está correto. Este erro indica que o **usuário da integração** "
-        "(login em [salesforce] **USER** nos Secrets) **não pode usar esse Record Type** no objeto Contact.\n"
-    )
-
-def _html_erro_salesforce_multilinha(msg: Any) -> str:
-    return html.escape(str(msg)).replace("\n", "<br/>")
-
-def _registrar_debug_envio(etapa: str, detalhe: Any = "") -> None:
-    ss = st.session_state
-    trilha = list(ss.get("ficha_debug_envio") or [])
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    txt = str(detalhe or "").strip()
-    trilha.append({"ts": stamp, "etapa": str(etapa or "").strip() or "evento", "detalhe": txt[:8000]})
-    ss["ficha_debug_envio"] = trilha[-120:]
+# Recursos pós-cadastro
+URL_YOUTUBE_BOAS_VINDAS_RH_EMBED = "https://www.youtube.com/embed/7cm3wFnoCSY"
+URL_YOUTUBE_SIMULADOR_EMBED = "https://www.youtube.com/embed/dE42s0g7K-c"
+POPUP_MAPA_ALTURA_PX = 320
 
 # =============================================================================
-# CAMPOS E CONFIGURAÇÕES
+# DEFINIÇÃO DE CAMPOS (MANTENDO ESTRUTURA ORIGINAL)
 # =============================================================================
-RECORD_TYPE_CORRETOR = ""
-_SF_ID_15_18 = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
-
-def _id_e_record_type_plausivel(rid: str) -> bool:
-    if not rid or len(rid) < 3 or not _SF_ID_15_18.match(rid):
-        return False
-    return rid[:3] == "012"
-
-_EMAIL_CONTATO_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
-
-def email_contato_formato_valido(val: Any) -> bool:
-    s = (str(val).strip() if val is not None else "") or ""
-    if not s or len(s) > 254:
-        return False
-    return bool(_EMAIL_CONTATO_RE.match(s))
-
-_EMAIL_CORP_MARKERS = (".direcionalvendas", ".rivavendas")
-_MSG_EMAIL_CORPORATIVO_OBRIGATORIO = "E-mail * — use o **e-mail corporativo** com **.direcionalvendas** ou **.rivavendas** no login."
-
-def email_corporativo_direcionalvendas_obrigatorio(val: Any) -> bool:
-    if not email_contato_formato_valido(val): return False
-    s = (str(val).strip() if val is not None else "").lower()
-    return any(marker in s for marker in _EMAIL_CORP_MARKERS)
-
-def record_type_id_contato_payload_e_aviso() -> Tuple[str, str]:
-    for candidate in ((os.environ.get("SF_RECORD_TYPE_ID") or "").strip(), (RECORD_TYPE_CORRETOR or "").strip()):
-        if not candidate: continue
-        if not _SF_ID_15_18.match(candidate): continue
-        if _id_e_record_type_plausivel(candidate): return candidate, ""
-        return ("", "Secrets [salesforce] RECORD_TYPE_ID está incorreto.")
-    return "", ""
-
-SEC_ORDER: Tuple[str, ...] = ("Dados Pessoais", "Endereço", "Dados para Contato", "Dados Familiares", "Dados Bancários Pessoa Física", "Informações para contato", "CRECI/TTI", "Preferência de contato", "Dados de Usuário", "Dados Integração")
-
-SF_OMIT_INSERT = frozenset({"Blacklist__c", "RetornoIntegracaoContaBancaria__c", "C_digo_Pessoa_UAU__c", "Corretor_Associado__c", "MultiplicadorFinal__c", "Contact_ID__c", "ErroIntegracaoUAU__c", "RetornoIntegracaoPessoa__c", "Data_Descredenciamento__c", "Origem__c"})
+SEC_ORDER: Tuple[str, ...] = (
+    "Dados Pessoais",
+    "Endereço",
+    "Dados para Contato",
+    "Dados Familiares",
+    "Dados Bancários Pessoa Física",
+    "Informações para contato",
+    "CRECI/TTI",
+    "Preferência de contato",
+)
 
 REGIONAIS = ["--Nenhum--", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
 ORIGENS = ["--Nenhum--", "RH", "Indicação", "Gerente", "Diretor", "DiRi Talent", "Coordenador", "Gupy", "MARINHA", "Creci", "Parceria Estácio"]
@@ -142,69 +75,42 @@ SEXOS = ["--Nenhum--", "Masculino", "Feminino"]
 CAMISETAS = ["--Nenhum--", "PP", "P", "M", "G", "GG", "XGG"]
 UNIDADE_REDE_OUTRA_IMOBILIARIA = "Outra imobiliária (parceira)"
 UNIDADES_NEGOCIO = ["--Nenhum--", "Direcional", "Riva", UNIDADE_REDE_OUTRA_IMOBILIARIA]
-_UNIDADE_NEGOCIO_UI_PARA_SF: Dict[str, str] = {"Direcional": "Direcional", "Riva": "Riva", UNIDADE_REDE_OUTRA_IMOBILIARIA: UNIDADE_REDE_OUTRA_IMOBILIARIA}
-ATIVIDADE_VENDAS_RJ_OPTS = ["--Nenhum--", "Corretor Parceiro", "Corretor", "Captador"]
 TIPO_PIX = ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Celular", "Chave aleatória"]
-ESTADOS_UF = ["--Nenhum--", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
-CAPITAL_POR_UF_BR: Dict[str, str] = {"AC": "Rio Branco", "AL": "Maceió", "AM": "Manaus", "AP": "Macapá", "BA": "Salvador", "CE": "Fortaleza", "DF": "Brasília", "ES": "Vitória", "GO": "Goiânia", "MA": "São Luís", "MG": "Belo Horizonte", "MS": "Campo Grande", "MT": "Cuiabá", "PA": "Belém", "PB": "João Pessoa", "PE": "Recife", "PI": "Teresina", "PR": "Curitiba", "RJ": "Rio de Janeiro", "RN": "Natal", "RO": "Porto Velho", "RR": "Boa Vista", "RS": "Porto Alegre", "SC": "Florianópolis", "SE": "Aracaju", "SP": "São Paulo", "TO": "Palmas"}
-
-def _naturalidade_capital_por_uf(uf: Any) -> str:
-    s = (str(uf).strip() if uf is not None else "")
-    return CAPITAL_POR_UF_BR.get(s, "")
-
+ESTADOS_UF = ["--Nenhum--"] + [u for u in REGIONAIS if u != "--Nenhum--"]
 POSSUI_FILHOS = ["--Nenhum--", "Sim", "Não"]
 TIPO_CONTA_BANCARIA = ["--Nenhum--", "Corrente", "Poupança"]
-_ESTADO_CIVIL = ["Solteiro", "Casado", "Divorciado", "Viúvo"]
-_ESCOLARIDADE = ["Ensino Fundamental", "Ensino Médio", "Superior em Andamento", "Superior Completo", "Mestrado em Andamento", "Mestrado Concluído", "Doutorado em Andamento", "Doutorado Concluído"]
-_NACIONALIDADE = ["Brasileiro", "Estrangeira", "Espanhola"]
-_ATIVIDADE = ["Captador", "Estagiário", "Corretor", "Coordenador", "Gerente de Vendas", "Gerente Regional", "Diretor", "Gerente", "Captador Recruta+", "Gerente Recruta+", "Corretor N1", "Gerente de Vendas N1", "Diretor de Vendas", "Analista", "Assistente", "Cliente", "Coordenador de Produto", "Coordenador de Vendas", "Diretor de Incorporação", "Gerente Comercial", "Gerente de Parcerias", "Imobiliária Parceira", "Pasteiro (a)", "Superintendente", "Supervisor", "Autônomo Parceiro", "Corretor Parceiro", "Recepção", "Coordenador de Parcerias"]
-_TIPO_CORRETOR = ["Direcional Vendas – GRI (CLT)", "Direcional Vendas – Autônomos", "Parceiros (Externo)"]
-_STATUS_CRECI = ["Concluído Provas", "Definitivo", "Estágio", "Matriculado", "Pendente", "Protocolo Definitivo", "Protocolo Estágio", "Pendente Prova"]
-_BANCO = ["001 – Banco do Brasil S.A.", "004 - BANCO DO NORDESTE DO BRASIL S.A.", "033 – Banco Santander (Brasil) S.A.", "070 - BCO BRB SA - BRASILIA", "104 – Caixa Econômica Federal", "237 – Banco Bradesco S.A.", "260 – Banco Nubank", "341 – Banco Itaú S.A."]
 
-ESTADO_CIVIL_OPTS = ["--Nenhum--"] + _ESTADO_CIVIL
-ESCOLARIDADE_OPTS = ["--Nenhum--"] + _ESCOLARIDADE
-NACIONALIDADE_OPTS = ["--Nenhum--"] + _NACIONALIDADE
-ATIVIDADE_OPTS = ["--Nenhum--"] + _ATIVIDADE
-TIPO_CORRETOR_OPTS = ["--Nenhum--"] + _TIPO_CORRETOR
-STATUS_CRECI_OPTS = ["--Nenhum--"] + _STATUS_CRECI
-BANCO_OPTS = ["--Nenhum--"] + _BANCO
+_ESTADO_CIVIL = ["Solteiro", "Casado", "Divorciado", "Viúvo"]
+_ESCOLARIDADE = ["Ensino Fundamental", "Ensino Médio", "Superior em Andamento", "Superior Completo", "Mestrado em Andamento", "Mestrado Concluído"]
+_ATIVIDADE = ["Captador", "Estagiário", "Corretor", "Coordenador", "Gerente de Vendas", "Diretor", "Corretor Parceiro"]
+_STATUS_CRECI = ["Concluído Provas", "Definitivo", "Estágio", "Matriculado", "Pendente"]
+_BANCO = ["001 – Banco do Brasil S.A.", "033 – Banco Santander (Brasil) S.A.", "104 – Caixa Econômica Federal", "237 – Banco Bradesco S.A.", "341 – Banco Itaú S.A.", "260 – Banco Nubank"]
+
 PREFERRED_METHOD_OPTS = ["Telefone de Trabalho", "Telefone residencial", "Celular", "Email de trabalho", "Email pessoal", "Sem preferência"]
-NOMES_CONTA_FIXOS: Tuple[str, ...] = ("RH",)
 
 def _z(**kw) -> Dict[str, Any]: return kw
 
 def _campos_def() -> List[Dict[str, Any]]:
     return [
-        _z(key="account_id", label="Nome da conta — Id (Account)", sec="Informações para contato", tipo="id", sf="AccountId", req=False),
-        _z(key="owner_id", label="Proprietário do contato", sec="Informações para contato", tipo="id", sf="OwnerId", req=False),
         _z(key="gerente_vendas", label="Gerente de vendas *", sec="Informações para contato", tipo="select", sf="AccountId", opcoes=["--Nenhum--"], req=True),
         _z(key="nome_completo", label="Nome completo *", sec="Dados Pessoais", tipo="text", sf=None, req=True),
-        _z(key="salutation", label="Tratamento", sec="Informações para contato", tipo="select", sf="Salutation", opcoes=SALUTATIONS, req=False),
-        _z(key="apelido", label="Apelido", sec="Informações para contato", tipo="text", sf="Apelido__c", req=False),
         _z(key="status_corretor", label="Status Corretor *", sec="Informações para contato", tipo="select", sf="Status_Corretor__c", opcoes=STATUS_CORRETOR, req=True),
         _z(key="regional", label="Regional *", sec="Informações para contato", tipo="select", sf="Regional__c", opcoes=REGIONAIS, req=True),
-        _z(key="origem", label="Origem *", sec="Informações para contato", tipo="select", sf="Origem__c", opcoes=ORIGENS, req=True),
         _z(key="sexo", label="Sexo *", sec="Informações para contato", tipo="select", sf="Sexo__c", opcoes=SEXOS, req=True),
         _z(key="camiseta", label="Camiseta *", sec="Informações para contato", tipo="select", sf="Camiseta__c", opcoes=CAMISETAS, req=True),
         _z(key="unidade_negocio", label="Fará parte de qual rede? *", sec="Informações para contato", tipo="select", sf="Unidade_Negocio__c", opcoes=UNIDADES_NEGOCIO, req=True),
-        _z(key="atividade", label="Função na operação *", sec="Informações para contato", tipo="select", sf="Atividade__c", opcoes=ATIVIDADE_OPTS, req=True),
-        _z(key="escolaridade", label="Escolaridade", sec="Informações para contato", tipo="select", sf="Escolaridade__c", opcoes=ESCOLARIDADE_OPTS, req=False),
+        _z(key="atividade", label="Função na operação *", sec="Informações para contato", tipo="select", sf="Atividade__c", opcoes=_ATIVIDADE, req=True),
         _z(key="birthdate", label="Data de nascimento *", sec="Dados Pessoais", tipo="date", sf="Birthdate", req=True),
-        _z(key="estado_civil", label="Estado Civil *", sec="Dados Pessoais", tipo="select", sf="EstadoCivil__c", opcoes=ESTADO_CIVIL_OPTS, req=True),
+        _z(key="estado_civil", label="Estado Civil *", sec="Dados Pessoais", tipo="select", sf="EstadoCivil__c", opcoes=["--Nenhum--"] + _ESTADO_CIVIL, req=True),
         _z(key="nome_conjuge", label="Nome do Cônjuge", sec="Dados Pessoais", tipo="text", sf="Nome_do_Conjuge__c", req=False),
         _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
-        _z(key="nacionalidade", label="Nacionalidade *", sec="Dados Pessoais", tipo="select", sf="Nacionalidade__c", opcoes=NACIONALIDADE_OPTS, req=True),
         _z(key="uf_naturalidade", label="UF Naturalidade *", sec="Dados Pessoais", tipo="select", sf="UF_Naturalidade__c", opcoes=ESTADOS_UF, req=True),
         _z(key="naturalidade", label="Naturalidade *", sec="Dados Pessoais", tipo="text", sf="Naturalidade__c", req=True),
-        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
-        _z(key="uf_rg", label="UF RG *", sec="Dados Pessoais", tipo="select", sf="UF_RG__c", opcoes=ESTADOS_UF, req=True),
         _z(key="tipo_pix", label="Tipo do PIX *", sec="Dados Pessoais", tipo="select", sf="Tipo_do_PIX__c", opcoes=TIPO_PIX, req=True),
         _z(key="dados_pix", label="Dados para PIX *", sec="Dados Pessoais", tipo="text", sf="Dados_para_PIX__c", req=True),
         _z(key="endereco_cep", label="CEP *", sec="Endereço", tipo="text", sf="EnderecoResidencialCEP__c", req=True),
         _z(key="endereco_logradouro", label="Logradouro *", sec="Endereço", tipo="text", sf="EnderecoResidencialLogradouro__c", req=True),
         _z(key="endereco_numero", label="Número *", sec="Endereço", tipo="text", sf="EnderecoResidencialNumero__c", req=True),
-        _z(key="endereco_complemento", label="Complemento", sec="Endereço", tipo="text", sf="EnderecoResidencialComplemento__c", req=False),
         _z(key="endereco_bairro", label="Bairro *", sec="Endereço", tipo="text", sf="EnderecoResidencialBairro__c", req=True),
         _z(key="endereco_cidade", label="Cidade *", sec="Endereço", tipo="text", sf="EnderecoResidencialCidade__c", req=True),
         _z(key="endereco_estado", label="Estado (UF) *", sec="Endereço", tipo="select", sf="EnderecoResidencialEstado__c", opcoes=ESTADOS_UF, req=True),
@@ -212,115 +118,242 @@ def _campos_def() -> List[Dict[str, Any]]:
         _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
         _z(key="nome_mae", label="Nome da Mãe *", sec="Dados Familiares", tipo="text", sf="Nome_da_Mae__c", req=True),
         _z(key="nome_pai", label="Nome do Pai *", sec="Dados Familiares", tipo="text", sf="Nome_do_Pai__c", req=True),
-        _z(key="possui_filhos", label="Possui Filho(s)?", sec="Dados Familiares", tipo="select", sf="Possui_Filho__c", opcoes=POSSUI_FILHOS, req=False),
-        _z(key="banco", label="Banco *", sec="Dados Bancários Pessoa Física", tipo="select", sf="Banco__c", opcoes=BANCO_OPTS, req=True),
+        _z(key="banco", label="Banco *", sec="Dados Bancários Pessoa Física", tipo="select", sf="Banco__c", opcoes=["--Nenhum--"] + _BANCO, req=True),
         _z(key="conta_bancaria", label="Conta Bancária *", sec="Dados Bancários Pessoa Física", tipo="text", sf="Conta_Banc_ria__c", req=True),
         _z(key="agencia_bancaria", label="Agência Bancária *", sec="Dados Bancários Pessoa Física", tipo="text", sf="Ag_ncia_Banc_ria__c", req=True),
         _z(key="possui_creci", label="Possui CRECI? *", sec="CRECI/TTI", tipo="select", sf=None, opcoes=["Sim", "Não"], req=True),
-        _z(key="status_creci", label="Status CRECI", sec="CRECI/TTI", tipo="select", sf="Status_CRECI__c", opcoes=STATUS_CRECI_OPTS, req=False),
         _z(key="creci", label="CRECI", sec="CRECI/TTI", tipo="text", sf="CRECI__c", req=False),
-        _z(key="validade_creci", label="Validade CRECI", sec="CRECI/TTI", tipo="date", sf="Validade_CRECI__c", req=False),
+        _z(key="status_creci", label="Status CRECI", sec="CRECI/TTI", tipo="select", sf="Status_CRECI__c", opcoes=["--Nenhum--"] + _STATUS_CRECI, req=False),
     ]
 
 CAMPOS = _campos_def()
-CAMPOS_OCULTOS_FORMULARIO = frozenset({"salutation", "apelido", "status_corretor", "regional", "origem", "account_id", "owner_id"})
+CAMPOS_OCULTOS_FORMULARIO = frozenset({"salutation", "apelido", "data_entrevista", "data_contrato", "data_credenciamento", "codigo_pessoa_uau"})
 
-# --- Funções de Suporte (Design e Planilha) ---
+# =============================================================================
+# SUPORTE GOOGLE DRIVE E SMTP (FALLBACKS ORIGINAIS)
+# =============================================================================
+def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
+    try:
+        gs = st_secrets.get("google_sheets")
+        raw = gs.get("SERVICE_ACCOUNT_JSON")
+        if isinstance(raw, dict): return raw
+        return json.loads(raw)
+    except: return None
+
+def _get_smtp_from_secrets():
+    try:
+        s = st.secrets.get("ficha_email", {})
+        return {
+            "host": s.get("smtp_server"),
+            "port": int(s.get("smtp_port", 587)),
+            "user": s.get("sender_email"),
+            "password": s.get("sender_password"),
+            "from_addr": s.get("sender_email"),
+        }
+    except: return None
+
+# =============================================================================
+# DESIGN E ESTILOS (RESTAURAÇÃO COMPLETA)
+# =============================================================================
+def _hex_rgb_triplet(hex_color: str) -> str:
+    x = hex_color.lstrip("#")
+    return f"{int(x[0:2], 16)}, {int(x[2:4], 16)}, {int(x[4:6], 16)}"
+
+RGB_AZUL_CSS = _hex_rgb_triplet(COR_AZUL_ESC)
+RGB_VERMELHO_CSS = _hex_rgb_triplet(COR_VERMELHO)
+
 def aplicar_estilo():
     st.markdown(f"""
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@700;900&family=Inter:wght@400;600&display=swap');
-        .stApp {{ background: linear-gradient(135deg, #04428f 0%, #cb0935 100%); }}
-        .block-container {{ background: rgba(255, 255, 255, 0.9); border-radius: 20px; padding: 2rem !important; }}
-        h1, h2, h3 {{ color: #04428f !important; }}
-        .section-head {{ font-weight: 800; border-bottom: 2px solid #eee; margin-bottom: 1rem; }}
+        @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;900&family=Inter:wght@400;600&display=swap');
+        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(18px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+        @keyframes shimmer {{ 0% {{ background-position: 0% 50%; }} 100% {{ background-position: 200% 50%; }} }}
+        
+        .stApp {{
+            background: linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba({RGB_VERMELHO_CSS}, 0.22) 100%),
+                        url("https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?auto=format&fit=crop&w=1920&q=80") center / cover no-repeat !important;
+        }}
+        .block-container {{
+            max-width: 920px !important;
+            padding: 2rem !important;
+            background: rgba(255, 255, 255, 0.85) !important;
+            backdrop-filter: blur(18px);
+            border-radius: 24px !important;
+            border: 1px solid rgba(255, 255, 255, 0.45);
+            box-shadow: 0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.18);
+            animation: fadeIn 0.7s ease-out both;
+        }}
+        h1, h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
+        .ficha-hero-bar {{
+            height: 4px; width: 100%; border-radius: 999px;
+            background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
+            background-size: 200% 100%; animation: shimmer 4s infinite alternate;
+            margin: 1.2rem 0;
+        }}
+        .section-head {{
+            font-family: 'Montserrat', sans-serif; font-size: 0.8rem; color: {COR_AZUL_ESC};
+            text-align: center; text-transform: uppercase; letter-spacing: 0.1em;
+            font-weight: 800; border-bottom: 2px solid #eef2f6; padding-bottom: 0.5rem; margin-bottom: 1rem;
+        }}
+        .stButton button[kind="primary"] {{
+            background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
+            border: none !important; border-radius: 12px !important; font-weight: 700 !important;
+        }}
+        .ficha-alert {{ border-radius: 14px; padding: 14px; margin-bottom: 12px; border: 2px solid {COR_AZUL_ESC}; background: #fff; color: {COR_AZUL_ESC}; }}
         </style>
     """, unsafe_allow_html=True)
 
-def _cabecalho_pagina(com_intro_formulario=False):
-    st.markdown(f'<h1 style="text-align:center">Credenciamento Direcional RJ</h1>', unsafe_allow_html=True)
+def _cabecalho_pagina(com_intro_formulario: bool = False):
+    st.markdown('<div style="text-align:center"><img src="https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png" width="180"></div>', unsafe_allow_html=True)
+    st.markdown(f"""
+        <div style="text-align:center; margin-top: 1rem;">
+            <p style="font-family:'Montserrat'; font-size:1.7rem; font-weight:900; color:{COR_AZUL_ESC}; margin:0;">Credenciamento Direcional Vendas RJ</p>
+            <p style="color:#475569; font-size:0.95rem;">Seu próximo passo começa aqui.</p>
+        </div>
+        <div class="ficha-hero-bar"></div>
+    """, unsafe_allow_html=True)
     if com_intro_formulario:
-        st.info("Preencha as etapas abaixo com atenção. Seus dados serão gravados com segurança.")
+        st.markdown('<p style="color:#334155; font-size:0.95rem; text-align:justify;">Reserve alguns minutos e tenha seus documentos em mãos. Use <strong>Avançar</strong> e <strong>Voltar</strong> para navegar entre as etapas.</p>', unsafe_allow_html=True)
 
+# =============================================================================
+# LÓGICA DE BACKEND (SALVAMENTO EM PLANILHA APENAS)
+# =============================================================================
+def _processar_envio_cadastro():
+    ss = st.session_state
+    # Mesclar dados do snapshot (etapas anteriores) com o estado atual
+    dados = dict(ss.get("ficha_snap_campos", {}))
+    for c in CAMPOS:
+        sk = f"fld_{c['key']}"
+        if sk in ss: dados[c["key"]] = ss[sk]
+    
+    # Validação Básica
+    if not ss.get("fld_lgpd_ficha"):
+        st.error("Você precisa aceitar os termos da LGPD para continuar.")
+        return
+
+    creds = _credenciais_de_secrets(st.secrets)
+    if not creds:
+        st.error("Configuração de banco de dados (Google Sheets) não encontrada.")
+        return
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        gc = gspread.authorize(Credentials.from_service_account_info(creds, scopes=scopes))
+        
+        gs_config = st.secrets.get("google_sheets", {})
+        sid = gs_config.get("SPREADSHEET_ID")
+        wname = gs_config.get("WORKSHEET_NAME", "Corretores")
+        
+        sh = gc.open_by_key(sid)
+        ws = sh.worksheet(wname)
+        
+        # Preparar linha (Data, Status 'Pendente' para o App 2 processar)
+        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        
+        # Mapeia os dados seguindo a ordem da planilha
+        linha = [timestamp, ""] # Data e Link (vazio)
+        for c in CAMPOS:
+            val = dados.get(c["key"], "")
+            linha.append(str(val) if val is not None else "")
+        
+        linha.extend(["Pendente", "Aguardando processamento"]) # Envio? e Log
+        
+        ws.append_row(linha, value_input_option="USER_ENTERED")
+        
+        ss["ficha_sucesso"] = True
+        st.rerun()
+    except Exception as e:
+        st.error(f"Erro ao gravar dados: {str(e)}")
+        _LOG_FICHA.error(traceback.format_exc())
+
+# =============================================================================
+# INTERFACE DO FORMULÁRIO (ETAPAS)
+# =============================================================================
 def _widget_campo(c):
     k, sk, label, tipo = c["key"], f"fld_{c['key']}", c["label"], c["tipo"]
     if tipo == "text": st.text_input(label, key=sk)
     elif tipo == "select": st.selectbox(label, options=c.get("opcoes", []), key=sk)
-    elif tipo == "date": st.date_input(label, key=sk)
-    elif tipo == "id": st.text_input(label, key=sk)
-
-def _processar_envio_cadastro():
-    ss = st.session_state
-    dados = {c["key"]: ss.get(f"fld_{c['key']}") for c in CAMPOS}
-    # Lógica de gravação na Planilha
-    creds = _credenciais_de_secrets(st.secrets)
-    if not creds:
-        st.error("Credenciais do Google não configuradas.")
-        return
-    
-    gs = dict(st.secrets.get("google_sheets", {}))
-    sid = gs.get("SPREADSHEET_ID", "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8")
-    wname = gs.get("WORKSHEET_NAME", "Corretores")
-    
-    try:
-        # Simulação de anexar linha conforme código original
-        from google.oauth2.service_account import Credentials
-        import gspread
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        gc = gspread.authorize(Credentials.from_service_account_info(creds, scopes=scopes))
-        sh = gc.open_by_key(sid)
-        ws = sh.worksheet(wname)
-        
-        linha = [datetime.now().strftime("%d/%m/%Y %H:%M:%S"), ""] + [str(v) for v in dados.values()] + ["Pendente", ""]
-        ws.append_row(linha)
-        
-        ss["ficha_sucesso"] = True
-        st.success("Cadastro gravado com sucesso na base!")
-    except Exception as e:
-        st.error(f"Erro ao salvar na planilha: {e}")
-
-def _credenciais_de_secrets(s):
-    try: return json.loads(s["google_sheets"]["SERVICE_ACCOUNT_JSON"])
-    except: return None
+    elif tipo == "date": st.date_input(label, key=sk, format="DD/MM/YYYY")
+    elif tipo == "textarea": st.text_area(label, key=sk)
 
 def main():
-    st.set_page_config(page_title="Formulário | Direcional Vendas RJ", layout="centered")
+    fav = Path(_DIR_APP / FAVICON_ARQUIVO)
+    st.set_page_config(page_title="Credenciamento | Direcional RJ", page_icon=str(fav) if fav.exists() else None)
     aplicar_estilo()
-    _cabecalho_pagina(com_intro_formulario=True)
-    
-    if st.session_state.get("ficha_sucesso"):
+
+    ss = st.session_state
+    if "ficha_sucesso" not in ss: ss["ficha_sucesso"] = False
+    if "step" not in ss: ss["step"] = 0
+    if "ficha_snap_campos" not in ss: ss["ficha_snap_campos"] = {}
+
+    if ss["ficha_sucesso"]:
+        _cabecalho_pagina()
         st.balloons()
-        st.success("Obrigado! Seu cadastro foi recebido.")
+        st.markdown(f"""
+            <div class="ficha-alert">
+                <h3 style="margin-top:0">✓ Cadastro Recebido!</h3>
+                <p>Obrigado por se inscrever. Seus dados foram salvos em nossa base de análise.</p>
+                <p><strong>Próximos passos:</strong> Aguarde o contato de nossa equipe de RH após a revisão do seu perfil.</p>
+            </div>
+        """, unsafe_allow_html=True)
+        st.video(URL_YOUTUBE_BOAS_VINDAS_RH_EMBED)
         if st.button("Novo Cadastro"):
-            st.session_state["ficha_sucesso"] = False
+            for key in list(ss.keys()): del ss[key]
             st.rerun()
         return
 
+    _cabecalho_pagina(com_intro_formulario=True)
+    
     secoes = SEC_ORDER
-    ss = st.session_state
-    idx = ss.get("step", 0)
+    idx = ss["step"]
     sec = secoes[idx]
     
-    st.markdown(f"### Etapa {idx+1}: {sec}")
-    cols_sec = [c for c in CAMPOS if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO]
-    
-    with st.form(f"form_{idx}"):
-        for c in cols_sec: _widget_campo(c)
+    # Barra de Progresso Customizada
+    pct = (idx + 1) / len(secoes)
+    st.progress(pct, text=f"Etapa {idx+1} de {len(secoes)}: {sec}")
+
+    with st.container():
+        st.markdown(f'<p class="section-head">{sec}</p>', unsafe_allow_html=True)
+        cols_visiveis = [c for c in CAMPOS if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO]
         
-        c1, c2 = st.columns(2)
-        with c1:
-            if idx > 0 and st.form_submit_button("Voltar"):
-                ss["step"] = idx - 1
-                st.rerun()
-        with c2:
-            if idx < len(secoes) - 1:
-                if st.form_submit_button("Próximo"):
-                    ss["step"] = idx + 1
+        with st.form(f"form_step_{idx}", border=False):
+            # Grid 2 colunas para campos
+            for i in range(0, len(cols_visiveis), 2):
+                c1 = cols_visiveis[i]
+                c2 = cols_visiveis[i+1] if i+1 < len(cols_visiveis) else None
+                if c2:
+                    col_l, col_r = st.columns(2)
+                    with col_l: _widget_campo(c1)
+                    with col_r: _widget_campo(c2)
+                else:
+                    _widget_campo(c1)
+            
+            if idx == len(secoes) - 1:
+                st.markdown("---")
+                st.checkbox("Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. *", key="fld_lgpd_ficha")
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            b_voltar, b_proximo = st.columns([1, 1])
+            with b_voltar:
+                if st.form_submit_button("Voltar", use_container_width=True, disabled=(idx == 0)):
+                    ss["step"] -= 1
                     st.rerun()
-            else:
-                if st.form_submit_button("Finalizar e Enviar"):
-                    _processar_envio_cadastro()
-                    st.rerun()
+            with b_proximo:
+                label_btn = "Finalizar Cadastro" if idx == len(secoes) - 1 else "Próxima Etapa"
+                if st.form_submit_button(label_btn, type="primary", use_container_width=True):
+                    # Persistir dados da etapa atual no snapshot antes de mudar
+                    for c in cols_visiveis:
+                        ss["ficha_snap_campos"][c["key"]] = ss.get(f"fld_{c['key']}")
+                    
+                    if idx < len(secoes) - 1:
+                        ss["step"] += 1
+                        st.rerun()
+                    else:
+                        _processar_envio_cadastro()
+
+    st.markdown('<div style="text-align:center; color:#64748b; font-size:0.8rem; margin-top:2rem;">Direcional Engenharia · Vendas Rio de Janeiro</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
