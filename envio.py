@@ -3,6 +3,7 @@
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 2: GESTÃO E INTEGRAÇÃO SALESFORCE
 Exibição de pendentes, seleção múltipla e persistência de logs.
+Ajustado para formatar CPF com máscara antes do envio.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import os
 import streamlit as st
 import pandas as pd
 import time
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 from pathlib import Path
@@ -118,6 +120,7 @@ def _resolver_png_raiz(nome: str) -> Path | None:
     return None
 
 def _exibir_logo_topo() -> None:
+    """Logo centralizada no topo: arquivo local ou URL de backup."""
     path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
     try:
         if path:
@@ -128,6 +131,13 @@ def _exibir_logo_topo() -> None:
             st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
     except:
         st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
+
+def formatar_cpf_mascara(val: Any) -> str:
+    """Garante o formato XXX.XXX.XXX-XX para validação do Salesforce."""
+    digits = re.sub(r"\D", "", str(val or ""))
+    if len(digits) != 11:
+        return digits # Retorna original se não tiver 11 dígitos para evitar erro de f-string
+    return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
 
 def conectar_salesforce():
     sf_sec = st.secrets.get("salesforce", {})
@@ -149,7 +159,6 @@ def ler_base_pendente():
     sh = gc.open_by_key(gs_sec["SPREADSHEET_ID"])
     ws = sh.worksheet(gs_sec.get("WORKSHEET_NAME", "Corretores"))
     
-    # Tratamento manual de cabeçalhos duplicados para evitar erro do pandas
     raw_data = ws.get_all_values()
     if not raw_data: return pd.DataFrame(), ws
         
@@ -167,7 +176,6 @@ def ler_base_pendente():
             
     df = pd.DataFrame(raw_data[1:], columns=new_headers)
     
-    # Filtro: Somente quem não possui link do Salesforce
     col_link = "Link Salesforce" if "Link Salesforce" in df.columns else "Link do contato (Salesforce)"
     if col_link in df.columns:
         df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
@@ -192,25 +200,6 @@ def atualizar_status_planilha(ws: Any, df_idx: int, status: str, log: str, link:
     if idx_log: ws.update_cell(row_num, idx_log, log)
     if idx_link and link: ws.update_cell(row_num, idx_link, link)
 
-def formatar_planilha_base(ws: Any):
-    """Aplica organização visual na planilha Google (Cores e Bordas)."""
-    try:
-        headers = ws.row_values(1)
-        n = len(headers)
-        
-        def rgb(r: float, g: float, b: float): return {"red": r, "green": g, "blue": b, "alpha": 1.0}
-        
-        # Batch update simplificado para o cabeçalho
-        requests = [{
-            "repeatCell": {
-                "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": n},
-                "cell": {"userEnteredFormat": {"backgroundColor": rgb(0.01, 0.25, 0.56), "textFormat": {"foregroundColor": rgb(1,1,1), "bold": True}}},
-                "fields": "userEnteredFormat(backgroundColor,textFormat)"
-            }
-        }]
-        ws.spreadsheet.batch_update({"requests": requests})
-    except: pass
-
 def main():
     fav = _resolver_png_raiz(FAVICON_ARQUIVO)
     st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav) if fav else None, layout="wide")
@@ -220,7 +209,6 @@ def main():
     st.markdown('<p style="font-family:\'Montserrat\'; font-size:1.8rem; font-weight:900; color:#04428f; text-align:center; margin:0;">Gestão de Integração Salesforce</p>', unsafe_allow_html=True)
     st.markdown('<div class="ficha-hero-bar"></div>', unsafe_allow_html=True)
 
-    # Inicializar logs no session_state
     if 'gestao_logs' not in st.session_state:
         st.session_state['gestao_logs'] = []
 
@@ -237,14 +225,12 @@ def main():
             st.rerun()
         return
 
-    # Interface de Seleção
     st.markdown("### Cadastros Pendentes")
-    col_sel_all, col_status = st.columns([1, 4])
+    col_sel_all, col_info = st.columns([1, 4])
     
     with col_sel_all:
         selecionar_todos = st.toggle("Selecionar todos", value=False)
 
-    # Preparar DataFrame para o editor
     df_display = df.copy()
     df_display.insert(0, "Selecionar", selecionar_todos)
 
@@ -260,7 +246,6 @@ def main():
 
     selecionados = edited_df[edited_df["Selecionar"] == True]
 
-    # Botão de Ação
     if not selecionados.empty:
         if st.button(f"Realizar envio de {len(selecionados)} corretores selecionados", type="primary", use_container_width=True):
             sf = conectar_salesforce()
@@ -279,18 +264,25 @@ def main():
                 status_text.markdown(f"**Integrando:** {nome}")
                 
                 try:
-                    # Payload simplificado baseado na estrutura original
                     partes = str(nome).strip().split(None, 1)
                     fname = partes[0][:40]
                     lname = (partes[1] if len(partes) > 1 else partes[0])[:80]
                     
+                    # Formatação do CPF com máscara para evitar erro de validação
+                    cpf_bruto = row.get("CPF *") or row.get("CPF")
+                    cpf_formatado = formatar_cpf_mascara(cpf_bruto)
+                    
+                    # Tratamento da Regional (Removendo "RH" se for enviado indevidamente)
+                    regional_val = row.get("Regional *") or row.get("Regional")
+                    if regional_val == "RH": regional_val = "RJ" # Fallback para opção válida
+
                     payload = {
                         "FirstName": fname,
                         "LastName": lname,
                         "Email": row.get("E-mail *") or row.get("E-mail"),
                         "MobilePhone": str(row.get("Celular *") or row.get("Celular")),
-                        "CPF__c": str(row.get("CPF *") or row.get("CPF")),
-                        "Regional__c": row.get("Regional *") or row.get("Regional"),
+                        "CPF__c": cpf_formatado,
+                        "Regional__c": regional_val,
                         "Origem__c": "RH"
                     }
                     
@@ -308,20 +300,17 @@ def main():
                         erros += 1
                 
                 except Exception as e:
-                    err_msg = str(e)[:200]
+                    err_msg = str(e)[:250]
                     atualizar_status_planilha(ws, idx, "Erro", err_msg)
                     st.session_state['gestao_logs'].append({"status": "erro", "msg": f"Falha: {nome} - {err_msg}"})
                     erros += 1
                 
-                # Pausa para visualização e atualização do tqdm (progress bar)
                 time.sleep(1.0)
                 prog_bar.progress((i + 1) / len(selecionados))
 
             status_text.success(f"Processamento concluído. Sucessos: {sucessos} | Erros: {erros}")
-            formatar_planilha_base(ws)
             st.rerun()
 
-    # Exibição dos Logs Persistentes
     if st.session_state['gestao_logs']:
         st.markdown("### Logs de Processamento")
         with st.container():
