@@ -2,8 +2,7 @@
 """
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 APP 2: GESTÃO E INTEGRAÇÃO SALESFORCE
-Design Premium Unificado, Logs Persistentes, Seleção Total e Processamento em Lote.
-Baseado na aba: Split App.
+Design Premium Unificado, Sem Sidebar, Logs Persistentes e Processamento em Lote.
 """
 from __future__ import annotations
 
@@ -17,7 +16,6 @@ import time
 import re
 import unicodedata
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
 from pathlib import Path
 
 _DIR_APP = Path(__file__).resolve().parent
@@ -28,22 +26,12 @@ try:
 except ImportError:
     Salesforce = None
 
-# --- Constantes de Design ---
+# --- Constantes de Design (Sincronizadas) ---
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
 COR_VERMELHO_ESCURO = "#9e0828"
 COR_BORDA = "#eef2f6"
 URL_LOGO_DIRECIONAL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
-LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
-FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
-
-CAPITAIS_MAP = {
-    "AC": "Rio Branco", "AL": "Maceió", "AM": "Manaus", "AP": "Macapá", "BA": "Salvador", "CE": "Fortaleza", 
-    "DF": "Brasília", "ES": "Vitória", "GO": "Goiânia", "MA": "São Luís", "MG": "Belo Horizonte", "MS": "Campo Grande", 
-    "MT": "Cuiabá", "PA": "Belém", "PB": "João Pessoa", "PE": "Recife", "PI": "Teresina", "PR": "Curitiba", 
-    "RJ": "Rio de Janeiro", "RN": "Natal", "RO": "Porto Velho", "RR": "Boa Vista", "RS": "Porto Alegre", 
-    "SC": "Florianópolis", "SE": "Aracaju", "SP": "São Paulo", "TO": "Palmas",
-}
 
 def normalize_text(text: Any) -> str:
     if text is None: return ""
@@ -72,8 +60,7 @@ def aplicar_estilo_gestao():
         }}
         .block-container {{
             max-width: 1200px !important; padding: 2rem !important; background: rgba(255, 255, 255, 0.88) !important;
-            backdrop-filter: blur(20px); border-radius: 24px !important; border: 1px solid rgba(255, 255, 255, 0.45);
-            box-shadow: 0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.25);
+            backdrop-filter: blur(20px); border-radius: 24px !important; box-shadow: 0 24px 48px -12px rgba(4,66,143,0.25);
             margin-top: 20px !important;
         }}
         h1, h2, h3 {{ font-family: 'Montserrat' !important; color: {COR_AZUL_ESC} !important; }}
@@ -89,37 +76,6 @@ def aplicar_estilo_gestao():
         </style>
     """, unsafe_allow_html=True)
 
-def _resolver_png_raiz(nome: str) -> Path | None:
-    """Procura o PNG na pasta do app e na pasta pai (raiz do repo no Streamlit Cloud)."""
-    for base in (_DIR_APP, _DIR_APP.parent):
-        p = base / nome
-        if p.is_file(): return p
-    return None
-
-def _exibir_logo_topo():
-    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
-    try:
-        if path:
-            with open(path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            st.markdown(f'<div class="ficha-logo-wrap"><img src="data:image/png;base64,{b64}" alt="Direcional" /></div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
-    except:
-        st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional" /></div>', unsafe_allow_html=True)
-
-def formatar_cpf_mascara(val: Any) -> str:
-    digits = re.sub(r"\D", "", str(val or ""))
-    if len(digits) != 11: return str(val or "")
-    return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
-
-def conectar_salesforce():
-    sf_sec = st.secrets.get("salesforce", {})
-    user, pwd, token = sf_sec.get("USER", ""), sf_sec.get("PASSWORD", ""), sf_sec.get("TOKEN", "")
-    if not (user and pwd and token): return None
-    try: return Salesforce(username=user, password=pwd, security_token=token, domain="login")
-    except: return None
-
 def ler_base_pendente():
     import gspread
     from google.oauth2.service_account import Credentials
@@ -132,28 +88,11 @@ def ler_base_pendente():
     all_vals = ws.get_all_values()
     if len(all_vals) < 3: return pd.DataFrame(), ws, []
     
-    labels = all_vals[0]
-    api_names = all_vals[1]
-    data = all_vals[2:]
+    labels, api_names = all_vals[0], all_vals[1]
+    df = pd.DataFrame(all_vals[2:], columns=labels)
     
-    seen = {}
-    new_labels = []
-    for h in labels:
-        h_str = str(h).strip() if h else "Vazio"
-        if h_str in seen:
-            seen[h_str] += 1
-            new_labels.append(f"{h_str}_{seen[h_str]}")
-        else:
-            seen[h_str] = 0
-            new_labels.append(h_str)
-    
-    df = pd.DataFrame(data, columns=new_labels)
-    col_link = next((c for c in df.columns if "Link do contato (Salesforce)" in c), None)
-    if col_link:
-        df_pendentes = df[df[col_link].astype(str).str.strip() == ""]
-    else:
-        df_pendentes = df
-    
+    # Filtro: Mostrar apenas quem não possui Link do Salesforce
+    df_pendentes = df[df["Link do contato (Salesforce)"].astype(str).str.strip() == ""]
     return df_pendentes, ws, api_names
 
 def atualizar_linha_base(ws: Any, df_idx_orig: int, status: str, log: str, link: str = ""):
@@ -169,11 +108,10 @@ def atualizar_linha_base(ws: Any, df_idx_orig: int, status: str, log: str, link:
     except: pass
 
 def main():
-    fav_path = _resolver_png_raiz(FAVICON_ARQUIVO)
-    st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav_path) if fav_path else None, layout="wide")
+    st.set_page_config(page_title="Gestão | Direcional", layout="wide")
     aplicar_estilo_gestao()
-    _exibir_logo_topo()
-    st.markdown('<p style="text-align:center; font-family:Montserrat; font-weight:900; font-size:1.8rem; color:#04428f; margin:0;">Gestão de Integração Salesforce</p>', unsafe_allow_html=True)
+    st.markdown(f'<div class="ficha-logo-wrap"><img src="{URL_LOGO_DIRECIONAL}" alt="Direcional"></div>', unsafe_allow_html=True)
+    st.markdown('<p style="text-align:center; font-family:Montserrat; font-weight:900; font-size:1.8rem; color:#04428f; margin:0;">Dashboard de Integração Salesforce</p>', unsafe_allow_html=True)
     st.markdown('<div class="ficha-hero-bar"></div>', unsafe_allow_html=True)
 
     if 'gestao_logs' not in st.session_state: st.session_state['gestao_logs'] = []
@@ -185,15 +123,14 @@ def main():
         return
 
     if df.empty:
-        st.info("Nenhum cadastro pendente encontrado na aba Split App.")
+        st.info("Nenhum cadastro pendente encontrado.")
         if st.button("Limpar historico e realizar nova consulta"):
             st.session_state['gestao_logs'] = []
             st.rerun()
         return
 
-    st.markdown(f"### Cadastros pendentes ({len(df)})")
+    st.markdown(f"### Cadastros pendentes na base Split App ({len(df)})")
     sel_total = st.toggle("Selecionar todos os pendentes", value=False)
-
     df_sel = df.copy()
     df_sel.insert(0, "Selecionar", sel_total)
 
@@ -206,73 +143,56 @@ def main():
     selecionados = edited_df[edited_df["Selecionar"] == True]
 
     if not selecionados.empty:
-        if st.button(f"Realizar envio de {len(selecionados)} corretores selecionados", type="primary", use_container_width=True):
-            sf = conectar_salesforce()
-            if not sf:
-                st.error("Falha na autenticacao com Salesforce.")
-                return
+        if st.button(f"Realizar envio de {len(selecionados)} registros selecionados", type="primary", use_container_width=True):
+            sf_sec = st.secrets.get("salesforce", {})
+            user, pwd, token = sf_sec.get("USER", ""), sf_sec.get("PASSWORD", ""), sf_sec.get("TOKEN", "")
+            try:
+                sf = Salesforce(username=user, password=pwd, security_token=token, domain="login")
+                prog = st.progress(0.0)
+                status_t = st.empty()
+                sucessos, falhas = 0, 0
+                original_labels = ws.row_values(1)
+                map_api = {normalize_text(label): api for label, api in zip(original_labels, api_names)}
 
-            prog = st.progress(0.0)
-            status_t = st.empty()
-            sucessos, falhas = 0, 0
-            original_labels = ws.row_values(1)
-            map_api = {normalize_text(label): api for label, api in zip(original_labels, api_names)}
-
-            for i, (idx_df, row) in enumerate(selecionados.iterrows()):
-                nome_key = next((k for k in row.index if "Nome completo" in k), "Nome completo *")
-                nome = row.get(nome_key) or "Candidato"
-                status_t.markdown(f"**Integrando:** {nome}")
-                
-                try:
-                    payload = {}
-                    ec_key = next((k for k in row.index if "Estado Civil" in k), "Estado Civil *")
-                    estado_civil_normal = normalize_text(row.get(ec_key))
-                    uf_key = next((k for k in row.index if "UF Naturalidade" in k), "UF Naturalidade *")
-                    uf_nasc_raw = normalize_text(row.get(uf_key))
-
-                    for col_label, val in row.items():
-                        if col_label == "Selecionar": continue
-                        clean_label = re.sub(r'_\d+$', '', col_label)
-                        norm_col = normalize_text(clean_label)
-                        api_key = map_api.get(norm_col)
+                for i, (idx_df, row) in enumerate(selecionados.iterrows()):
+                    nome = row.get("Nome completo *") or "Candidato"
+                    status_t.markdown(f"**Processando:** {nome}")
+                    try:
+                        payload = {}
+                        for label, val in row.items():
+                            if label == "Selecionar": continue
+                            api_key = map_api.get(normalize_text(label))
+                            if api_key and api_key not in ["Timestamp", "Link_SF", "Status_Envio", "Log_Erro", "N/A"]:
+                                payload[api_key] = str(val)
                         
-                        if not api_key or str(api_key).startswith("http") or len(str(api_key)) > 60: continue
-
-                        if api_key not in ["Timestamp", "Link_SF", "Status_Envio", "Log_Erro", "N/A"]:
-                            if "CONJUGE" in norm_col and "CASADO" not in estado_civil_normal: continue
-                            if "NATURALIDADE" in norm_col and "UF" not in norm_col:
-                                if uf_nasc_raw in CAPITAIS_MAP: val = CAPITAIS_MAP[uf_nasc_raw]
-                            if "CPF" in norm_col: val = formatar_cpf_mascara(val)
-                            if "REGIONAL" in norm_col and normalize_text(val) == "RH": val = "RJ"
-                            payload[api_key] = str(val)
-
-                    partes = str(nome).split(None, 1)
-                    payload["FirstName"] = partes[0][:40]
-                    payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
-                    payload["Origem__c"] = "RH"
-
-                    res = sf.Contact.create(payload)
-                    cid = res.get("id")
-                    
-                    if cid:
-                        link = f"https://direcional.lightning.force.com/lightning/r/Contact/{cid}/view"
-                        atualizar_linha_base(ws, idx_df, "Sucesso", "Integrado com sucesso", link)
-                        st.session_state['gestao_logs'].append({"status": "sucesso", "msg": f"Sucesso: {nome} integrado com sucesso."})
-                        sucessos += 1
-                    else:
-                        atualizar_linha_base(ws, idx_df, "Erro", "Salesforce nao retornou ID")
+                        # Ajuste de Nome
+                        partes = str(nome).split(None, 1)
+                        payload["FirstName"] = partes[0][:40]
+                        payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
+                        
+                        res = sf.Contact.create(payload)
+                        cid = res.get("id")
+                        if cid:
+                            link = f"https://direcional.lightning.force.com/lightning/r/Contact/{cid}/view"
+                            atualizar_linha_base(ws, idx_df, "Sucesso", "Integrado", link)
+                            st.session_state['gestao_logs'].append({"status": "sucesso", "msg": f"Sucesso: {nome} enviado."})
+                            sucessos += 1
+                        else:
+                            atualizar_linha_base(ws, idx_df, "Erro", "Sem ID")
+                            falhas += 1
+                    except Exception as e:
+                        msg = str(e)[:250]
+                        atualizar_linha_base(ws, idx_df, "Erro", msg)
+                        st.session_state['gestao_logs'].append({"status": "erro", "msg": f"Falha: {nome} - {msg}"})
                         falhas += 1
-                except Exception as e:
-                    msg_erro = str(e)[:300]
-                    atualizar_linha_base(ws, idx_df, "Erro", msg_erro)
-                    st.session_state['gestao_logs'].append({"status": "erro", "msg": f"Falha: {nome} - {msg_erro}"})
-                    falhas += 1
+                    
+                    time.sleep(0.5)
+                    prog.progress((i + 1) / len(selecionados))
                 
-                time.sleep(0.5)
-                prog.progress((i + 1) / len(selecionados))
-
-            status_t.success(f"Processamento concluido. Sucessos: {sucessos} | Falhas: {falhas}")
-            st.rerun()
+                status_t.success(f"Concluido! Sucessos: {sucessos} | Falhas: {falhas}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro no Salesforce: {e}")
 
     if st.session_state['gestao_logs']:
         st.markdown("### Historico de Processamento")
@@ -280,11 +200,10 @@ def main():
         for i, log in enumerate(reversed(st.session_state['gestao_logs'])):
             clase = "log-success" if log['status'] == "sucesso" else "log-error"
             log_html += f'<div class="log-entry {clase}">{log["msg"]}</div>'
-            if i < len(st.session_state['gestao_logs']) - 1:
-                log_html += '<hr class="log-divider">'
+            if i < len(st.session_state['gestao_logs']) - 1: log_html += '<hr class="log-divider">'
         log_html += '</div>'
         st.markdown(log_html, unsafe_allow_html=True)
-        if st.button("Limpar historico e realizar novo envio", use_container_width=True):
+        if st.button("Limpar historico e novo envio"):
             st.session_state['gestao_logs'] = []
             st.rerun()
 
