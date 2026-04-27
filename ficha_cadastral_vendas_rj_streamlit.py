@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
-APP 1: FORMULÁRIO DE ENTRADA DE DADOS (DESIGN ORIGINAL)
-Cabeçalho de duas linhas: Rótulo (Linha 1) e API Name (Linha 2).
-Configurado para a aba: Split App.
+APP 1: FORMULÁRIO DE ENTRADA DE DADOS
+Design Premium, Dados Derivados, Cabeçalho de 2 Linhas e Aba Split App.
 """
 from __future__ import annotations
 
@@ -13,45 +12,23 @@ import io
 import json
 import logging
 import os
-import platform
 import re
-import smtplib
-import sys
-import time
-import traceback
-import unicodedata
-from datetime import date, datetime, timezone
-from pathlib import Path
-from xml.sax.saxutils import escape as _xml_escape_para_pdf
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-import requests
 import streamlit as st
+import unicodedata
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 _DIR_APP = Path(__file__).resolve().parent
-_LOG_FICHA = logging.getLogger(__name__)
 
-# --- Constantes de Design e Identidade ---
+# --- Constantes de Design ---
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
-COR_FUNDO = "#04428f"
-COR_BORDA = "#eef2f6"
-COR_INPUT_BG = "#f0f2f6"
-COR_TEXTO_MUTED = "#64748b"
-COR_TEXTO_LABEL = "#1e293b"
 COR_VERMELHO_ESCURO = "#9e0828"
+COR_BORDA = "#eef2f6"
+COR_TEXTO_LABEL = "#1e293b"
+URL_LOGO_DIRECIONAL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
 
-LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
-FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
-URL_LOGO_DIRECIONAL_EMAIL = "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
-
-URL_YOUTUBE_BOAS_VINDAS_RH_EMBED = "https://www.youtube.com/embed/7cm3wFnoCSY"
-POPUP_MAPA_ALTURA_PX = 320
-
-# Mapeamento de Naturalidade (Capitais por UF)
 CAPITAIS_MAP = {
     "AC": "Rio Branco", "AL": "Maceió", "AM": "Manaus", "AP": "Macapá", "BA": "Salvador", "CE": "Fortaleza", 
     "DF": "Brasília", "ES": "Vitória", "GO": "Goiânia", "MA": "São Luís", "MG": "Belo Horizonte", "MS": "Campo Grande", 
@@ -61,104 +38,75 @@ CAPITAIS_MAP = {
 }
 
 def normalize_text(text: Any) -> str:
-    """Normaliza texto para garantir paridade em comparações."""
     if text is None: return ""
     s = str(text).strip().upper()
     s = "".join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
     return s
 
 def formatar_cpf_mascara(val: Any) -> str:
-    """Garante o formato XXX.XXX.XXX-XX."""
     digits = re.sub(r"\D", "", str(val or ""))
     if len(digits) != 11: return str(val or "")
     return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
 
 # =============================================================================
-# DEFINIÇÃO DE CAMPOS (ORDEM ORGANIZADA PARA A BASE)
+# ESTRUTURA DE CAMPOS (PEDIDOS NO FORMULÁRIO)
 # =============================================================================
-SEC_ORDER: Tuple[str, ...] = (
-    "Dados Pessoais",
-    "Endereço",
-    "Dados para Contato",
-    "Dados Familiares",
-    "Dados Bancários Pessoa Física",
-    "Informações para contato",
-    "CRECI/TTI",
-    "Preferência de contato",
-)
+SEC_ORDER = ("Dados Pessoais", "Endereço", "Dados para Contato", "Dados Familiares", "Dados Bancários Pessoa Física", "Informações para contato", "CRECI/TTI")
 
-REGIONAIS = ["--Nenhum--", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
-SEXOS = ["--Nenhum--", "Masculino", "Feminino"]
-CAMISETAS = ["--Nenhum--", "PP", "P", "M", "G", "GG", "XGG"]
-UNIDADES_NEGOCIO = ["--Nenhum--", "Direcional", "Riva", "Outra imobiliária (parceira)"]
-ATIVIDADE_VENDAS_RJ_OPTS = ["--Nenhum--", "Corretor Parceiro", "Corretor", "Captador"]
-ESTADOS_UF = ["--Nenhum--"] + [u for u in REGIONAIS if u != "--Nenhum--"]
-
-def _z(**kw) -> Dict[str, Any]: return kw
-
-def _campos_def() -> List[Dict[str, Any]]:
+def _campos_def():
     return [
-        _z(key="nome_completo", label="Nome completo *", sec="Dados Pessoais", tipo="text", sf="FirstName", req=True),
-        _z(key="birthdate", label="Data de nascimento *", sec="Dados Pessoais", tipo="date", sf="Birthdate", req=True),
-        _z(key="estado_civil", label="Estado Civil *", sec="Dados Pessoais", tipo="select", sf="EstadoCivil__c", opcoes=["--Nenhum--", "Solteiro", "Casado", "Divorciado", "Viúvo"], req=True),
-        _z(key="nome_conjuge", label="Nome do Cônjuge", sec="Dados Pessoais", tipo="text", sf="Nome_do_Conjuge__c", req=False),
-        _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
-        _z(key="nacionalidade", label="Nacionalidade *", sec="Dados Pessoais", tipo="text", sf="Nacionalidade__c", req=True),
-        _z(key="uf_naturalidade", label="UF Naturalidade *", sec="Dados Pessoais", tipo="select", sf="UF_Naturalidade__c", opcoes=ESTADOS_UF, req=True),
-        _z(key="naturalidade", label="Naturalidade *", sec="Dados Pessoais", tipo="text", sf="Naturalidade__c", req=True),
-        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
-        _z(key="uf_rg", label="UF RG *", sec="Dados Pessoais", tipo="select", sf="UF_RG__c", opcoes=ESTADOS_UF, req=True),
-        _z(key="tipo_pix", label="Tipo do PIX *", sec="Dados Pessoais", tipo="select", sf="Tipo_do_PIX__c", opcoes=["--Nenhum--", "CPF", "CNPJ", "E-mail", "Celular", "Chave aleatória"], req=True),
-        _z(key="dados_pix", label="Dados para PIX *", sec="Dados Pessoais", tipo="text", sf="Dados_para_PIX__c", req=True),
-        _z(key="endereco_cep", label="CEP *", sec="Endereço", tipo="text", sf="EnderecoResidencialCEP__c", req=True),
-        _z(key="endereco_logradouro", label="Logradouro *", sec="Endereço", tipo="text", sf="EnderecoResidencialLogradouro__c", req=True),
-        _z(key="endereco_numero", label="Número *", sec="Endereço", tipo="text", sf="EnderecoResidencialNumero__c", req=True),
-        _z(key="endereco_complemento", label="Complemento", sec="Endereço", tipo="text", sf="EnderecoResidencialComplemento__c", req=False),
-        _z(key="endereco_bairro", label="Bairro *", sec="Endereço", tipo="text", sf="EnderecoResidencialBairro__c", req=True),
-        _z(key="endereco_cidade", label="Cidade *", sec="Endereço", tipo="text", sf="EnderecoResidencialCidade__c", req=True),
-        _z(key="endereco_estado", label="Estado (UF) *", sec="Endereço", tipo="select", sf="EnderecoResidencialEstado__c", opcoes=ESTADOS_UF, req=True),
-        _z(key="phone", label="Telefone", sec="Dados para Contato", tipo="text", sf="Phone", req=False),
-        _z(key="mobile", label="Celular *", sec="Dados para Contato", tipo="text", sf="MobilePhone", req=True),
-        _z(key="email", label="E-mail *", sec="Dados para Contato", tipo="text", sf="Email", req=True),
-        _z(key="nome_mae", label="Nome da Mãe *", sec="Dados Familiares", tipo="text", sf="Nome_da_Mae__c", req=True),
-        _z(key="nome_pai", label="Nome do Pai *", sec="Dados Familiares", tipo="text", sf="Nome_do_Pai__c", req=True),
-        _z(key="possui_filhos", label="Possui Filho(s)?", sec="Dados Familiares", tipo="select", sf="Possui_Filho__c", opcoes=["--Nenhum--", "Sim", "Não"], req=False),
-        _z(key="qtd_filhos", label="Quantidade de Filhos", sec="Dados Familiares", tipo="text", sf="Quantidade_de_Filhos__c", req=False),
-        _z(key="banco", label="Banco *", sec="Dados Bancários Pessoa Física", tipo="select", sf="Banco__c", opcoes=["--Nenhum--", "001 – Banco do Brasil S.A.", "033 – Banco Santander (Brasil) S.A.", "104 – Caixa Econômica Federal", "237 – Banco Bradesco S.A."], req=True),
-        _z(key="conta_bancaria", label="Conta Bancária *", sec="Dados Bancários Pessoa Física", tipo="text", sf="Conta_Banc_ria__c", req=True),
-        _z(key="agencia_bancaria", label="Agência Bancária *", sec="Dados Bancários Pessoa Física", tipo="text", sf="Ag_ncia_Banc_ria__c", req=True),
-        _z(key="gerente_vendas", label="Gerente de vendas *", sec="Informações para contato", tipo="select", sf="Gerente_de_Vendas__c", req=True),
-        _z(key="regional", label="Regional *", sec="Informações para contato", tipo="select", sf="Regional__c", opcoes=REGIONAIS, req=True),
-        _z(key="sexo", label="Sexo *", sec="Informações para contato", tipo="select", sf="Sexo__c", opcoes=SEXOS, req=True),
-        _z(key="camiseta", label="Camiseta *", sec="Informações para contato", tipo="select", sf="Camiseta__c", opcoes=CAMISETAS, req=True),
-        _z(key="unidade_negocio", label="Fará parte de qual rede? *", sec="Informações para contato", tipo="select", sf="Unidade_Negocio__c", opcoes=UNIDADES_NEGOCIO, req=True),
-        _z(key="atividade", label="Função na operação *", sec="Informações para contato", tipo="select", sf="Atividade__c", opcoes=ATIVIDADE_VENDAS_RJ_OPTS, req=True),
-        _z(key="possui_creci", label="Possui CRECI? *", sec="CRECI/TTI", tipo="select", sf="Possui_CRECI__c", opcoes=["Sim", "Não"], req=True),
-        _z(key="creci", label="CRECI", sec="CRECI/TTI", tipo="text", sf="CRECI__c", req=False),
-        _z(key="status_creci", label="Status CRECI", sec="CRECI/TTI", tipo="select", sf="Status_CRECI__c", opcoes=["--Nenhum--", "Definitivo", "Estágio", "Pendente"], req=False),
+        {"key": "nome_completo", "label": "Nome completo *", "sec": "Dados Pessoais", "tipo": "text", "sf": "FirstName", "req": True},
+        {"key": "birthdate", "label": "Data de nascimento *", "sec": "Dados Pessoais", "tipo": "date", "sf": "Birthdate", "req": True},
+        {"key": "estado_civil", "label": "Estado Civil *", "sec": "Dados Pessoais", "tipo": "select", "sf": "EstadoCivil__c", "opcoes": ["--Nenhum--", "Solteiro", "Casado", "Divorciado", "Viúvo"], "req": True},
+        {"key": "nome_conjuge", "label": "Nome do Cônjuge", "sec": "Dados Pessoais", "tipo": "text", "sf": "Nome_do_Conjuge__c", "req": False},
+        {"key": "cpf", "label": "CPF *", "sec": "Dados Pessoais", "tipo": "text", "sf": "CPF__c", "req": True},
+        {"key": "nacionalidade", "label": "Nacionalidade *", "sec": "Dados Pessoais", "tipo": "text", "sf": "Nacionalidade__c", "req": True},
+        {"key": "uf_naturalidade", "label": "UF Naturalidade *", "sec": "Dados Pessoais", "tipo": "select", "sf": "UF_Naturalidade__c", "opcoes": list(CAPITAIS_MAP.keys()), "req": True},
+        {"key": "rg", "label": "RG *", "sec": "Dados Pessoais", "tipo": "text", "sf": "RG__c", "req": True},
+        {"key": "uf_rg", "label": "UF RG *", "sec": "Dados Pessoais", "tipo": "select", "sf": "UF_RG__c", "opcoes": list(CAPITAIS_MAP.keys()), "req": True},
+        {"key": "tipo_pix", "label": "Tipo do PIX *", "sec": "Dados Pessoais", "tipo": "select", "sf": "Tipo_do_PIX__c", "opcoes": ["--Nenhum--", "CPF", "CNPJ", "E-mail", "Celular", "Chave aleatória"], "req": True},
+        {"key": "dados_pix", "label": "Dados para PIX *", "sec": "Dados Pessoais", "tipo": "text", "sf": "Dados_para_PIX__c", "req": True},
+        {"key": "endereco_cep", "label": "CEP *", "sec": "Endereço", "tipo": "text", "sf": "EnderecoResidencialCEP__c", "req": True},
+        {"key": "endereco_logradouro", "label": "Logradouro *", "sec": "Endereço", "tipo": "text", "sf": "EnderecoResidencialLogradouro__c", "req": True},
+        {"key": "endereco_numero", "label": "Número *", "sec": "Endereço", "tipo": "text", "sf": "EnderecoResidencialNumero__c", "req": True},
+        {"key": "endereco_complemento", "label": "Complemento", "sec": "Endereço", "tipo": "text", "sf": "EnderecoResidencialComplemento__c", "req": False},
+        {"key": "endereco_bairro", "label": "Bairro *", "sec": "Endereço", "tipo": "text", "sf": "EnderecoResidencialBairro__c", "req": True},
+        {"key": "endereco_cidade", "label": "Cidade *", "sec": "Endereço", "tipo": "text", "sf": "EnderecoResidencialCidade__c", "req": True},
+        {"key": "endereco_estado", "label": "Estado (UF) *", "sec": "Endereço", "tipo": "select", "sf": "EnderecoResidencialEstado__c", "opcoes": list(CAPITAIS_MAP.keys()), "req": True},
+        {"key": "mobile", "label": "Celular *", "sec": "Dados para Contato", "tipo": "text", "sf": "MobilePhone", "req": True},
+        {"key": "email", "label": "E-mail *", "sec": "Dados para Contato", "tipo": "text", "sf": "Email", "req": True},
+        {"key": "nome_mae", "label": "Nome da Mãe *", "sec": "Dados Familiares", "tipo": "text", "sf": "Nome_da_Mae__c", "req": True},
+        {"key": "nome_pai", "label": "Nome do Pai *", "sec": "Dados Familiares", "tipo": "text", "sf": "Nome_do_Pai__c", "req": True},
+        {"key": "possui_filhos", "label": "Possui Filho(s)?", "sec": "Dados Familiares", "tipo": "select", "sf": "Possui_Filho__c", "opcoes": ["Não", "Sim"], "req": False},
+        {"key": "qtd_filhos", "label": "Quantidade de Filhos", "sec": "Dados Familiares", "tipo": "text", "sf": "Quantidade_de_Filhos__c", "req": False},
+        {"key": "banco", "label": "Banco *", "sec": "Dados Bancários Pessoa Física", "tipo": "select", "sf": "Banco__c", "opcoes": ["--Nenhum--", "001 – Banco do Brasil S.A.", "033 – Banco Santander", "104 – Caixa", "237 – Bradesco", "260 – Nubank"], "req": True},
+        {"key": "conta_bancaria", "label": "Conta Bancária *", "sec": "Dados Bancários Pessoa Física", "tipo": "text", "sf": "Conta_Banc_ria__c", "req": True},
+        {"key": "agencia_bancaria", "label": "Agência Bancária *", "sec": "Dados Bancários Pessoa Física", "tipo": "text", "sf": "Ag_ncia_Banc_ria__c", "req": True},
+        {"key": "gerente_vendas", "label": "Gerente de vendas *", "sec": "Informações para contato", "tipo": "select", "sf": "Gerente_de_Vendas__c", "req": True},
+        {"key": "sexo", "label": "Sexo *", "sec": "Informações para contato", "tipo": "select", "sf": "Sexo__c", "opcoes": ["--Nenhum--", "Masculino", "Feminino"], "req": True},
+        {"key": "camiseta", "label": "Camiseta *", "sec": "Informações para contato", "tipo": "select", "sf": "Camiseta__c", "opcoes": ["--Nenhum--", "P", "M", "G", "GG"], "req": True},
+        {"key": "unidade_negocio", "label": "Fará parte de qual rede? *", "sec": "Informações para contato", "tipo": "select", "sf": "Unidade_Negocio__c", "opcoes": ["Direcional", "Riva", "Outra imobiliária (parceira)"], "req": True},
+        {"key": "atividade", "label": "Função na operação *", "sec": "Informações para contato", "tipo": "select", "sf": "Atividade__c", "opcoes": ["Corretor", "Captador", "Corretor Parceiro"], "req": True},
+        {"key": "possui_creci", "label": "Possui CRECI? *", "sec": "CRECI/TTI", "tipo": "select", "sf": "Possui_CRECI__c", "opcoes": ["Não", "Sim"], "req": True},
+        {"key": "creci", "label": "CRECI", "sec": "CRECI/TTI", "tipo": "text", "sf": "CRECI__c", "req": False},
+        {"key": "status_creci", "label": "Status CRECI", "sec": "CRECI/TTI", "tipo": "select", "sf": "Status_CRECI__c", "opcoes": ["--Nenhum--", "Definitivo", "Estágio", "Pendente"], "req": False},
     ]
 
-CAMPOS = _campos_def()
-CAMPOS_OCULTOS_FORMULARIO = frozenset({"salutation", "apelido", "data_entrevista", "data_contrato", "data_credenciamento"})
-
-# =============================================================================
-# LÓGICA DE FORMATAÇÃO E ORGANIZAÇÃO DA BASE (Aba: Split App)
-# =============================================================================
-def _aplicar_organizacao_planilha(ws: Any):
-    """Garante cabeçalho de duas linhas e cores por seção na base Split App."""
-    headers_row1 = ["Data e hora do envio", "Link do contato (Salesforce)"] + [c["label"] for c in CAMPOS] + ["Envio?", "Log / erro"]
-    headers_row2 = ["Timestamp", "Link_SF"] + [c["sf"] if c["sf"] else "N/A" for c in CAMPOS] + ["Status_Envio", "Log_Erro"]
-    
-    current_values = ws.get_all_values()
-    # Sempre garante que as duas primeiras linhas são o cabeçalho técnico
-    ws.update("A1:ZZ2", [headers_row1, headers_row2])
-    
-    try:
-        from gspread_formatting import format_cell_range, CellFormat, Color, TextFormat
-        # Estilo cabeçalho: Azul Direcional
-        fmt = CellFormat(backgroundColor=Color(0.01, 0.25, 0.56), textFormat=TextFormat(foregroundColor=Color(1, 1, 1), bold=True))
-        format_cell_range(ws, "A1:ZZ2", fmt)
-    except: pass
+# Campos totais na base (incluindo derivados)
+CAMPOS_TOTAL = _campos_def() + [
+    {"key": "naturalidade", "label": "Naturalidade *", "sf": "Naturalidade__c"},
+    {"key": "salutation", "label": "Tratamento", "sf": "Salutation"},
+    {"key": "apelido", "label": "Apelido", "sf": "Apelido__c"},
+    {"key": "regional", "label": "Regional *", "sf": "Regional__c"},
+    {"key": "status_corretor", "label": "Status Corretor *", "sf": "Status_Corretor__c"},
+    {"key": "origem", "label": "Origem *", "sf": "Origem__c"},
+    {"key": "data_entrevista", "label": "Data da Entrevista", "sf": "Data_da_Entrevista__c"},
+    {"key": "data_contrato", "label": "Data Contrato", "sf": "Data_Contrato__c"},
+    {"key": "data_credenciamento", "label": "Data Credenciamento", "sf": "Data_Credenciamento__c"},
+    {"key": "multiplicador_nivel", "label": "Multiplicador de Nível", "sf": "Multiplicador__c"},
+    {"key": "multiplicador_regime", "label": "Multiplicador de Regime", "sf": "Multiplicador_de_Regime__c"},
+    {"key": "tipo_corretor", "label": "Tipo Corretor *", "sf": "Tipo_Corretor__c"},
+]
 
 def aplicar_estilo():
     bg_url = "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?auto=format&fit=crop&w=1920&q=80"
@@ -192,21 +140,15 @@ def _hex_rgb_triplet(hex_color: str) -> str:
     x = hex_color.lstrip("#")
     return f"{int(x[0:2], 16)}, {int(x[2:4], 16)}, {int(x[4:6], 16)}"
 
-def _exibir_logo_topo():
-    st.markdown(f'<div style="text-align:center; padding-bottom:1rem;"><img src="{URL_LOGO_DIRECIONAL_EMAIL}" width="180"></div>', unsafe_allow_html=True)
-
-# =============================================================================
-# BACKEND (SALVAMENTO NA ABA SPLIT APP)
-# =============================================================================
 def _processar_envio_cadastro():
     ss = st.session_state
     dados = dict(ss.get("ficha_snap_campos", {}))
-    for c in CAMPOS:
-        sk = f"fld_{c['key']}"
-        if sk in ss: dados[c["key"]] = ss[sk]
+    # Captura campos da ultima etapa
+    for c in _campos_def():
+        if f"fld_{c['key']}" in ss: dados[c["key"]] = ss[f"fld_{c['key']}"]
     
     if not ss.get("fld_lgpd_ficha"):
-        st.error("A concordância com a LGPD é obrigatória.")
+        st.error("Aceite os termos da LGPD.")
         return
 
     try:
@@ -215,28 +157,48 @@ def _processar_envio_cadastro():
         gs_cfg = st.secrets["google_sheets"]
         creds_dict = json.loads(gs_cfg["SERVICE_ACCOUNT_JSON"])
         gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]))
-        
         sh = gc.open_by_key(gs_cfg["SPREADSHEET_ID"])
-        # Agora utiliza a aba Split App
         ws = sh.worksheet("Split App")
         
-        _aplicar_organizacao_planilha(ws)
+        # --- DERIVAÇÃO DE DADOS ---
+        dados["nome_completo"] = normalize_text(dados.get("nome_completo"))
+        dados["nome_conjuge"] = normalize_text(dados.get("nome_conjuge")) if dados.get("estado_civil") == "Casado" else ""
         
-        # Paridade: Naturalidade Fixa por UF
         uf_nasc = str(dados.get("uf_naturalidade", "")).strip().upper()
-        if uf_nasc in CAPITAIS_MAP: dados["naturalidade"] = CAPITAIS_MAP[uf_nasc]
+        dados["naturalidade"] = CAPITAIS_MAP.get(uf_nasc, "")
+        
+        sexo = dados.get("sexo", "")
+        dados["salutation"] = "Sr." if sexo == "Masculino" else "Sra." if sexo == "Feminino" else ""
+        
+        primeiro_nome = str(dados["nome_completo"]).split()[0]
+        dados["apelido"] = f"{primeiro_nome}_RJ01"
+        dados["regional"] = "RJ"
+        dados["status_corretor"] = "Pré credenciado"
+        dados["origem"] = "RH"
+        
+        hoje = datetime.now().strftime("%d/%m/%Y")
+        dados["data_entrevista"] = dados["data_contrato"] = dados["data_credenciamento"] = hoje
+        
+        funcao = dados.get("atividade", "")
+        dados["multiplicador_nivel"] = 0.9 if funcao == "Captador" else 1.0
+        dados["multiplicador_regime"] = 1.0
+        
+        rede = dados.get("unidade_negocio", "")
+        dados["tipo_corretor"] = "Parceiros (Externo)" if "Outra" in rede else "Direcional Vendas – Autônomos"
 
-        # Linha: Data Envio, Link Vazio, Dados..., Pendente, Log
+        # --- GRAVAÇÃO ---
+        headers_row1 = ["Data e hora do envio", "Link do contato (Salesforce)"] + [c["label"] for c in CAMPOS_TOTAL] + ["Envio?", "Log / erro"]
+        headers_row2 = ["Timestamp", "Link_SF"] + [c["sf"] for c in CAMPOS_TOTAL] + ["Status_Envio", "Log_Erro"]
+        
+        if not ws.get_all_values():
+            ws.update("A1:ZZ2", [headers_row1, headers_row2])
+
         linha = [datetime.now().strftime("%d/%m/%Y %H:%M:%S"), ""]
-        for c in CAMPOS:
-            v = dados.get(c["key"], "")
-            if c["key"] == "cpf": v = formatar_cpf_mascara(v)
-            # Se for Conjuge e nao for Casado, limpa
-            if c["key"] == "nome_conjuge" and "CASADO" not in normalize_text(dados.get("estado_civil", "")):
-                v = ""
-            linha.append(str(v) if v is not None else "")
-            
-        linha.extend(["Pendente", "Aguardando envio via Dashboard"])
+        for c in CAMPOS_TOTAL:
+            val = dados.get(c["key"], "")
+            if c["key"] == "cpf": val = formatar_cpf_mascara(val)
+            linha.append(str(val))
+        linha.extend(["Pendente", "Aguardando Dashboard"])
         
         ws.append_row(linha, value_input_option="USER_ENTERED")
         ss["ficha_sucesso"] = True
@@ -247,22 +209,21 @@ def _processar_envio_cadastro():
 def main():
     st.set_page_config(page_title="Credenciamento | Direcional", layout="centered")
     aplicar_estilo()
-    
     ss = st.session_state
     if "ficha_sucesso" not in ss: ss["ficha_sucesso"] = False
     if "step" not in ss: ss["step"] = 0
     if "ficha_snap_campos" not in ss: ss["ficha_snap_campos"] = {}
 
     if ss["ficha_sucesso"]:
-        _exibir_logo_topo()
-        st.success("✓ Cadastro realizado com sucesso na base Split App!")
-        st.video(URL_YOUTUBE_BOAS_VINDAS_RH_EMBED)
-        if st.button("Fazer novo cadastro"):
+        st.markdown(f'<div style="text-align:center;"><img src="{URL_LOGO_DIRECIONAL}" width="180"></div>', unsafe_allow_html=True)
+        st.success("✓ Cadastro realizado com sucesso!")
+        st.video("https://youtu.be/7cm3wFnoCSY")
+        if st.button("Novo Cadastro"):
             for k in list(ss.keys()): del ss[k]
             st.rerun()
         return
 
-    _exibir_logo_topo()
+    st.markdown(f'<div style="text-align:center;"><img src="{URL_LOGO_DIRECIONAL}" width="180"></div>', unsafe_allow_html=True)
     st.markdown('<p style="text-align:center; font-family:Montserrat; font-weight:900; font-size:1.6rem; color:#04428f; margin:0;">Credenciamento Vendas RJ</p>', unsafe_allow_html=True)
     st.markdown('<div class="ficha-hero-bar"></div>', unsafe_allow_html=True)
 
@@ -274,11 +235,10 @@ def main():
 
     with st.container():
         st.markdown(f'<p class="section-head">{sec}</p>', unsafe_allow_html=True)
-        cols_vis = [c for c in CAMPOS if c["sec"] == sec and c["key"] not in CAMPOS_OCULTOS_FORMULARIO]
+        cols_vis = [c for c in _campos_def() if c["sec"] == sec]
         
-        # Ocultar Nome do Cônjuge se não for Casado
-        est_civil_atual = normalize_text(ss.get("fld_estado_civil", ""))
-        if "CASADO" not in est_civil_atual:
+        # Filtro de visibilidade do Cônjuge
+        if sec == "Dados Pessoais" and normalize_text(ss.get("fld_estado_civil")) != "CASADO":
             cols_vis = [c for c in cols_vis if c["key"] != "nome_conjuge"]
 
         with st.form(f"f_{idx}", border=False):
@@ -289,13 +249,13 @@ def main():
                 with L: 
                     k, sk, label, tipo = c1["key"], f"fld_{c1['key']}", c1["label"], c1["tipo"]
                     if tipo == "text": st.text_input(label, key=sk)
-                    elif tipo == "select": st.selectbox(label, options=c1.get("opcoes", ["--Nenhum--"]), key=sk)
+                    elif tipo == "select": st.selectbox(label, options=c1.get("opcoes", []), key=sk)
                     elif tipo == "date": st.date_input(label, key=sk, format="DD/MM/YYYY", min_value=date(1900,1,1))
                 if c2:
                     with R:
                         k, sk, label, tipo = c2["key"], f"fld_{c2['key']}", c2["label"], c2["tipo"]
                         if tipo == "text": st.text_input(label, key=sk)
-                        elif tipo == "select": st.selectbox(label, options=c2.get("opcoes", ["--Nenhum--"]), key=sk)
+                        elif tipo == "select": st.selectbox(label, options=c2.get("opcoes", []), key=sk)
                         elif tipo == "date": st.date_input(label, key=sk, format="DD/MM/YYYY", min_value=date(1900,1,1))
             
             if idx == len(secoes) - 1:
@@ -317,7 +277,4 @@ def main():
                     else:
                         _processar_envio_cadastro()
 
-    st.markdown('<div style="text-align:center; color:#64748b; font-size:0.75rem; margin-top:3rem;">Direcional Engenharia · Vendas Rio de Janeiro</div>', unsafe_allow_html=True)
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
