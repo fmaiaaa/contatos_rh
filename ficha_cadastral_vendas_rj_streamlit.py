@@ -1458,15 +1458,23 @@ def aplicar_formatacao_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
     cpf_raw = re.sub(r"\D", "", str(out.get("cpf") or ""))
     if len(cpf_raw) == 11:
         out["cpf"] = f"{cpf_raw[:3]}.{cpf_raw[3:6]}.{cpf_raw[6:9]}-{cpf_raw[9:]}"
-    elif cpf_raw:
-        out["cpf"] = str(out.get("cpf")).strip()  # fallback if not 11
+    elif out.get("cpf"):
+        out["cpf"] = str(out.get("cpf")).strip().upper()
+
+    # Format RG
+    rg_raw = re.sub(r"[^\dXxx]", "", str(out.get("rg") or ""))
+    rg_digits = re.sub(r"\D", "", rg_raw)
+    if len(rg_digits) == 9:
+        out["rg"] = f"{rg_digits[:2]}.{rg_digits[2:5]}.{rg_digits[5:8]}-{rg_digits[8:]}"
+    elif out.get("rg"):
+        out["rg"] = str(out.get("rg")).strip().upper()
 
     # Format CEP
     cep_raw = re.sub(r"\D", "", str(out.get("endereco_cep") or ""))
     if len(cep_raw) == 8:
         out["endereco_cep"] = f"{cep_raw[:5]}-{cep_raw[5:]}"
-    elif cep_raw:
-        out["endereco_cep"] = str(out.get("endereco_cep")).strip()
+    elif out.get("endereco_cep"):
+        out["endereco_cep"] = str(out.get("endereco_cep")).strip().upper()
 
     # Format Phones
     for k in ["mobile", "phone"]:
@@ -1475,13 +1483,13 @@ def aplicar_formatacao_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = f"({tel[:2]}) {tel[2:7]}-{tel[7:]}"
         elif len(tel) == 10:
             out[k] = f"({tel[:2]}) {tel[2:6]}-{tel[6:]}"
-        elif tel:
-            out[k] = str(out.get(k)).strip()
+        elif out.get(k):
+            out[k] = str(out.get(k)).strip().upper()
 
     # Ensure names and strings are UPPERCASE (excluding specific fields)
     nao_uppercase = {
         "email", "cpf", "endereco_cep", "mobile", "phone",
-        "account_id", "owner_id", "codigo_pessoa_uau", "conta_bancaria", "agencia_bancaria", "creci"
+        "account_id", "owner_id", "codigo_pessoa_uau", "conta_bancaria", "agencia_bancaria", "creci", "rg"
     }
     for c in CAMPOS:
         k = c["key"]
@@ -1490,12 +1498,6 @@ def aplicar_formatacao_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
                 v = out.get(k)
                 if isinstance(v, str) and v.strip():
                     out[k] = v.strip().upper()
-
-    # Explicitly ensure RG is uppercase string
-    if isinstance(out.get("rg"), str) and str(out["rg"]).strip():
-        out["rg"] = str(out["rg"]).strip().upper()
-    elif out.get("rg"):
-        out["rg"] = str(out["rg"]).upper()
 
     return out
 
@@ -2688,12 +2690,6 @@ GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS: Tuple[str, ...] = tuple(
         if linha.strip()
     )
 )
-# Pasta raiz no Google Drive para documento de identidade (compartilhar com o e-mail da service account do JSON).
-# Padrão: pasta na conta pessoal indicada pelo time; sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
-DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1x2vGhf3Fnt_rtykdrU3nqJD7kh_pnrSv"
-
-# Documento de identidade: e-mail só se o upload ao Drive falhar (fallback; [ficha_email] SMTP).
-IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO = "ynara.silva@direcional.com.br"
 
 # Mensagens ao corretor: sem citar planilha, Salesforce ou outros sistemas internos.
 FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO = (
@@ -2750,233 +2746,6 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
         return None
     except Exception:
         return None
-
-
-def _drive_parent_id_identidade(st_secrets: Any) -> str:
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            gd = st_secrets.get("google_drive")
-            if isinstance(gd, dict):
-                pid = (
-                    gd.get("PARENT_FOLDER_ID")
-                    or gd.get("identidade_parent_folder_id")
-                    or ""
-                ).strip()
-                if pid:
-                    return pid
-    except Exception:
-        pass
-    return DRIVE_IDENTIDADE_PASTA_RAIZ_ID
-
-
-def _drive_email_dono_apos_upload(st_secrets: Any) -> str:
-    """
-    E-mail para o qual a API tenta transferir a propriedade do arquivo após o upload
-    (conta de serviço não tem cota; dono passa a ser você / Workspace).
-    Secrets [google_drive]: TRANSFER_OWNERSHIP_TO_EMAIL ou FILE_OWNER_EMAIL ou OWNER_EMAIL.
-    """
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            gd = st_secrets.get("google_drive")
-            if isinstance(gd, dict):
-                for key in (
-                    "TRANSFER_OWNERSHIP_TO_EMAIL",
-                    "transfer_ownership_to_email",
-                    "FILE_OWNER_EMAIL",
-                    "file_owner_email",
-                    "OWNER_EMAIL",
-                    "owner_email",
-                ):
-                    v = str(gd.get(key) or "").strip()
-                    if v:
-                        return v
-    except Exception:
-        pass
-    return ""
-
-
-def _drive_transferir_propriedade_arquivo(
-    service: Any, file_id: str, email: str
-) -> Optional[str]:
-    """
-    Tenta `permissions.create` com transferOwnership (Drive v3).
-    Retorna None se OK; senão mensagem de erro para exibir ao usuário.
-    """
-    em = (email or "").strip()
-    if not em or not file_id:
-        return None
-    try:
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "user", "role": "owner", "emailAddress": em},
-            transferOwnership=True,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-        return None
-    except Exception as e:
-        return str(e)
-
-
-def _drive_escapar_nome_query(nome: str) -> str:
-    return (nome or "").replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _drive_obter_ou_criar_subpasta(service: Any, parent_id: str, nome_pasta: str) -> str:
-    """Retorna o ID da subpasta `nome_pasta` dentro de `parent_id` (cria se não existir)."""
-    q = (
-        f"name='{_drive_escapar_nome_query(nome_pasta)}' and "
-        f"'{parent_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    res = (
-        service.files()
-        .list(
-            q=q,
-            spaces="drive",
-            fields="files(id,name)",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
-    )
-    files = res.get("files") or []
-    if files:
-        return str(files[0]["id"])
-    body = {
-        "name": nome_pasta,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    created = service.files().create(
-        body=body, fields="id", supportsAllDrives=True
-    ).execute()
-    return str(created["id"])
-
-
-def _safe_filename_part(s: str) -> str:
-    t = re.sub(r"[^\w\-]+", "_", (s or "").strip(), flags=re.UNICODE)[:48]
-    return t or "arquivo"
-
-
-def _drive_nome_arquivo_identidade(dados: Dict[str, Any], nome_original: str) -> str:
-    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
-    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
-    suf = Path(nome_original or "doc").suffix.lower()
-    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
-        suf = ".pdf"
-    try:
-        from zoneinfo import ZoneInfo
-
-        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
-    except Exception:
-        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"identidade_{cpf_l}_{nc}_{agora}{suf}"
-
-
-def _upload_arquivo_google_drive_com_nome(
-    creds_dict: Dict[str, Any],
-    parent_folder_id: str,
-    uploaded: Any,
-    dados: Dict[str, Any],
-    nome_arquivo_fn: Callable[[Dict[str, Any], str], str],
-    *,
-    transferir_propriedade_para_email: str = "",
-) -> Tuple[Optional[str], str]:
-    """Envia binário para subpasta do dia; `nome_arquivo_fn` define o nome no Drive."""
-    try:
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseUpload
-    except ImportError:
-        return (
-            None,
-            "Dependência ausente: instale com «pip install google-api-python-client google-auth-httplib2» "
-            "e faça **redeploy** no Streamlit Cloud (o requirements.txt na pasta do app deve listar esses pacotes).",
-        )
-
-    try:
-        try:
-            from zoneinfo import ZoneInfo
-
-            dia = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d")
-        except Exception:
-            dia = datetime.now().strftime("%Y-%m-%d")
-
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        folder_dia_id = _drive_obter_ou_criar_subpasta(service, parent_folder_id, dia)
-
-        raw = uploaded.getvalue()
-        if not raw:
-            return None, "Arquivo vazio."
-
-        mime = getattr(uploaded, "type", None) or "application/octet-stream"
-        nome_out = nome_arquivo_fn(dados, getattr(uploaded, "name", "") or "")
-
-        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=True)
-        body = {"name": nome_out, "parents": [folder_dia_id]}
-        created = (
-            service.files()
-            .create(body=body, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
-            .execute()
-        )
-        fid = (created.get("id") or "").strip()
-        link = (created.get("webViewLink") or "").strip()
-        if not link and fid:
-            link = f"https://drive.google.com/file/d/{fid}/view"
-
-        aviso = ""
-        te = (transferir_propriedade_para_email or "").strip()
-        if te and fid:
-            terr = _drive_transferir_propriedade_arquivo(service, fid, te)
-            if terr:
-                aviso = (
-                    f"Arquivo enviado, mas a transferência de propriedade para {te} falhou: {terr} "
-                    "(em Shared Drive a propriedade é do drive; em Gmail pessoal a API pode bloquear transferência a partir de conta de serviço)."
-                )
-        return (link or None), aviso
-    except Exception as e:
-        msg = str(e)
-        low = msg.lower()
-        if "404" in msg and ("not found" in low or "filenotfound" in low or "file not found" in low):
-            msg += (
-                " — Confirme o ID da pasta pai nos Secrets [google_drive] PARENT_FOLDER_ID. "
-                "A pasta precisa existir e estar compartilhada com o e-mail «client_email» da conta de serviço (JSON), "
-                "como Editor (o link no navegador pode abrir para você mesmo sem a API enxergar a pasta)."
-            )
-        if "storagequota" in low or "storage quota" in low or "do not have storage quota" in low:
-            msg += (
-                " — Prefira pasta dentro de um **Shared Drive** ou **Meu Drive** seu compartilhado com a service account; "
-                "opcionalmente defina [google_drive] TRANSFER_OWNERSHIP_TO_EMAIL com seu e-mail após o upload."
-            )
-        return None, msg
-
-
-def upload_identidade_google_drive(
-    creds_dict: Dict[str, Any],
-    parent_folder_id: str,
-    uploaded: Any,
-    dados: Dict[str, Any],
-    *,
-    transferir_propriedade_para_email: str = "",
-) -> Tuple[Optional[str], str]:
-    """
-    Envia o arquivo para subpasta do dia (AAAA-MM-DD em Brasília) dentro de `parent_folder_id`.
-    Use pasta no **Meu Drive** de um usuário (compartilhada com a service account) ou **Shared Drive**;
-    opcionalmente `transferir_propriedade_para_email` repassa a propriedade após o create (API Drive).
-    Retorna (link_webViewLink ou None, mensagem_erro ou aviso — ex.: upload OK mas transferência falhou).
-    """
-    return _upload_arquivo_google_drive_com_nome(
-        creds_dict,
-        parent_folder_id,
-        uploaded,
-        dados,
-        _drive_nome_arquivo_identidade,
-        transferir_propriedade_para_email=transferir_propriedade_para_email,
-    )
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
@@ -5017,4 +4786,209 @@ box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
 <p style="margin:0;font-size:14px;line-height:1.55;color:#475569;text-align:center;">
 Olá, <strong>{nome}</strong> — segue o resumo dos dados enviados. O PDF completo está em <strong>anexo</strong>.
 </p>
-<p style="margin:12px 0 0 0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:
+<p style="margin:12px 0 0 0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">Emitido em {emitido}</p>
+</td>
+</tr>
+<tr><td style="padding:0 24px 12px 24px;">
+<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+<tr style="background:{azul};color:#ffffff;">
+<th colspan="2" align="left" style="padding:10px 12px;font-weight:700;">Identificação</th>
+</tr>
+<tr><td style="padding:10px 12px;border:1px solid {borda};color:{azul};font-weight:600;">Nome</td>
+<td style="padding:10px 12px;border:1px solid {borda};">{nome}</td></tr>
+<tr><td style="padding:10px 12px;border:1px solid {borda};color:{azul};font-weight:600;">CPF</td>
+<td style="padding:10px 12px;border:1px solid {borda};">{cpf}</td></tr>
+</table>
+</td></tr>
+<tr><td style="padding:8px 24px 24px 24px;">
+<p style="margin:0 0 10px 0;font-size:12px;font-weight:700;color:{azul};text-transform:uppercase;letter-spacing:0.06em;">
+Dados do formulário</p>
+<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+{tbody}
+</table>
+</td></tr>
+<tr><td style="padding:16px 20px;background:{azul};text-align:center;">
+<p style="margin:0;font-size:11px;color:rgba(255,255,255,0.88);">Direcional Engenharia · Vendas Rio de Janeiro</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+
+def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError as e:
+        raise ImportError(
+            "Pacote 'reportlab' não encontrado. Execute: python -m pip install reportlab"
+        ) from e
+
+    def _registrar_fonte_pdf() -> str:
+        """Registra TTF com suporte a UTF-8 (acentos PT-BR). Sem TTF, usa Helvetica + cp1252 em _cell_txt."""
+        candidatos: list[str] = []
+        sysname = platform.system()
+        if sysname == "Windows":
+            w = os.environ.get("WINDIR", r"C:\Windows")
+            candidatos.extend(
+                [
+                    os.path.join(w, "Fonts", "arialuni.ttf"),
+                    os.path.join(w, "Fonts", "arial.ttf"),
+                    os.path.join(w, "Fonts", "Arial.ttf"),
+                ]
+            )
+        elif sysname == "Darwin":
+            candidatos.extend(
+                [
+                    "/Library/Fonts/Arial Unicode.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                    "/Library/Fonts/Arial.ttf",
+                ]
+            )
+        else:
+            # Linux (Streamlit Cloud, Docker): caminhos usuais de pacotes de fontes
+            for root in ("/usr/share/fonts", "/usr/local/share/fonts"):
+                if not os.path.isdir(root):
+                    continue
+                for sub, nome in (
+                    ("truetype/dejavu", "DejaVuSans.ttf"),
+                    ("TTF", "DejaVuSans.ttf"),
+                    ("truetype/liberation", "LiberationSans-Regular.ttf"),
+                    ("truetype/noto", "NotoSans-Regular.ttf"),
+                    ("truetype/freefont", "FreeSans.ttf"),
+                ):
+                    p = os.path.join(root, sub, nome)
+                    if os.path.isfile(p):
+                        candidatos.append(p)
+        # Fonte junto ao app (deploy: copiar DejaVuSans.ttf para assets/fonts/)
+        _font_app = _DIR_APP / "assets" / "fonts" / "DejaVuSans.ttf"
+        if _font_app.is_file():
+            candidatos.insert(0, str(_font_app))
+
+        for path in candidatos:
+            if os.path.isfile(path):
+                try:
+                    pdfmetrics.registerFont(TTFont("FichaPdfFont", path))
+                    return "FichaPdfFont"
+                except Exception:
+                    continue
+        return "Helvetica"
+
+    font = _registrar_fonte_pdf()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=2 * cm,
+        leftMargin=2 * cm,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
+    )
+    styles = getSampleStyleSheet()
+    azul = colors.HexColor(COR_AZUL_ESC)
+    verm = colors.HexColor(COR_VERMELHO)
+    st_banner = ParagraphStyle(
+        name="Banner",
+        parent=styles["Normal"],
+        fontName=font,
+        fontSize=11,
+        leading=14,
+        textColor=colors.white,
+        alignment=TA_CENTER,
+        spaceAfter=0,
+    )
+    st_sub = ParagraphStyle(
+        name="Sub",
+        parent=styles["Normal"],
+        fontName=font,
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor(COR_TEXTO_MUTED),
+        alignment=TA_CENTER,
+        spaceAfter=10,
+    )
+    st_body = ParagraphStyle(name="Corpo", parent=styles["Normal"], fontName=font, fontSize=9, leading=12)
+
+    def _cell_txt(x: Any) -> str:
+        """Texto seguro para Paragraph: TTF aceita Unicode; Helvetica usa WinAnsi (cp1252) para PT-BR."""
+        s = str(x) if x is not None else ""
+        if font != "Helvetica":
+            return s
+        # Helvetica no ReportLab = WinAnsiEncoding (~cp1252): português completo, sem «?» nos acentos.
+        try:
+            return s.encode("cp1252", "replace").decode("cp1252")
+        except Exception:
+            return s
+
+    def _para_celula(s: str) -> Paragraph:
+        """Células da tabela como Paragraph (Unicode + acentos) com escape XML mínimo."""
+        t = _xml_escape_para_pdf(_cell_txt(s)).replace("\n", "<br/>")
+        return Paragraph(t, st_body)
+
+    largura = 17 * cm
+    story: list = []
+    # Cabeçalho marca (faixa azul + linha vermelha)
+    head_tbl = Table(
+        [[Paragraph(_cell_txt("FICHA CADASTRAL | DIRECIONAL VENDAS RJ"), st_banner)]],
+        colWidths=[largura],
+    )
+    head_tbl.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), azul),
+                ("TOPPADDING", (0, 0), (-1, -1), 11),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    story.append(head_tbl)
+    red_bar = Table([[""]], colWidths=[largura], rowHeights=[0.14 * cm])
+    red_bar.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), verm)]))
+    story.append(red_bar)
+    story.append(Spacer(1, 0.35 * cm))
+    story.append(
+        Paragraph(
+            _cell_txt(f"Emitido em: {datetime.now().strftime('%d/%m/%Y %H:%M')}"),
+            st_sub,
+        )
+    )
+    story.append(Spacer(1, 0.2 * cm))
+
+    linhas_tab: list[list[str]] = []
+    for c in CAMPOS:
+        k = c["key"]
+        val = dados.get(k)
+        if val is None or (isinstance(val, list) and len(val) == 0):
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        label = c["label"]
+        if isinstance(val, list):
+            vtxt = "; ".join(str(x) for x in val)
+        else:
+            vtxt = str(val)
+        linhas_tab.append([_para_celula(label), _para_celula(vtxt)])
+
+    if linhas_tab:
+        hdr_bg = colors.HexColor("#e8eef5")
+        t = Table(
+            [[_para_celula("Campo"), _para_celula("Resposta")]] + linhas_tab,
+            colWidths=[6 * cm, 11 * cm],
+        )
+        t.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), hdr_bg),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), azul),
+                    ("FONTNAME", (0, 0), (-1, -1), font),
+                    ("FONTSIZE", (0,
