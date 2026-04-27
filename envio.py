@@ -72,7 +72,8 @@ def aplicar_estilo_gestao():
         }}
         .block-container {{
             max-width: 1200px !important; padding: 2rem !important; background: rgba(255, 255, 255, 0.88) !important;
-            backdrop-filter: blur(20px); border-radius: 24px !important; box-shadow: 0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.25);
+            backdrop-filter: blur(20px); border-radius: 24px !important; border: 1px solid rgba(255, 255, 255, 0.45);
+            box-shadow: 0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.25);
             margin-top: 20px !important;
         }}
         h1, h2, h3 {{ font-family: 'Montserrat' !important; color: {COR_AZUL_ESC} !important; }}
@@ -87,6 +88,13 @@ def aplicar_estilo_gestao():
         .ficha-logo-wrap img {{ max-height: 80px; width: auto; object-fit: contain; display: inline-block; }}
         </style>
     """, unsafe_allow_html=True)
+
+def _resolver_png_raiz(nome: str) -> Path | None:
+    """Procura o PNG na pasta do app e na pasta pai (raiz do repo no Streamlit Cloud)."""
+    for base in (_DIR_APP, _DIR_APP.parent):
+        p = base / nome
+        if p.is_file(): return p
+    return None
 
 def _exibir_logo_topo():
     path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
@@ -161,8 +169,8 @@ def atualizar_linha_base(ws: Any, df_idx_orig: int, status: str, log: str, link:
     except: pass
 
 def main():
-    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
-    st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav) if fav else None, layout="wide")
+    fav_path = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(page_title="Dashboard | Direcional", page_icon=str(fav_path) if fav_path else None, layout="wide")
     aplicar_estilo_gestao()
     _exibir_logo_topo()
     st.markdown('<p style="text-align:center; font-family:Montserrat; font-weight:900; font-size:1.8rem; color:#04428f; margin:0;">Gestão de Integração Salesforce</p>', unsafe_allow_html=True)
@@ -252,7 +260,7 @@ def main():
                         st.session_state['gestao_logs'].append({"status": "sucesso", "msg": f"Sucesso: {nome} integrado com sucesso."})
                         sucessos += 1
                     else:
-                        atualizar_linha_base(ws, idx_df, "Erro", "Sem ID")
+                        atualizar_linha_base(ws, idx_df, "Erro", "Salesforce nao retornou ID")
                         falhas += 1
                 except Exception as e:
                     msg_erro = str(e)[:300]
