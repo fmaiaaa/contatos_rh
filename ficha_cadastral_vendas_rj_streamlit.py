@@ -1450,58 +1450,6 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(erros))
 
 
-def aplicar_formatacao_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
-    """Formata e garante que os valores sejam strings maiúsculas ou formatadas."""
-    out = dict(dados)
-
-    # Format CPF
-    cpf_raw = re.sub(r"\D", "", str(out.get("cpf") or ""))
-    if len(cpf_raw) == 11:
-        out["cpf"] = f"{cpf_raw[:3]}.{cpf_raw[3:6]}.{cpf_raw[6:9]}-{cpf_raw[9:]}"
-    elif out.get("cpf"):
-        out["cpf"] = str(out.get("cpf")).strip().upper()
-
-    # Format RG
-    rg_raw = re.sub(r"[^\dXxx]", "", str(out.get("rg") or ""))
-    rg_digits = re.sub(r"\D", "", rg_raw)
-    if len(rg_digits) == 9:
-        out["rg"] = f"{rg_digits[:2]}.{rg_digits[2:5]}.{rg_digits[5:8]}-{rg_digits[8:]}"
-    elif out.get("rg"):
-        out["rg"] = str(out.get("rg")).strip().upper()
-
-    # Format CEP
-    cep_raw = re.sub(r"\D", "", str(out.get("endereco_cep") or ""))
-    if len(cep_raw) == 8:
-        out["endereco_cep"] = f"{cep_raw[:5]}-{cep_raw[5:]}"
-    elif out.get("endereco_cep"):
-        out["endereco_cep"] = str(out.get("endereco_cep")).strip().upper()
-
-    # Format Phones
-    for k in ["mobile", "phone"]:
-        tel = re.sub(r"\D", "", str(out.get(k) or ""))
-        if len(tel) == 11:
-            out[k] = f"({tel[:2]}) {tel[2:7]}-{tel[7:]}"
-        elif len(tel) == 10:
-            out[k] = f"({tel[:2]}) {tel[2:6]}-{tel[6:]}"
-        elif out.get(k):
-            out[k] = str(out.get(k)).strip().upper()
-
-    # Ensure names and strings are UPPERCASE (excluding specific fields)
-    nao_uppercase = {
-        "email", "cpf", "endereco_cep", "mobile", "phone",
-        "account_id", "owner_id", "codigo_pessoa_uau", "conta_bancaria", "agencia_bancaria", "creci", "rg"
-    }
-    for c in CAMPOS:
-        k = c["key"]
-        if c["tipo"] in ("text", "textarea", "id"):
-            if k not in nao_uppercase:
-                v = out.get(k)
-                if isinstance(v, str) and v.strip():
-                    out[k] = v.strip().upper()
-
-    return out
-
-
 def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
     """Primeira palavra → FirstName; restante → LastName (sem campos separados no formulário)."""
     nc = (dados.get("nome_completo") or "").strip().upper()
@@ -1797,8 +1745,9 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             continue
 
         if key == "cpf" and sf == "CPF__c":
-            if raw:
-                payload[sf] = str(raw).strip()
+            digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
+            if digits:
+                payload[sf] = digits
             continue
 
         if key == "creci" and sf == "CRECI__c":
@@ -1811,8 +1760,12 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             continue
 
         if key == "endereco_cep" and sf == "EnderecoResidencialCEP__c":
-            if raw:
-                payload[sf] = str(raw).strip()
+            dig = re.sub(r"\D", "", str(raw if raw is not None else ""))
+            if dig:
+                if len(dig) == 8:
+                    payload[sf] = f"{dig[:5]}-{dig[5:]}"
+                else:
+                    payload[sf] = dig[:9]
             continue
 
         s = (str(raw).strip() if raw is not None else "") or ""
@@ -2151,7 +2104,6 @@ def _executar_teste_criar_sf_de_linha_planilha(
     dados = dados_dict_de_linha_planilha(headers, cells)
     dados = _merge_defaults_ficha_em_dict(dados)
     dados = enriquecer_derivados_vendas_rj(dados)
-    dados = aplicar_formatacao_dados(dados)
     erros = validar_obrigatorios(dados)
     if erros:
         lista = "<br>".join(f"• {html.escape(e)}" for e in erros)
@@ -2690,6 +2642,12 @@ GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS: Tuple[str, ...] = tuple(
         if linha.strip()
     )
 )
+# Pasta raiz no Google Drive para documento de identidade (compartilhar com o e-mail da service account do JSON).
+# Padrão: pasta na conta pessoal indicada pelo time; sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
+DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1x2vGhf3Fnt_rtykdrU3nqJD7kh_pnrSv"
+
+# Documento de identidade: e-mail só se o upload ao Drive falhar (fallback; [ficha_email] SMTP).
+IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO = "ynara.silva@direcional.com.br"
 
 # Mensagens ao corretor: sem citar planilha, Salesforce ou outros sistemas internos.
 FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO = (
@@ -2746,6 +2704,267 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
         return None
     except Exception:
         return None
+
+
+def _drive_parent_id_identidade(st_secrets: Any) -> str:
+    try:
+        if st_secrets and hasattr(st_secrets, "get"):
+            gd = st_secrets.get("google_drive")
+            if isinstance(gd, dict):
+                pid = (
+                    gd.get("PARENT_FOLDER_ID")
+                    or gd.get("identidade_parent_folder_id")
+                    or ""
+                ).strip()
+                if pid:
+                    return pid
+    except Exception:
+        pass
+    return DRIVE_IDENTIDADE_PASTA_RAIZ_ID
+
+
+def _drive_email_dono_apos_upload(st_secrets: Any) -> str:
+    """
+    E-mail para o qual a API tenta transferir a propriedade do arquivo após o upload
+    (conta de serviço não tem cota; dono passa a ser você / Workspace).
+    Secrets [google_drive]: TRANSFER_OWNERSHIP_TO_EMAIL ou FILE_OWNER_EMAIL ou OWNER_EMAIL.
+    """
+    try:
+        if st_secrets and hasattr(st_secrets, "get"):
+            gd = st_secrets.get("google_drive")
+            if isinstance(gd, dict):
+                for key in (
+                    "TRANSFER_OWNERSHIP_TO_EMAIL",
+                    "transfer_ownership_to_email",
+                    "FILE_OWNER_EMAIL",
+                    "file_owner_email",
+                    "OWNER_EMAIL",
+                    "owner_email",
+                ):
+                    v = str(gd.get(key) or "").strip()
+                    if v:
+                        return v
+    except Exception:
+        pass
+    return ""
+
+
+def _drive_transferir_propriedade_arquivo(
+    service: Any, file_id: str, email: str
+) -> Optional[str]:
+    """
+    Tenta `permissions.create` com transferOwnership (Drive v3).
+    Retorna None se OK; senão mensagem de erro para exibir ao usuário.
+    """
+    em = (email or "").strip()
+    if not em or not file_id:
+        return None
+    try:
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "user", "role": "owner", "emailAddress": em},
+            transferOwnership=True,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _drive_escapar_nome_query(nome: str) -> str:
+    return (nome or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _drive_obter_ou_criar_subpasta(service: Any, parent_id: str, nome_pasta: str) -> str:
+    """Retorna o ID da subpasta `nome_pasta` dentro de `parent_id` (cria se não existir)."""
+    q = (
+        f"name='{_drive_escapar_nome_query(nome_pasta)}' and "
+        f"'{parent_id}' in parents and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    res = (
+        service.files()
+        .list(
+            q=q,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    files = res.get("files") or []
+    if files:
+        return str(files[0]["id"])
+    body = {
+        "name": nome_pasta,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    created = service.files().create(
+        body=body, fields="id", supportsAllDrives=True
+    ).execute()
+    return str(created["id"])
+
+
+def _safe_filename_part(s: str) -> str:
+    t = re.sub(r"[^\w\-]+", "_", (s or "").strip(), flags=re.UNICODE)[:48]
+    return t or "arquivo"
+
+
+def _drive_nome_arquivo_identidade(dados: Dict[str, Any], nome_original: str) -> str:
+    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
+    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
+    suf = Path(nome_original or "doc").suffix.lower()
+    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
+        suf = ".pdf"
+    try:
+        from zoneinfo import ZoneInfo
+
+        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"identidade_{cpf_l}_{nc}_{agora}{suf}"
+
+
+def _drive_nome_arquivo_creci_carteira(dados: Dict[str, Any], nome_original: str) -> str:
+    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
+    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
+    suf = Path(nome_original or "doc").suffix.lower()
+    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
+        suf = ".pdf"
+    try:
+        from zoneinfo import ZoneInfo
+
+        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"creci_carteira_{cpf_l}_{nc}_{agora}{suf}"
+
+
+def _upload_arquivo_google_drive_com_nome(
+    creds_dict: Dict[str, Any],
+    parent_folder_id: str,
+    uploaded: Any,
+    dados: Dict[str, Any],
+    nome_arquivo_fn: Callable[[Dict[str, Any], str], str],
+    *,
+    transferir_propriedade_para_email: str = "",
+) -> Tuple[Optional[str], str]:
+    """Envia binário para subpasta do dia; `nome_arquivo_fn` define o nome no Drive."""
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+    except ImportError:
+        return (
+            None,
+            "Dependência ausente: instale com «pip install google-api-python-client google-auth-httplib2» "
+            "e faça **redeploy** no Streamlit Cloud (o requirements.txt na pasta do app deve listar esses pacotes).",
+        )
+
+    try:
+        try:
+            from zoneinfo import ZoneInfo
+
+            dia = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d")
+        except Exception:
+            dia = datetime.now().strftime("%Y-%m-%d")
+
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        folder_dia_id = _drive_obter_ou_criar_subpasta(service, parent_folder_id, dia)
+
+        raw = uploaded.getvalue()
+        if not raw:
+            return None, "Arquivo vazio."
+
+        mime = getattr(uploaded, "type", None) or "application/octet-stream"
+        nome_out = nome_arquivo_fn(dados, getattr(uploaded, "name", "") or "")
+
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=True)
+        body = {"name": nome_out, "parents": [folder_dia_id]}
+        created = (
+            service.files()
+            .create(body=body, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
+            .execute()
+        )
+        fid = (created.get("id") or "").strip()
+        link = (created.get("webViewLink") or "").strip()
+        if not link and fid:
+            link = f"https://drive.google.com/file/d/{fid}/view"
+
+        aviso = ""
+        te = (transferir_propriedade_para_email or "").strip()
+        if te and fid:
+            terr = _drive_transferir_propriedade_arquivo(service, fid, te)
+            if terr:
+                aviso = (
+                    f"Arquivo enviado, mas a transferência de propriedade para {te} falhou: {terr} "
+                    "(em Shared Drive a propriedade é do drive; em Gmail pessoal a API pode bloquear transferência a partir de conta de serviço)."
+                )
+        return (link or None), aviso
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "404" in msg and ("not found" in low or "filenotfound" in low or "file not found" in low):
+            msg += (
+                " — Confirme o ID da pasta pai nos Secrets [google_drive] PARENT_FOLDER_ID. "
+                "A pasta precisa existir e estar compartilhada com o e-mail «client_email» da conta de serviço (JSON), "
+                "como Editor (o link no navegador pode abrir para você mesmo sem a API enxergar a pasta)."
+            )
+        if "storagequota" in low or "storage quota" in low or "do not have storage quota" in low:
+            msg += (
+                " — Prefira pasta dentro de um **Shared Drive** ou **Meu Drive** seu compartilhado com a service account; "
+                "opcionalmente defina [google_drive] TRANSFER_OWNERSHIP_TO_EMAIL com seu e-mail após o upload."
+            )
+        return None, msg
+
+
+def upload_identidade_google_drive(
+    creds_dict: Dict[str, Any],
+    parent_folder_id: str,
+    uploaded: Any,
+    dados: Dict[str, Any],
+    *,
+    transferir_propriedade_para_email: str = "",
+) -> Tuple[Optional[str], str]:
+    """
+    Envia o arquivo para subpasta do dia (AAAA-MM-DD em Brasília) dentro de `parent_folder_id`.
+    Use pasta no **Meu Drive** de um usuário (compartilhada com a service account) ou **Shared Drive**;
+    opcionalmente `transferir_propriedade_para_email` repassa a propriedade após o create (API Drive).
+    Retorna (link_webViewLink ou None, mensagem_erro ou aviso — ex.: upload OK mas transferência falhou).
+    """
+    return _upload_arquivo_google_drive_com_nome(
+        creds_dict,
+        parent_folder_id,
+        uploaded,
+        dados,
+        _drive_nome_arquivo_identidade,
+        transferir_propriedade_para_email=transferir_propriedade_para_email,
+    )
+
+
+def upload_creci_carteira_google_drive(
+    creds_dict: Dict[str, Any],
+    parent_folder_id: str,
+    uploaded: Any,
+    dados: Dict[str, Any],
+    *,
+    transferir_propriedade_para_email: str = "",
+) -> Tuple[Optional[str], str]:
+    """Upload da carteirinha CRECI (mesma pasta lógica do documento de identidade)."""
+    return _upload_arquivo_google_drive_com_nome(
+        creds_dict,
+        parent_folder_id,
+        uploaded,
+        dados,
+        _drive_nome_arquivo_creci_carteira,
+        transferir_propriedade_para_email=transferir_propriedade_para_email,
+    )
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
@@ -3136,9 +3355,9 @@ def anexar_linha(
     google_sheets_extras: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
-    Garante que a aba existe, alinha os valores gravados aos nomes de colunas reais na planilha
-    (para caso a ordem tenha sido alterada manualmente) e anexa a linha.
-    Atualiza também abas de documentação.
+    Garante que a aba existe, cabeçalho na linha 1 alinhado ao layout atual e anexa a linha.
+    Atualiza também a aba «Valores fixos (automáticos)» (nome configurável nos Secrets)
+    e a aba «Dicionário» (colunas Corretores × significado Salesforce).
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
@@ -3162,40 +3381,28 @@ def anexar_linha(
 
     existing = ws.get_all_values()
     atualizou_cabecalho = False
-
     if not existing or not any(str(cell).strip() for cell in existing[0]):
         ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
-        headers = cabecalho
         atualizou_cabecalho = True
-    else:
-        headers = list(existing[0])
-        norm_headers = [_norm_cabecalho_planilha(h) for h in headers]
-        missing = []
-        for h in cabecalho:
-            if _norm_cabecalho_planilha(h) not in norm_headers:
-                missing.append(h)
-
-        if missing:
-            headers.extend(missing)
-            ws.update("A1", [headers], value_input_option="USER_ENTERED")
-            atualizou_cabecalho = True
+    elif _cabecalho_planilha_desalinhado(list(existing[0]), cabecalho):
+        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
+        atualizou_cabecalho = True
+    elif len(existing[0]) < len(cabecalho):
+        pad = list(existing[0]) + [""] * (len(cabecalho) - len(existing[0]))
+        for i, h in enumerate(cabecalho):
+            if i >= len(pad) or not str(pad[i] or "").strip():
+                pad[i] = h
+        ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
+        atualizou_cabecalho = True
 
     if atualizou_cabecalho:
         try:
-            _formatar_visual_aba_corretores(ws, headers)
+            _formatar_visual_aba_corretores(ws, cabecalho)
         except Exception:
             pass
 
-    # Garante a escrita orientada por cabeçalho em vez de ordem fixa
-    data_map = dict(zip(cabecalho, linha))
-    norm_data_map = {_norm_cabecalho_planilha(k): v for k, v in data_map.items()}
-
-    actual_row = []
-    for h in headers:
-        actual_row.append(norm_data_map.get(_norm_cabecalho_planilha(h), ""))
-
-    ws.append_row(actual_row, value_input_option="USER_ENTERED")
-    return len(existing) + 1 if existing else 2
+    ws.append_row(linha, value_input_option="USER_ENTERED")
+    return len(ws.get_all_values())
 
 
 def atualizar_status_envio_salesforce(
@@ -4711,16 +4918,16 @@ def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> 
     avisos: list[str] = []
     if payload.get("MobilePhone"):
         return avisos
-    m = str(dados.get("mobile") or "")
-    if len(_somente_digitos(m)) >= 10:
-        payload["MobilePhone"] = m
+    m = _somente_digitos(str(dados.get("mobile") or ""))
+    if len(m) >= 10:
+        payload["MobilePhone"] = m[:11]
         return avisos
     tipo = (dados.get("tipo_pix") or "").strip()
     dp = str(dados.get("dados_pix") or "")
     if tipo in ("Telefone", "Celular"):
         mt = _somente_digitos(dp)
         if len(mt) >= 10:
-            payload["MobilePhone"] = dp
+            payload["MobilePhone"] = mt[:11]
             return avisos
     return avisos
 
@@ -4991,4 +5198,1367 @@ def gerar_pdf_ficha(dados: dict[str, Any]) -> bytes:
                     ("BACKGROUND", (0, 0), (-1, 0), hdr_bg),
                     ("TEXTCOLOR", (0, 0), (-1, 0), azul),
                     ("FONTNAME", (0, 0), (-1, -1), font),
-                    ("FONTSIZE", (0,
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor(COR_BORDA)),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor(COR_INPUT_BG)]),
+                ]
+            )
+        )
+        story.append(t)
+    else:
+        story.append(Paragraph(_cell_txt("(Nenhum dado preenchido)"), st_body))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def montar_corpo_email_boas_vindas(
+    dados: dict[str, Any],
+    link_contato_sf: str | None,
+    *,
+    tem_pdf_anexo: bool,
+) -> tuple[str, str]:
+    """Corpo do e-mail automático: apresentação Direcional, cadastro, materiais de vendas e PDF."""
+    nome = _nome_candidato_ficha(dados)
+    nome_esc = html.escape(nome)
+    logo = html.escape(URL_LOGO_DIRECIONAL_EMAIL)
+    azul = COR_AZUL_ESC
+    verm = COR_VERMELHO
+    borda = COR_BORDA
+
+    linhas_txt: list[str] = []
+    itens_html: list[str] = []
+    for label, url in LINKS_POS_CADASTRO:
+        linhas_txt.append(f"- {label}: {url}")
+        itens_html.append(
+            f'<li style="margin:10px 0;line-height:1.45;">'
+            f'<a href="{html.escape(url)}" style="color:{azul};font-weight:600;text-decoration:none;">'
+            f"{html.escape(label)}</a>"
+            f'<br><span style="font-size:12px;color:{COR_TEXTO_MUTED};word-break:break-all;">{html.escape(url)}</span>'
+            f"</li>"
+        )
+    if link_contato_sf:
+        linhas_txt.append(f"- Seu cadastro no Salesforce: {link_contato_sf}")
+        itens_html.append(
+            f'<li style="margin:10px 0;line-height:1.45;">'
+            f'<a href="{html.escape(link_contato_sf)}" '
+            f'style="color:{azul};font-weight:600;text-decoration:none;">'
+            f"Abrir seu cadastro no Salesforce</a></li>"
+        )
+
+    bloco_pdf_plain = (
+        "Anexamos neste e-mail o PDF da sua ficha cadastral (cópia do que você enviou pelo formulário).\n\n"
+        if tem_pdf_anexo
+        else "Não foi possível gerar o PDF automaticamente neste envio; após o cadastro, conclua o aviso "
+        "de boas-vindas no formulário e use os recursos na página seguinte, ou peça uma nova cópia ao RH.\n\n"
+    )
+    bloco_pdf_html = (
+        f'<p style="margin:0 0 16px 0;padding:14px 16px;background:{COR_INPUT_BG};border-radius:10px;'
+        f'border-left:4px solid {verm};font-size:14px;line-height:1.55;color:#334155;">'
+        f"<strong>PDF em anexo:</strong> segue a cópia em PDF da sua ficha cadastral.</p>"
+        if tem_pdf_anexo
+        else f'<p style="margin:0 0 16px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">'
+        f"Se o PDF não estiver disponível neste e-mail, após o cadastro clique em <strong>Concluir</strong> "
+        f"no aviso inicial e use os recursos na página seguinte, ou solicite uma nova cópia ao RH.</p>"
+    )
+
+    plain = (
+        f"Olá, {nome},\n\n"
+        "Bem-vindo(a) à Direcional Vendas Rio de Janeiro.\n\n"
+        "Recebemos o seu cadastro com sucesso. Você já está registrado(a) em nossa base — "
+        "agradecemos a confiança e o tempo dedicado.\n\n"
+        "--- A Direcional ---\n"
+        f"{_APRESENTACAO_DIRECIONAL_PLAIN}\n\n"
+        "--- Materiais e canais para sua atuação ---\n"
+        + "\n".join(linhas_txt)
+        + "\n\n"
+        + bloco_pdf_plain
+        + "No formulário, após clicar em **Concluir** no aviso de boas-vindas, a página mostra o mapa de "
+        + "empreendimentos, o vídeo do simulador e links úteis.\n\n"
+        + "Direcional Engenharia · Vendas Rio de Janeiro"
+    )
+
+    apresent_esc = html.escape(_APRESENTACAO_DIRECIONAL_PLAIN)
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:24px;background:#f1f5f9;font-family:'Segoe UI',Inter,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;">
+<tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;
+box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
+<tr>
+<td align="center" style="background:{azul};padding:22px 20px;border-bottom:4px solid {verm};">
+<img src="{logo}" alt="Direcional Engenharia" width="168" style="display:block;max-width:100%;height:auto;">
+</td>
+</tr>
+<tr>
+<td style="padding:28px 24px 8px 24px;">
+<p style="margin:0 0 8px 0;font-size:20px;font-weight:700;color:{azul};text-align:center;">
+Bem-vindo(a) à Direcional Vendas RJ</p>
+<p style="margin:0;font-size:15px;line-height:1.65;color:#475569;text-align:center;">
+Olá, <strong>{nome_esc}</strong> — <strong>seu cadastro foi recebido</strong> e você já integra nossa operação comercial.
+Obrigado(a) por escolher seguir conosco.
+</p>
+</td>
+</tr>
+<tr><td style="padding:16px 28px 8px 28px;">
+<p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">A Direcional</p>
+<p style="margin:0;font-size:14px;line-height:1.65;color:#475569;">{apresent_esc}</p>
+</td></tr>
+<tr><td style="padding:16px 28px 8px 28px;">
+<p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">Materiais e canais para vendas</p>
+<p style="margin:0 0 12px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
+Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe — os mesmos recursos do formulário.
+</p>
+<ul style="margin:0;padding-left:18px;color:#334155;font-size:14px;">
+{"".join(itens_html)}
+</ul>
+</td></tr>
+<tr><td style="padding:8px 28px 8px 28px;">
+{bloco_pdf_html}
+<p style="margin:0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
+Após clicar em <strong>Concluir</strong> no aviso inicial de boas-vindas, a <strong>página do formulário</strong>
+exibe o <strong>mapa de empreendimentos</strong>, o <strong>vídeo</strong> do simulador e os links úteis.
+</p>
+</td></tr>
+<tr><td style="padding:20px 24px 28px 24px;border-top:1px solid {borda};">
+<p style="margin:0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">
+Direcional Engenharia · Vendas Rio de Janeiro
+</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+    return plain, html_body
+
+
+def _smtp_erro_amigavel(exc: BaseException) -> str:
+    """Evita exibir dict/tuple cru do Gmail (ex.: destinatário «K» inválido)."""
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        partes: list[str] = []
+        rec = getattr(exc, "recipients", None) or {}
+        for addr, tup in rec.items():
+            if isinstance(tup, tuple) and len(tup) >= 2:
+                cod, raw = tup[0], tup[1]
+                msg = (
+                    raw.decode("utf-8", "replace")
+                    if isinstance(raw, (bytes, bytearray))
+                    else str(raw)
+                )
+                partes.append(f"{addr}: código {cod} — {msg[:280]}")
+            else:
+                partes.append(f"{addr}: {tup}")
+        if partes:
+            return (
+                "O servidor recusou o destinatário. Confira se o **E-mail** no formulário está completo "
+                "(ex.: nome@empresa.com.br). Detalhe: " + " | ".join(partes[:2])
+            )
+    return str(exc)
+
+
+def enviar_email_boas_vindas_candidato(
+    dados: dict[str, Any],
+    pdf_bytes: bytes | None,
+    link_contato_sf: str | None,
+) -> tuple[bool, str]:
+    """Envia ao e-mail do formulário o agradecimento + links (e PDF se houver)."""
+    cfg = _get_smtp_from_secrets()
+    if not cfg or not cfg["host"] or not cfg["user"]:
+        return False, "SMTP não configurado ([ficha_email] nos Secrets)."
+
+    dest = (dados.get("email") or "").strip()
+    if not dest:
+        return False, "E-mail do candidato não informado no formulário."
+    if not email_contato_formato_valido(dest):
+        return False, "E-mail do cadastro inválido — use formato nome@dominio.com (evite abreviações como uma única letra)."
+    if not email_corporativo_direcionalvendas_obrigatorio(dest):
+        return False, (
+            "E-mail do cadastro deve ser o corporativo com .direcionalvendas no login "
+            "(ex.: nomesobrenome.direcionalvendas@gmail.com)."
+        )
+
+    nome = _nome_candidato_ficha(dados)
+    tem_pdf = bool(pdf_bytes)
+    plain, html_body = montar_corpo_email_boas_vindas(
+        dados, link_contato_sf, tem_pdf_anexo=tem_pdf
+    )
+
+    msg = MIMEMultipart()
+    msg["Subject"] = (
+        f"Bem-vindo(a) — Direcional Vendas RJ | Ficha e materiais — {nome}"
+        if tem_pdf
+        else f"Bem-vindo(a) — Direcional Vendas RJ | Cadastro recebido — {nome}"
+    )
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = dest
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain, "plain", "utf-8"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt)
+
+    if pdf_bytes:
+        part = MIMEApplication(pdf_bytes, _subtype="pdf")
+        part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename="ficha_cadastral_direcional_vendas_rj.pdf",
+        )
+        msg.attach(part)
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["user"], cfg["password"])
+            server.sendmail(cfg["from_addr"], [dest], msg.as_string())
+        return True, "E-mail enviado (apresentação, materiais e PDF, se gerado) para o e-mail do cadastro."
+    except Exception as e:
+        return False, _smtp_erro_amigavel(e)
+
+
+def _tentar_enviar_email_boas_vindas(dados: dict[str, Any], contact_id: str | None) -> None:
+    """Dispara o e-mail automático; não interrompe o fluxo se falhar."""
+    ss = st.session_state
+    pdf_bytes: bytes | None = None
+    try:
+        pdf_bytes = gerar_pdf_ficha(dados)
+    except Exception:
+        pass
+    link = _url_contact(contact_id) if contact_id else None
+    ok, msg = enviar_email_boas_vindas_candidato(dados, pdf_bytes, link)
+    ss["ficha_email_boas_vindas_ok"] = ok
+    ss["ficha_email_boas_vindas_msg"] = msg
+
+
+def _get_smtp_from_secrets():
+    """
+    Lê [ficha_email] nos Secrets. Chaves esperadas:
+      smtp_server, smtp_port (padrão 587), sender_email, sender_password
+    Compatibilidade: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, TO_EMAIL, FROM_EMAIL.
+    Destinatário fixo opcional: to_email ou TO_EMAIL (senão use o campo na tela).
+    """
+    try:
+        s = st.secrets.get("ficha_email", {})
+        host = (s.get("smtp_server") or s.get("SMTP_HOST") or "").strip()
+        port_raw = s.get("smtp_port", s.get("SMTP_PORT", 587))
+        port = int(port_raw) if port_raw not in (None, "") else 587
+        user = (s.get("sender_email") or s.get("SMTP_USER") or "").strip()
+        password = (s.get("sender_password") or s.get("SMTP_PASSWORD") or "").strip()
+        to_fixed = (s.get("to_email") or s.get("TO_EMAIL") or "").strip()
+        if to_fixed and not email_contato_formato_valido(to_fixed):
+            to_fixed = ""
+        return {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "to": to_fixed,
+            "from_addr": user or (s.get("FROM_EMAIL") or "").strip(),
+        }
+    except Exception:
+        return None
+
+
+def _email_destino_documento_identidade(st_secrets: Any) -> str:
+    """Sobrescreva em [ficha_email] IDENTIDADE_DEST_EMAIL (ou identidade_dest_email)."""
+    try:
+        if st_secrets and hasattr(st_secrets, "get"):
+            fe = st_secrets.get("ficha_email", {})
+            if isinstance(fe, dict):
+                for key in (
+                    "IDENTIDADE_DEST_EMAIL",
+                    "identidade_dest_email",
+                    "DOCUMENTO_IDENTIDADE_DESTINO",
+                    "documento_identidade_destino",
+                ):
+                    v = str(fe.get(key) or "").strip()
+                    if v and email_contato_formato_valido(v):
+                        return v
+    except Exception:
+        pass
+    return IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO
+
+
+def enviar_documento_identidade_por_email(
+    uploaded: Any, dados: Dict[str, Any], destinatario: str
+) -> Tuple[bool, str]:
+    """
+    Fallback: envia o documento de identidade por e-mail ([ficha_email] SMTP) quando o upload ao Drive falha.
+    """
+    cfg = _get_smtp_from_secrets()
+    if not cfg or not cfg["host"] or not cfg["user"]:
+        return False, (
+            "SMTP não configurado — adicione [ficha_email] com smtp_server, sender_email e sender_password nos Secrets."
+        )
+    to = (destinatario or "").strip()
+    if not email_contato_formato_valido(to):
+        return False, f"E-mail de destino inválido ({to!r})."
+
+    raw = uploaded.getvalue()
+    if not raw:
+        return False, "Arquivo vazio."
+
+    nome_arq = _drive_nome_arquivo_identidade(dados, getattr(uploaded, "name", "") or "")
+    mime = (getattr(uploaded, "type", None) or "").strip().lower() or "application/octet-stream"
+    if mime == "application/pdf" or nome_arq.lower().endswith(".pdf"):
+        sub = "pdf"
+    elif mime in ("image/jpeg", "image/jpg") or nome_arq.lower().endswith((".jpg", ".jpeg")):
+        sub = "jpeg"
+    elif mime == "image/png" or nome_arq.lower().endswith(".png"):
+        sub = "png"
+    else:
+        sub = "octet-stream"
+
+    nome_cand = _nome_candidato_ficha(dados)
+    msg = MIMEMultipart()
+    msg["Subject"] = f"[Vendas RJ] Documento de identidade — {nome_cand}"
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = to
+
+    corpo = (
+        "Documento de identidade enviado pelo formulário de credenciamento (Direcional Vendas RJ).\n\n"
+        f"Nome: {nome_cand}\n"
+        f"CPF: {dados.get('cpf', '')}\n"
+        f"E-mail no cadastro: {dados.get('email', '')}\n"
+        f"Celular: {dados.get('mobile', '')}\n"
+    )
+    msg.attach(MIMEText(corpo, "plain", "utf-8"))
+
+    part = MIMEApplication(raw, _subtype=sub)
+    part.add_header("Content-Disposition", "attachment", filename=nome_arq)
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["user"], cfg["password"])
+            server.sendmail(cfg["from_addr"], [to], msg.as_string())
+        return True, ""
+    except Exception as e:
+        return False, _smtp_erro_amigavel(e)
+
+
+def enviar_creci_carteira_por_email(
+    uploaded: Any, dados: Dict[str, Any], destinatario: str
+) -> Tuple[bool, str]:
+    """Fallback: envia a carteirinha CRECI por e-mail quando o upload ao Drive falha."""
+    cfg = _get_smtp_from_secrets()
+    if not cfg or not cfg["host"] or not cfg["user"]:
+        return False, (
+            "SMTP não configurado — adicione [ficha_email] com smtp_server, sender_email e sender_password nos Secrets."
+        )
+    to = (destinatario or "").strip()
+    if not email_contato_formato_valido(to):
+        return False, f"E-mail de destino inválido ({to!r})."
+
+    raw = uploaded.getvalue()
+    if not raw:
+        return False, "Arquivo vazio."
+
+    nome_arq = _drive_nome_arquivo_creci_carteira(dados, getattr(uploaded, "name", "") or "")
+    mime = (getattr(uploaded, "type", None) or "").strip().lower() or "application/octet-stream"
+    if mime == "application/pdf" or nome_arq.lower().endswith(".pdf"):
+        sub = "pdf"
+    elif mime in ("image/jpeg", "image/jpg") or nome_arq.lower().endswith((".jpg", ".jpeg")):
+        sub = "jpeg"
+    elif mime == "image/png" or nome_arq.lower().endswith(".png"):
+        sub = "png"
+    else:
+        sub = "octet-stream"
+
+    nome_cand = _nome_candidato_ficha(dados)
+    msg = MIMEMultipart()
+    msg["Subject"] = f"[Vendas RJ] Carteirinha CRECI — {nome_cand}"
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = to
+
+    corpo = (
+        "Carteirinha do CRECI enviada pelo formulário de credenciamento (Direcional Vendas RJ).\n\n"
+        f"Nome: {nome_cand}\n"
+        f"CPF: {dados.get('cpf', '')}\n"
+        f"E-mail no cadastro: {dados.get('email', '')}\n"
+        f"Celular: {dados.get('mobile', '')}\n"
+    )
+    msg.attach(MIMEText(corpo, "plain", "utf-8"))
+
+    part = MIMEApplication(raw, _subtype=sub)
+    part.add_header("Content-Disposition", "attachment", filename=nome_arq)
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["user"], cfg["password"])
+            server.sendmail(cfg["from_addr"], [to], msg.as_string())
+        return True, ""
+    except Exception as e:
+        return False, _smtp_erro_amigavel(e)
+
+
+def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra: str | None) -> tuple[bool, str]:
+    cfg = _get_smtp_from_secrets()
+    if not cfg or not cfg["host"] or not cfg["user"]:
+        return False, (
+            "E-mail não configurado (adicione [ficha_email] com smtp_server e sender_email nos Secrets)."
+        )
+
+    to_list = [cfg["to"]] if cfg["to"] else []
+    if destinatario_extra and destinatario_extra.strip():
+        to_list.append(destinatario_extra.strip())
+    if not to_list:
+        return False, "Informe um e-mail de destino no campo abaixo (ou to_email em [ficha_email], opcional)."
+    for addr in to_list:
+        if not email_contato_formato_valido(addr):
+            return False, (
+                f"E-mail de destino inválido ({addr!r}) — use formato completo nome@dominio.com."
+            )
+
+    nome = _nome_candidato_ficha(dados)
+    msg = MIMEMultipart()
+    msg["Subject"] = f"Ficha Cadastral — Direcional Vendas RJ — {nome}"
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = ", ".join(to_list)
+
+    corpo_txt = (
+        "Segue em anexo a cópia da ficha cadastral enviada pelo formulário "
+        "Ficha Cadastral | Direcional Vendas RJ.\n\n"
+        f"Nome: {nome}\n"
+        f"CPF: {dados.get('cpf', '')}\n"
+    )
+    corpo_html = montar_html_email_ficha_pdf(dados)
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(corpo_txt, "plain", "utf-8"))
+    alt.attach(MIMEText(corpo_html, "html", "utf-8"))
+    msg.attach(alt)
+
+    part = MIMEApplication(pdf_bytes, _subtype="pdf")
+    part.add_header("Content-Disposition", "attachment", filename="ficha_cadastral_direcional_vendas_rj.pdf")
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["user"], cfg["password"])
+            server.sendmail(cfg["from_addr"], to_list, msg.as_string())
+        return True, "E-mail enviado com sucesso."
+    except Exception as e:
+        return False, _smtp_erro_amigavel(e)
+
+
+def _section_container():
+    """Container com borda quando suportado (Streamlit recente)."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
+def _render_secao_formulario(secoes: list[str]) -> None:
+    """Uma seção por vez; navegação por botões na parte inferior."""
+    ss = st.session_state
+    ss.setdefault("ficha_secao_idx", 0)
+    n = len(secoes)
+    if n == 0:
+        _alert_vermelho("Nenhuma seção de formulário configurada.")
+        return
+
+    idx = max(0, min(int(ss["ficha_secao_idx"]), n - 1))
+    ss["ficha_secao_idx"] = idx
+    sec = secoes[idx]
+    _garantir_campos_secao_de_snapshot(sec)
+
+    if ss.get("ficha_erros_secao_idx") is not None and int(ss["ficha_erros_secao_idx"]) != idx:
+        ss.pop("ficha_erros_secao", None)
+        ss.pop("ficha_erros_secao_idx", None)
+
+    rotulo_curto = _tab_label(sec)
+    st.caption(f"Só mais um pouco: **{idx + 1}** de **{n}** · {rotulo_curto}")
+    pct = 100.0 * float(idx + 1) / float(n)
+    st.markdown(
+        f'<div class="ficha-etapas-progress" role="progressbar" '
+        f'aria-valuenow="{idx + 1}" aria-valuemin="1" aria-valuemax="{n}" '
+        f'aria-label="Progresso das etapas do cadastro">'
+        f'<div class="ficha-etapas-progress-track">'
+        f'<div class="ficha-etapas-progress-fill" style="width:{pct:.4f}%"></div>'
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    with _section_container():
+        st.markdown(
+            f'<p class="section-head">{sec}</p>',
+            unsafe_allow_html=True,
+        )
+        # Campos que controlam visibilidade de outros devem ficar FORA do st.form: dentro do form
+        # o Streamlit só sincroniza o state no envio — ex.: «Sim» em CRECI, rede em Informações,
+        # **Estado civil** em Dados Pessoais (senão «Casado» não atualiza a tempo e o nome do cônjuge some).
+        dados_sec = _coletar_dados_formulario_completo()
+        if sec == "CRECI/TTI":
+            c_pc = next((c for c in CAMPOS if c["key"] == "possui_creci"), None)
+            if c_pc:
+                _widget_campo(c_pc)
+            dados_sec = _coletar_dados_formulario_completo()
+            if _formulario_exibe_creci_detalhado(dados_sec):
+                st.markdown(
+                    '<div class="ficha-input-label">Carteirinha do CRECI '
+                    '<span class="ficha-star-req" aria-hidden="true">*</span><br/>'
+                    '<span style="font-weight:400;color:#64748b">Envie foto ou PDF da carteirinha '
+                    "(obrigatório quando «Possui CRECI?» = Sim).</span></div>",
+                    unsafe_allow_html=True,
+                )
+                st.file_uploader(
+                    "Carteirinha do CRECI",
+                    type=["pdf", "png", "jpg", "jpeg"],
+                    key="ficha_creci_carteira_upload",
+                    label_visibility="collapsed",
+                )
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] != "possui_creci"
+            ]
+        elif sec == "Informações para contato":
+            c_un = next((c for c in CAMPOS if c["key"] == "unidade_negocio"), None)
+            if c_un:
+                _widget_campo(c_un)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] != "unidade_negocio"
+            ]
+        elif sec == "Dados Pessoais":
+            # Mesma razão do CRECI/rede: estado civil fora do form para o select atualizar o state
+            # antes do submit; nome e nascimento ficam fora só para manter a ordem visual (nome → nasc. → estado).
+            _chaves_fora_form_dados_pessoais = ("nome_completo", "birthdate", "estado_civil")
+            for _k in _chaves_fora_form_dados_pessoais:
+                c0 = next((x for x in CAMPOS if x["key"] == _k and x["sec"] == sec), None)
+                if c0:
+                    _widget_campo(c0)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] not in _chaves_fora_form_dados_pessoais
+            ]
+        else:
+            cols = campos_por_secao_visiveis(sec, dados_sec)
+
+        # st.form: ao usar «Avançar» / «Enviar», todos os valores da etapa são gravados de uma vez
+        # (evita depender de Enter ou blur em text_input/select).
+        form_key = f"ficha_etapa_{idx}"
+        with st.form(form_key, clear_on_submit=False, border=False):
+            # Grid 2 colunas: pares lado a lado; quando ímpar, o último ocupa largura total.
+            for i in range(0, len(cols), 2):
+                c1 = cols[i]
+                c2 = cols[i + 1] if i + 1 < len(cols) else None
+                if c2 is None:
+                    _widget_campo(c1)
+                    continue
+                left, right = st.columns(2)
+                with left:
+                    _widget_campo(c1)
+                with right:
+                    _widget_campo(c2)
+
+            st.markdown("<br/>", unsafe_allow_html=True)
+            if idx < n - 1:
+                col_avancar, col_voltar = st.columns(2)
+                with col_avancar:
+                    clicou_avancar = st.form_submit_button(
+                        "Avançar",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(idx <= 0),
+                    )
+            else:
+                st.markdown(
+                    '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
+                    unsafe_allow_html=True,
+                )
+                st.text_input(
+                    "Company website",
+                    key="ficha_hp_website",
+                    label_visibility="collapsed",
+                    max_chars=96,
+                )
+                st.markdown(
+                    '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
+                    "credenciamento na Direcional, conforme a LGPD. "
+                    '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.checkbox(
+                    "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. "
+                    "(campo obrigatório)",
+                    key="fld_lgpd_ficha",
+                    label_visibility="collapsed",
+                )
+                col_enviar, col_voltar = st.columns(2)
+                with col_enviar:
+                    clicou_enviar = st.form_submit_button(
+                        "Enviar meu cadastro",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(len(secoes) <= 1),
+                    )
+
+        if idx < n - 1:
+            if clicou_voltar:
+                ss["ficha_secao_idx"] = idx - 1
+                ss.pop("ficha_erros_secao", None)
+                ss.pop("ficha_erros_secao_idx", None)
+                st.rerun()
+            if clicou_avancar:
+                dados = _coletar_dados_formulario_completo()
+                erros_sec = validar_obrigatorios_secao(sec, dados)
+                if erros_sec:
+                    ss["ficha_erros_secao"] = erros_sec
+                    ss["ficha_erros_secao_idx"] = idx
+                    st.rerun()
+                _snapshot_persistir_secao_atual(sec)
+                _snapshot_mesclar_todos_fld_do_session_state()
+                ss.pop("ficha_erros_secao", None)
+                ss.pop("ficha_erros_secao_idx", None)
+                ss["ficha_secao_idx"] = idx + 1
+                st.rerun()
+        else:
+            if clicou_voltar:
+                ss.pop("ficha_erros_envio", None)
+                ss["ficha_secao_idx"] = max(0, len(secoes) - 2)
+                st.rerun()
+            if clicou_enviar:
+                _processar_envio_cadastro()
+
+        if ss.get("ficha_erros_secao_idx") == idx and ss.get("ficha_erros_secao"):
+            lista = "<br>".join(f"• {html.escape(e)}" for e in ss["ficha_erros_secao"])
+            _alert_vermelho_html(
+                f"<strong>Preencha os campos obrigatórios desta etapa:</strong><br>{lista}"
+            )
+
+
+def _limpar_session_formulario():
+    for c in CAMPOS:
+        sk = f"fld_{c['key']}"
+        if sk in st.session_state:
+            del st.session_state[sk]
+    for k in (
+        "fld_lgpd_ficha",
+        "fc_mail_extra",
+        "fc_mail_extra_popup",
+        "ficha_sucesso",
+        "ficha_secao_idx",
+        "ficha_erros_secao",
+        "ficha_erros_secao_idx",
+        "ficha_snap_campos",
+        "ficha_email_boas_vindas_ok",
+        "ficha_email_boas_vindas_msg",
+        "ficha_erros_envio",
+        "ficha_seg_t0",
+        "ficha_rl_envios_ts",
+        "ficha_hp_website",
+        "ficha_modo_teste_design",
+        "ficha_sf_retry_row",
+        "ficha_sf_retry_sid",
+        "ficha_sf_retry_wname",
+        "ficha_debug_envio",
+        "ficha_creci_carteira_upload",
+        "ficha_creci_drive_link",
+        "ficha_creci_drive_erro",
+        "ficha_creci_email_para",
+        "ficha_boas_vindas_popup_concluido",
+    ):
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def _definir_sucesso_pos_cadastro() -> None:
+    """Marca cadastro concluído e reabre o popup de boas-vindas (antes de «Concluir»)."""
+    ss = st.session_state
+    ss["ficha_sucesso"] = True
+    ss["ficha_boas_vindas_popup_concluido"] = False
+
+
+def _finalizar_popup_e_novo_cadastro() -> None:
+    """Após «Finalizar» no popup: limpa tudo e volta ao formulário (sem tela final)."""
+    _limpar_session_formulario()
+    ss = st.session_state
+    for k in ("ficha_dados_enviados", "sf_contact_id", "sf_erro", "sf_avisos"):
+        ss.pop(k, None)
+
+
+def _design_teste_habilitado() -> bool:
+    """Modo teste de layout: env `FICHA_DESIGN_TEST=1` ou URL `?design_test=1`."""
+    if FICHA_MODO_PRODUCAO:
+        return False
+    if (os.environ.get("FICHA_DESIGN_TEST") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        v = st.query_params.get("design_test", "")
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _design_teste_expander_aberto() -> bool:
+    try:
+        v = st.query_params.get("design_test", "")
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _dados_ficha_demo_design() -> dict[str, Any]:
+    """Dados fictícios para pré-visualizar PDF e e-mail no modo teste de design."""
+    demo: dict[str, Any] = {}
+    for c in CAMPOS:
+        k = c["key"]
+        tipo = c["tipo"]
+        op = c.get("opcoes") or []
+        if tipo == "multiselect":
+            cand = [x for x in op if x and str(x).strip() and x != "--Nenhum--"]
+            demo[k] = [cand[0]] if cand else ["RJ"]
+        elif tipo == "select":
+            cand = [x for x in op if x and str(x).strip() and x != "--Nenhum--"]
+            demo[k] = cand[0] if cand else "—"
+        elif tipo == "date":
+            demo[k] = date(1990, 5, 15)
+        elif tipo == "number":
+            demo[k] = 1.0
+        elif tipo == "checkbox":
+            demo[k] = True
+        elif tipo == "id":
+            demo[k] = ""
+        else:
+            demo[k] = f"[Preview] {c['label'][:48]}"
+    demo["nome_completo"] = "Maria Silva Santos (pré-visualização design)"
+    demo["account_name"] = _nome_conta_rh_padrao()
+    demo["cpf"] = "123.456.789-09"
+    demo["email"] = "maria.silva.demo@exemplo.com.br"
+    demo["mobile"] = "(21) 99999-0000"
+    return enriquecer_derivados_vendas_rj(demo)
+
+
+def _ativar_cenario_teste_design() -> None:
+    """Simula sucesso + popup sem planilha/Salesforce; preenche dados demo para ver PDF/e-mail."""
+    ss = st.session_state
+    _definir_sucesso_pos_cadastro()
+    ss["ficha_modo_teste_design"] = True
+    ss["ficha_dados_enviados"] = _dados_ficha_demo_design()
+    ss["sf_contact_id"] = None
+    ss["sf_erro"] = None
+    ss["sf_avisos"] = []
+
+
+def _processar_envio_cadastro() -> None:
+    """Grava planilha, tenta Salesforce e define tela de sucesso."""
+    ss = st.session_state
+    ss["ficha_debug_envio"] = []
+    _registrar_debug_envio("início_envio", "Fluxo principal iniciado.")
+    ss.pop("ficha_erros_envio", None)
+    ok_sec, msg_sec = verificar_antes_envio()
+    if not ok_sec:
+        _registrar_debug_envio("bloqueio_pré_envio", msg_sec)
+        ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
+        return
+    secoes_env = secoes_com_campos_visiveis()
+    idx_env = max(0, min(int(ss.get("ficha_secao_idx", 0)), len(secoes_env) - 1))
+    if secoes_env:
+        _snapshot_persistir_secao_atual(secoes_env[idx_env])
+    # Última etapa: valores do form acabam de entrar no session_state; etapas antigas já no snap.
+    _snapshot_mesclar_todos_fld_do_session_state()
+    dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario_completo())
+    erros = validar_obrigatorios(dados)
+    if (str(dados.get("possui_creci") or "").strip()) == "Sim" and not ss.get(
+        "ficha_creci_carteira_upload"
+    ):
+        erros.append("Carteirinha do CRECI * (envie PDF, JPG ou PNG)")
+    if not ss.get("fld_lgpd_ficha"):
+        erros.append("Concordância LGPD *")
+    if erros:
+        _registrar_debug_envio("falha_validação", "; ".join(str(x) for x in erros))
+        ss["ficha_erros_envio"] = {"kind": "validation", "items": erros}
+        return
+
+    ss.pop("ficha_modo_teste_design", None)
+
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if not creds:
+        _registrar_debug_envio("erro_google_credentials", "SERVICE_ACCOUNT_JSON ausente/inválido.")
+        _LOG_FICHA.error(
+            "Ficha cadastro: envio indisponível (mensagem genérica ao usuário) — "
+            "credenciais Google ausentes ou SERVICE_ACCOUNT_JSON inválido/ausente em "
+            "st.secrets['google_sheets']; verifique Secrets no deploy."
+        )
+        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
+        return
+
+    gs = {}
+    if hasattr(st, "secrets"):
+        try:
+            gs = dict(st.secrets.get("google_sheets", {}))
+        except Exception:
+            gs = {}
+    sid = str(gs.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
+    wname = str(gs.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME).strip() or DEFAULT_WORKSHEET_NAME
+
+    st.caption("**Carregando…** Aguarde — gravando seu cadastro. Não feche a página.")
+    bar_envio = st.progress(0.0)
+
+    payload, avisos = montar_payload_salesforce(dados)
+    _registrar_debug_envio(
+        "payload_salesforce_montado",
+        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+    )
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados))
+    linha = linha_planilha(dados, payload)
+    cab = cabecalho_planilha()
+
+    try:
+        bar_envio.progress(0.15)
+        row_num = anexar_linha(linha, cab, sid, wname, creds, gs)
+        _registrar_debug_envio("planilha_append_ok", f"linha={row_num} planilha={sid} aba={wname}")
+        bar_envio.progress(0.38)
+    except Exception as e:
+        erro_txt = str(e or "").strip()
+        erro_low = erro_txt.lower()
+        msg = FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO
+        if "spreadsheet" in erro_low and "not found" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio porque a planilha configurada não foi encontrada "
+                "ou não está acessível para a conta de serviço."
+            )
+        elif "worksheet" in erro_low and "not found" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio porque a aba configurada na planilha não foi encontrada."
+            )
+        elif "permission" in erro_low or "forbidden" in erro_low or "insufficient" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio por falta de permissão na planilha."
+            )
+        _LOG_FICHA.exception(
+            "Ficha cadastro: falha em anexar_linha (planilha). "
+            "planilha_id=%r aba=%r mensagem_ao_usuario=%r tipo_excecao=%s erro_str=%r",
+            sid,
+            wname,
+            msg,
+            type(e).__name__,
+            erro_txt or repr(e),
+        )
+        _registrar_debug_envio("planilha_append_erro", f"{type(e).__name__}: {e}")
+        ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
+        return
+
+    ss["ficha_dados_enviados"] = dados
+    ss["sf_contact_id"] = None
+    ss["sf_erro"] = None
+    ss["sf_avisos"] = []
+    ss["ficha_sf_retry_row"] = row_num
+    ss["ficha_sf_retry_sid"] = sid
+    ss["ficha_sf_retry_wname"] = wname
+    ss["ficha_creci_drive_link"] = None
+    ss["ficha_creci_drive_erro"] = None
+    ss["ficha_creci_email_para"] = None
+
+    up_creci = ss.get("ficha_creci_carteira_upload")
+    if up_creci and (str(dados.get("possui_creci") or "").strip()) == "Sim":
+        sec = st.secrets if hasattr(st, "secrets") else None
+        parent_drive = _drive_parent_id_identidade(sec)
+        dono_email = _drive_email_dono_apos_upload(sec)
+        dlink, derr = upload_creci_carteira_google_drive(
+            creds,
+            parent_drive,
+            up_creci,
+            dados,
+            transferir_propriedade_para_email=dono_email,
+        )
+        if dlink:
+            ss["ficha_creci_drive_link"] = dlink
+        else:
+            dest_doc = _email_destino_documento_identidade(sec)
+            ok_mail, err_mail = enviar_creci_carteira_por_email(up_creci, dados, dest_doc)
+            if ok_mail:
+                ss["ficha_creci_email_para"] = dest_doc
+            else:
+                partes = [x for x in (derr, err_mail) if x]
+                ss["ficha_creci_drive_erro"] = " | ".join(partes) if partes else (
+                    "Falha no Drive e no envio por e-mail (carteirinha CRECI)."
+                )
+    bar_envio.progress(0.52)
+
+    _aplicar_secrets_sf()
+    bar_envio.progress(0.58)
+    if not _credenciais_salesforce_ok():
+        _registrar_debug_envio("sf_config_ausente", "Secrets USER/PASSWORD/TOKEN ausentes.")
+        atualizar_status_envio_salesforce(
+            sid,
+            wname,
+            creds,
+            row_num,
+            "Erro",
+            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        bar_envio.progress(0.88)
+        _tentar_enviar_email_boas_vindas(dados, None)
+        bar_envio.progress(1.0)
+        _definir_sucesso_pos_cadastro()
+        st.rerun()
+        return
+
+    if not _SF_SDK_DISPONIVEL:
+        _registrar_debug_envio("sf_sdk_indisponivel", "simple_salesforce não instalado.")
+        atualizar_status_envio_salesforce(
+            sid,
+            wname,
+            creds,
+            row_num,
+            "Erro",
+            "simple_salesforce não instalado.",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        bar_envio.progress(0.88)
+        _tentar_enviar_email_boas_vindas(dados, None)
+        bar_envio.progress(1.0)
+        _definir_sucesso_pos_cadastro()
+        st.rerun()
+        return
+
+    bar_envio.progress(0.68)
+
+    sf = conectar_salesforce()
+    bar_envio.progress(0.78)
+    if not sf:
+        _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
+        atualizar_status_envio_salesforce(
+            sid,
+            wname,
+            creds,
+            row_num,
+            "Erro",
+            "Falha ao conectar ao Salesforce (credenciais ou rede).",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
+        ss["sf_avisos"] = avisos
+        bar_envio.progress(0.88)
+        _tentar_enviar_email_boas_vindas(dados, None)
+        bar_envio.progress(1.0)
+        _definir_sucesso_pos_cadastro()
+        st.rerun()
+        return
+
+    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
+    _registrar_debug_envio(
+        "payload_sf_enriquecido",
+        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+    )
+    bar_envio.progress(0.85)
+    cid, err = criar_contato_payload(sf, payload)
+    bar_envio.progress(0.93)
+    link = _url_contact(cid) if cid else ""
+
+    if cid:
+        _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
+        atualizar_status_envio_salesforce(
+            sid, wname, creds, row_num, "Sucesso", "", link, payload_final=payload
+        )
+        ss["sf_contact_id"] = cid
+        ss["sf_erro"] = None
+        ss.pop("ficha_sf_retry_row", None)
+        ss.pop("ficha_sf_retry_sid", None)
+        ss.pop("ficha_sf_retry_wname", None)
+    else:
+        err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        _registrar_debug_envio("sf_create_erro", err_full)
+        atualizar_status_envio_salesforce(
+            sid, wname, creds, row_num, "Erro", err_full[:49000], "", payload_final=payload
+        )
+        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+
+    ss["sf_avisos"] = avisos
+    if avisos:
+        _registrar_debug_envio("avisos_fluxo", " | ".join(str(x) for x in avisos))
+    bar_envio.progress(0.96)
+    _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
+    bar_envio.progress(1.0)
+    _definir_sucesso_pos_cadastro()
+    st.rerun()
+
+
+def _retentar_salesforce_ultimo_envio() -> None:
+    """
+    Repete apenas a criação do contato no Salesforce com os mesmos dados já gravados na planilha.
+    Atualiza a mesma linha (status / log / link); não insere nova linha.
+    """
+    ss = st.session_state
+    dados = ss.get("ficha_dados_enviados")
+    row_num = ss.get("ficha_sf_retry_row")
+    sid = ss.get("ficha_sf_retry_sid")
+    wname = ss.get("ficha_sf_retry_wname")
+    if not isinstance(dados, dict) or row_num is None:
+        ss["sf_erro"] = "Não há dados salvos para retentativa. Use «Começar um novo cadastro»."
+        return
+    if not sid or not wname:
+        ss["sf_erro"] = "Contexto da planilha perdido; não é possível retentar o envio ao Salesforce."
+        return
+
+    ok_sec, msg_sec = verificar_antes_envio()
+    if not ok_sec:
+        ss["sf_erro"] = f"Retentativa bloqueada: {msg_sec}"
+        return
+
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if not creds:
+        ss["sf_erro"] = "Credenciais Google Sheets ausentes — necessárias para atualizar o status na planilha."
+        return
+
+    dados_c = dict(dados)
+    payload, avisos = montar_payload_salesforce(dados_c)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados_c))
+
+    _aplicar_secrets_sf()
+    if not _credenciais_salesforce_ok():
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        return
+
+    if not _SF_SDK_DISPONIVEL:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "simple_salesforce não instalado.",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        return
+
+    with st.spinner("Tentando novamente no Salesforce..."):
+        sf = conectar_salesforce()
+    if not sf:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "Falha ao conectar ao Salesforce (credenciais ou rede).",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
+        ss["sf_avisos"] = avisos
+        return
+
+    _aplicar_enriquecimentos_payload_sf(payload, dados_c, sf, avisos)
+    cid, err = criar_contato_payload(sf, payload)
+    link = _url_contact(cid) if cid else ""
+
+    if cid:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Sucesso",
+            "",
+            link,
+            payload_final=payload,
+        )
+        ss["sf_contact_id"] = cid
+        ss["sf_erro"] = None
+        ss.pop("ficha_sf_retry_row", None)
+        ss.pop("ficha_sf_retry_sid", None)
+        ss.pop("ficha_sf_retry_wname", None)
+    else:
+        err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            err_full[:49000],
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+
+    ss["sf_avisos"] = avisos
+    _tentar_enviar_email_boas_vindas(dados_c, cid if cid else None)
+
+
+def gerar_workbook_ficha_cadastro_bytes(dados: Dict[str, Any]) -> bytes:
+    """
+    Planilha com aba «Respostas» (rótulos na linha 1, valores na 2) e «Dicionário»
+    (rótulo × nome de API Salesforce).
+    """
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Respostas"
+    cols = campos_planilha_corretor()
+    for j, c in enumerate(cols, start=1):
+        ws1.cell(row=1, column=j, value=c["label"])
+        k = c["key"]
+        v = dados.get(k)
+        if c["tipo"] == "multiselect" and isinstance(v, list):
+            ws1.cell(row=2, column=j, value="; ".join(str(x) for x in v))
+        elif isinstance(v, datetime):
+            ws1.cell(row=2, column=j, value=v.isoformat())
+        elif isinstance(v, date):
+            ws1.cell(row=2, column=j, value=v.isoformat())
+        elif v is None:
+            ws1.cell(row=2, column=j, value="")
+        else:
+            ws1.cell(row=2, column=j, value=str(v))
+
+    ws2 = wb.create_sheet("Dicionário")
+    ws2.cell(row=1, column=1, value="Rótulo do campo")
+    ws2.cell(row=1, column=2, value="Nome do campo (API Salesforce)")
+    r = 2
+    for c in CAMPOS:
+        sf = c.get("sf")
+        if not sf:
+            continue
+        lab = str(c.get("label") or "")
+        if lab.endswith(" *"):
+            lab = lab[:-2].rstrip()
+        ws2.cell(row=r, column=1, value=lab)
+        ws2.cell(row=r, column=2, value=str(sf))
+        r += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _render_recursos_pos_concluir_na_pagina() -> None:
+    """Mapa, vídeo do simulador e links — na página principal após «Concluir» no popup de boas-vindas."""
+    ss = st.session_state
+    if ss.get("ficha_modo_teste_design"):
+        st.info(
+            "Modo teste de design: pré-visualização com **dados fictícios** — nenhum envio real foi feito."
+        )
+    st.markdown("##### Empreendimentos no mapa")
+    st.caption(
+        "Minimapa: **+** / **−** para zoom, arraste para mover e **tela cheia** no canto superior direito."
+    )
+    try:
+        from empreendimentos_mapa import render_mapa_empreendimentos_streamlit
+
+        render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
+    except Exception:
+        st.caption("Mapa indisponível no momento.")
+    st.markdown("##### Como usar o simulador")
+    st.markdown(
+        f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
+        f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_SIMULADOR_EMBED)}" '
+        f'title="Como usar o simulador de negociação" loading="lazy" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
+        f'allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_SIMULADOR}]({URL_YOUTUBE_SIMULADOR})")
+
+    st.markdown("##### Links úteis")
+    st.link_button(
+        "Materiais de marketing (Linktree)",
+        URL_LINKTREE_MARKETING,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Pedir acesso ao simulador de negociação",
+        URL_FORM_SIMULADOR,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Treinamentos — Diri Academy",
+        URL_DIRI_ACADEMY,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Salesforce (portal de vendas)",
+        URL_SALESFORCE_VENDAS,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Entrar no grupo — WhatsApp",
+        URL_WHATSAPP_EQUIPE,
+        use_container_width=True,
+    )
+
+    st.markdown("")
+    if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_pos_cadastro_fechar"):
+        _finalizar_popup_e_novo_cadastro()
+        st.rerun()
+
+
+@st.dialog("Boas-vindas", width="medium")
+def _dialog_recursos_pos_cadastro() -> None:
+    """Popup inicial: sucesso, mensagem de boas-vindas e vídeo do RH; mapa e demais recursos ficam na página após «Concluir»."""
+    ss = st.session_state
+    modo_design = bool(ss.get("ficha_modo_teste_design"))
+
+    if modo_design:
+        _render_status_final_tela(
+            sucesso=True,
+            mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
+        )
+        st.markdown(
+            "Assista ao vídeo de boas-vindas do RH e clique em **Concluir** para ver na página o mapa, "
+            "o vídeo do simulador e os links úteis."
+        )
+        st.caption("No modo teste, PDF e e-mail usam dados fictícios.")
+    else:
+        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
+        st.markdown(
+            """
+**Recebemos o seu cadastro com sucesso.** Você deve receber **automaticamente** no e-mail informado uma mensagem
+com a apresentação da Direcional, **links de materiais** e, quando possível, o **PDF da ficha** em anexo.
+
+Assista ao vídeo de boas-vindas do RH abaixo. Em seguida clique em **Concluir** para abrir na página o **mapa** de
+empreendimentos, o **vídeo** do simulador e os **links** úteis.
+            """.strip()
+        )
+
+    st.markdown("##### Vídeo de boas-vindas — RH")
+    st.markdown(
+        f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
+        f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_BOAS_VINDAS_RH_EMBED)}" '
+        f'title="Boas-vindas — RH" loading="lazy" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
+        f'allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_BOAS_VINDAS_RH}]({URL_YOUTUBE_BOAS_VINDAS_RH})")
+
+    st.markdown("")
+    if st.button("Concluir", type="primary", use_container_width=True, key="ficha_dialog_boas_vindas_concluir"):
+        ss["ficha_boas_vindas_popup_concluido"] = True
+        st.rerun()
+
+
+def main():
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(
+        page_title="Credenciamento | Direcional Vendas RJ",
+        page_icon=str(fav) if fav else None,
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
+    _aplicar_secrets_sf()
+    aplicar_estilo()
+    injetar_cliente_e_meta()
+
+    ss = st.session_state
+    ss.setdefault("ficha_sucesso", False)
+
+    if _teste_planilha_sf_habilitado():
+        _render_sidebar_teste_planilha_sf()
+
+    if ss.get("ficha_sucesso"):
+        if not ss.get("ficha_boas_vindas_popup_concluido"):
+            _dialog_recursos_pos_cadastro()
+        _cabecalho_pagina()
+        if ss.get("ficha_boas_vindas_popup_concluido"):
+            _render_recursos_pos_concluir_na_pagina()
+        st.markdown(
+            '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    _cabecalho_pagina(com_intro_formulario=True)
+
+    if _design_teste_habilitado():
+        with st.expander(
+            "Modo teste de design — popup de conclusão (sem enviar dados)",
+            expanded=_design_teste_expander_aberto(),
+        ):
+            st.markdown(
+                "Simula o **cadastro concluído**: abre o **popup** de boas-vindas (vídeo do RH); após **Concluir**, "
+                "o **mapa**, o vídeo do simulador e os **links** aparecem na página. Não grava na planilha nem no "
+                "Salesforce. PDF e e-mail usam **dados fictícios**."
+            )
+            st.caption(
+                "Ative este bloco com a variável de ambiente **FICHA_DESIGN_TEST=1** "
+                "ou com **?design_test=1** na URL (o expander abre já expandido)."
+            )
+            if st.button(
+                "Simular cadastro enviado e abrir o popup",
+                type="secondary",
+                key="ficha_simular_sucesso_design",
+            ):
+                _ativar_cenario_teste_design()
+                st.rerun()
+
+    _init_defaults()
+    iniciar_sessao_formulario()
+    secoes = secoes_com_campos_visiveis()
+    _render_secao_formulario(secoes)
+
+    fe = ss.get("ficha_erros_envio")
+    if fe:
+        kind = fe.get("kind")
+        if kind == "validation":
+            linhas = "<br>".join(f"• {html.escape(e)}" for e in fe.get("items") or [])
+            _alert_vermelho_html(
+                f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
+            )
+        elif kind == "html":
+            _alert_vermelho(FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO)
+        elif kind == "text":
+            _alert_vermelho(fe.get("text") or "")
+
+    trilha = list(ss.get("ficha_debug_envio") or [])
+    if trilha:
+        with st.expander("Debug do envio (planilha e Salesforce)", expanded=False):
+            st.caption(
+                "Use este painel para diagnóstico quando houver divergência entre planilha e Salesforce."
+            )
+            st.json(trilha)
+
+
+if __name__ == "__main__":
+    main()
