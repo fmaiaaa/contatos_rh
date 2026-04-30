@@ -78,6 +78,66 @@ def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
         return None, f"[{err_kind}] {err_msg}\n\n{err_trace}"
 
 
+def _agora_texto_brasilia() -> str:
+    """Data/hora atual em formato legível para registrar em Observacoes__c."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        dt = datetime.now(ZoneInfo("America/Sao_Paulo"))
+    except Exception:
+        dt = datetime.now()
+    return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _erro_relacionado_naturalidade_uf(err: Any) -> bool:
+    """Heurística para identificar erro de validação de naturalidade/UF nascimento."""
+    txt = (str(err or "")).upper()
+    return any(
+        tok in txt
+        for tok in (
+            "NATURALIDADE",
+            "UF_NATURALIDADE",
+            "UF NASCIMENTO",
+            "UF_NASCIMENTO",
+            "NASCIMENTO",
+        )
+    )
+
+
+def _garantir_obs_automacao(
+    payload: Dict[str, Any], *, naturalidade_fallback: bool = False
+) -> None:
+    """Garante trilha mínima da automação no campo Observacoes__c."""
+    base = (str(payload.get("Observacoes__c") or "")).strip()
+    linhas = [x for x in base.splitlines() if x.strip()] if base else []
+    linhas.append(f"Criado via Automação em {_agora_texto_brasilia()}.")
+    if naturalidade_fallback:
+        linhas.append("Ajuste técnico automático no envio: Naturalidade definida como Brasília.")
+    payload["Observacoes__c"] = "\n".join(linhas).strip()
+
+
+def criar_contato_payload_com_fallback_naturalidade(
+    sf: Any, payload: Dict[str, Any], avisos: List[str]
+) -> tuple[Any, Any, Dict[str, Any]]:
+    """
+    Tenta create padrão; se erro de naturalidade/UF, tenta novamente com Naturalidade__c = Brasília.
+    Não expõe fallback no front: registra apenas aviso técnico.
+    """
+    payload_envio = dict(payload)
+    cid, err = criar_contato_payload(sf, payload_envio)
+    if cid or not _erro_relacionado_naturalidade_uf(err):
+        return cid, err, payload_envio
+
+    payload_retry = dict(payload_envio)
+    payload_retry["Naturalidade__c"] = "Brasília"
+    _garantir_obs_automacao(payload_retry, naturalidade_fallback=True)
+    cid2, err2 = criar_contato_payload(sf, payload_retry)
+    if cid2:
+        avisos.append("Ajuste técnico aplicado no envio ao Salesforce.")
+        return cid2, None, payload_retry
+    return None, err2, payload_retry
+
+
 def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
     """
     INVALID_CROSS_REFERENCE_KEY em RecordTypeId: o Id 012… costuma estar certo; o usuário da API
@@ -1793,6 +1853,7 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
     extra_block = "\n".join(extras_obs)
     if extra_block:
         payload["Observacoes__c"] = (obs_final + "\n" + extra_block).strip() if obs_final else extra_block
+    _garantir_obs_automacao(payload)
 
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
     _ajustar_payload_creci_conforme_possui(payload, dados)
@@ -2651,13 +2712,6 @@ GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS: Tuple[str, ...] = tuple(
         if linha.strip()
     )
 )
-# Pasta raiz no Google Drive para documento de identidade (compartilhar com o e-mail da service account do JSON).
-# Padrão: pasta na conta pessoal indicada pelo time; sobrescreva com [google_drive] PARENT_FOLDER_ID nos Secrets.
-DRIVE_IDENTIDADE_PASTA_RAIZ_ID = "1x2vGhf3Fnt_rtykdrU3nqJD7kh_pnrSv"
-
-# Documento de identidade: e-mail só se o upload ao Drive falhar (fallback; [ficha_email] SMTP).
-IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO = "ynara.silva@direcional.com.br"
-
 # Mensagens ao corretor: sem citar planilha, Salesforce ou outros sistemas internos.
 FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO = (
     "Não foi possível concluir o envio no momento. Tente novamente em alguns minutos."
@@ -2713,267 +2767,6 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
         return None
     except Exception:
         return None
-
-
-def _drive_parent_id_identidade(st_secrets: Any) -> str:
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            gd = st_secrets.get("google_drive")
-            if isinstance(gd, dict):
-                pid = (
-                    gd.get("PARENT_FOLDER_ID")
-                    or gd.get("identidade_parent_folder_id")
-                    or ""
-                ).strip()
-                if pid:
-                    return pid
-    except Exception:
-        pass
-    return DRIVE_IDENTIDADE_PASTA_RAIZ_ID
-
-
-def _drive_email_dono_apos_upload(st_secrets: Any) -> str:
-    """
-    E-mail para o qual a API tenta transferir a propriedade do arquivo após o upload
-    (conta de serviço não tem cota; dono passa a ser você / Workspace).
-    Secrets [google_drive]: TRANSFER_OWNERSHIP_TO_EMAIL ou FILE_OWNER_EMAIL ou OWNER_EMAIL.
-    """
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            gd = st_secrets.get("google_drive")
-            if isinstance(gd, dict):
-                for key in (
-                    "TRANSFER_OWNERSHIP_TO_EMAIL",
-                    "transfer_ownership_to_email",
-                    "FILE_OWNER_EMAIL",
-                    "file_owner_email",
-                    "OWNER_EMAIL",
-                    "owner_email",
-                ):
-                    v = str(gd.get(key) or "").strip()
-                    if v:
-                        return v
-    except Exception:
-        pass
-    return ""
-
-
-def _drive_transferir_propriedade_arquivo(
-    service: Any, file_id: str, email: str
-) -> Optional[str]:
-    """
-    Tenta `permissions.create` com transferOwnership (Drive v3).
-    Retorna None se OK; senão mensagem de erro para exibir ao usuário.
-    """
-    em = (email or "").strip()
-    if not em or not file_id:
-        return None
-    try:
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "user", "role": "owner", "emailAddress": em},
-            transferOwnership=True,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-        return None
-    except Exception as e:
-        return str(e)
-
-
-def _drive_escapar_nome_query(nome: str) -> str:
-    return (nome or "").replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _drive_obter_ou_criar_subpasta(service: Any, parent_id: str, nome_pasta: str) -> str:
-    """Retorna o ID da subpasta `nome_pasta` dentro de `parent_id` (cria se não existir)."""
-    q = (
-        f"name='{_drive_escapar_nome_query(nome_pasta)}' and "
-        f"'{parent_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    res = (
-        service.files()
-        .list(
-            q=q,
-            spaces="drive",
-            fields="files(id,name)",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
-    )
-    files = res.get("files") or []
-    if files:
-        return str(files[0]["id"])
-    body = {
-        "name": nome_pasta,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    created = service.files().create(
-        body=body, fields="id", supportsAllDrives=True
-    ).execute()
-    return str(created["id"])
-
-
-def _safe_filename_part(s: str) -> str:
-    t = re.sub(r"[^\w\-]+", "_", (s or "").strip(), flags=re.UNICODE)[:48]
-    return t or "arquivo"
-
-
-def _drive_nome_arquivo_identidade(dados: Dict[str, Any], nome_original: str) -> str:
-    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
-    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
-    suf = Path(nome_original or "doc").suffix.lower()
-    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
-        suf = ".pdf"
-    try:
-        from zoneinfo import ZoneInfo
-
-        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
-    except Exception:
-        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"identidade_{cpf_l}_{nc}_{agora}{suf}"
-
-
-def _drive_nome_arquivo_creci_carteira(dados: Dict[str, Any], nome_original: str) -> str:
-    cpf_l = re.sub(r"\D", "", str(dados.get("cpf") or ""))[:11] or "sem_cpf"
-    nc = _safe_filename_part(str(dados.get("nome_completo") or "corretor"))
-    suf = Path(nome_original or "doc").suffix.lower()
-    if suf not in (".pdf", ".png", ".jpg", ".jpeg"):
-        suf = ".pdf"
-    try:
-        from zoneinfo import ZoneInfo
-
-        agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y%m%d_%H%M%S")
-    except Exception:
-        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"creci_carteira_{cpf_l}_{nc}_{agora}{suf}"
-
-
-def _upload_arquivo_google_drive_com_nome(
-    creds_dict: Dict[str, Any],
-    parent_folder_id: str,
-    uploaded: Any,
-    dados: Dict[str, Any],
-    nome_arquivo_fn: Callable[[Dict[str, Any], str], str],
-    *,
-    transferir_propriedade_para_email: str = "",
-) -> Tuple[Optional[str], str]:
-    """Envia binário para subpasta do dia; `nome_arquivo_fn` define o nome no Drive."""
-    try:
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseUpload
-    except ImportError:
-        return (
-            None,
-            "Dependência ausente: instale com «pip install google-api-python-client google-auth-httplib2» "
-            "e faça **redeploy** no Streamlit Cloud (o requirements.txt na pasta do app deve listar esses pacotes).",
-        )
-
-    try:
-        try:
-            from zoneinfo import ZoneInfo
-
-            dia = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d")
-        except Exception:
-            dia = datetime.now().strftime("%Y-%m-%d")
-
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        folder_dia_id = _drive_obter_ou_criar_subpasta(service, parent_folder_id, dia)
-
-        raw = uploaded.getvalue()
-        if not raw:
-            return None, "Arquivo vazio."
-
-        mime = getattr(uploaded, "type", None) or "application/octet-stream"
-        nome_out = nome_arquivo_fn(dados, getattr(uploaded, "name", "") or "")
-
-        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=True)
-        body = {"name": nome_out, "parents": [folder_dia_id]}
-        created = (
-            service.files()
-            .create(body=body, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
-            .execute()
-        )
-        fid = (created.get("id") or "").strip()
-        link = (created.get("webViewLink") or "").strip()
-        if not link and fid:
-            link = f"https://drive.google.com/file/d/{fid}/view"
-
-        aviso = ""
-        te = (transferir_propriedade_para_email or "").strip()
-        if te and fid:
-            terr = _drive_transferir_propriedade_arquivo(service, fid, te)
-            if terr:
-                aviso = (
-                    f"Arquivo enviado, mas a transferência de propriedade para {te} falhou: {terr} "
-                    "(em Shared Drive a propriedade é do drive; em Gmail pessoal a API pode bloquear transferência a partir de conta de serviço)."
-                )
-        return (link or None), aviso
-    except Exception as e:
-        msg = str(e)
-        low = msg.lower()
-        if "404" in msg and ("not found" in low or "filenotfound" in low or "file not found" in low):
-            msg += (
-                " — Confirme o ID da pasta pai nos Secrets [google_drive] PARENT_FOLDER_ID. "
-                "A pasta precisa existir e estar compartilhada com o e-mail «client_email» da conta de serviço (JSON), "
-                "como Editor (o link no navegador pode abrir para você mesmo sem a API enxergar a pasta)."
-            )
-        if "storagequota" in low or "storage quota" in low or "do not have storage quota" in low:
-            msg += (
-                " — Prefira pasta dentro de um **Shared Drive** ou **Meu Drive** seu compartilhado com a service account; "
-                "opcionalmente defina [google_drive] TRANSFER_OWNERSHIP_TO_EMAIL com seu e-mail após o upload."
-            )
-        return None, msg
-
-
-def upload_identidade_google_drive(
-    creds_dict: Dict[str, Any],
-    parent_folder_id: str,
-    uploaded: Any,
-    dados: Dict[str, Any],
-    *,
-    transferir_propriedade_para_email: str = "",
-) -> Tuple[Optional[str], str]:
-    """
-    Envia o arquivo para subpasta do dia (AAAA-MM-DD em Brasília) dentro de `parent_folder_id`.
-    Use pasta no **Meu Drive** de um usuário (compartilhada com a service account) ou **Shared Drive**;
-    opcionalmente `transferir_propriedade_para_email` repassa a propriedade após o create (API Drive).
-    Retorna (link_webViewLink ou None, mensagem_erro ou aviso — ex.: upload OK mas transferência falhou).
-    """
-    return _upload_arquivo_google_drive_com_nome(
-        creds_dict,
-        parent_folder_id,
-        uploaded,
-        dados,
-        _drive_nome_arquivo_identidade,
-        transferir_propriedade_para_email=transferir_propriedade_para_email,
-    )
-
-
-def upload_creci_carteira_google_drive(
-    creds_dict: Dict[str, Any],
-    parent_folder_id: str,
-    uploaded: Any,
-    dados: Dict[str, Any],
-    *,
-    transferir_propriedade_para_email: str = "",
-) -> Tuple[Optional[str], str]:
-    """Upload da carteirinha CRECI (mesma pasta lógica do documento de identidade)."""
-    return _upload_arquivo_google_drive_com_nome(
-        creds_dict,
-        parent_folder_id,
-        uploaded,
-        dados,
-        _drive_nome_arquivo_creci_carteira,
-        transferir_propriedade_para_email=transferir_propriedade_para_email,
-    )
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
@@ -5425,142 +5218,6 @@ def _get_smtp_from_secrets():
         return None
 
 
-def _email_destino_documento_identidade(st_secrets: Any) -> str:
-    """Sobrescreva em [ficha_email] IDENTIDADE_DEST_EMAIL (ou identidade_dest_email)."""
-    try:
-        if st_secrets and hasattr(st_secrets, "get"):
-            fe = st_secrets.get("ficha_email", {})
-            if isinstance(fe, dict):
-                for key in (
-                    "IDENTIDADE_DEST_EMAIL",
-                    "identidade_dest_email",
-                    "DOCUMENTO_IDENTIDADE_DESTINO",
-                    "documento_identidade_destino",
-                ):
-                    v = str(fe.get(key) or "").strip()
-                    if v and email_contato_formato_valido(v):
-                        return v
-    except Exception:
-        pass
-    return IDENTIDADE_DOCUMENTO_EMAIL_DESTINO_PADRAO
-
-
-def enviar_documento_identidade_por_email(
-    uploaded: Any, dados: Dict[str, Any], destinatario: str
-) -> Tuple[bool, str]:
-    """
-    Fallback: envia o documento de identidade por e-mail ([ficha_email] SMTP) quando o upload ao Drive falha.
-    """
-    cfg = _get_smtp_from_secrets()
-    if not cfg or not cfg["host"] or not cfg["user"]:
-        return False, (
-            "SMTP não configurado — adicione [ficha_email] com smtp_server, sender_email e sender_password nos Secrets."
-        )
-    to = (destinatario or "").strip()
-    if not email_contato_formato_valido(to):
-        return False, f"E-mail de destino inválido ({to!r})."
-
-    raw = uploaded.getvalue()
-    if not raw:
-        return False, "Arquivo vazio."
-
-    nome_arq = _drive_nome_arquivo_identidade(dados, getattr(uploaded, "name", "") or "")
-    mime = (getattr(uploaded, "type", None) or "").strip().lower() or "application/octet-stream"
-    if mime == "application/pdf" or nome_arq.lower().endswith(".pdf"):
-        sub = "pdf"
-    elif mime in ("image/jpeg", "image/jpg") or nome_arq.lower().endswith((".jpg", ".jpeg")):
-        sub = "jpeg"
-    elif mime == "image/png" or nome_arq.lower().endswith(".png"):
-        sub = "png"
-    else:
-        sub = "octet-stream"
-
-    nome_cand = _nome_candidato_ficha(dados)
-    msg = MIMEMultipart()
-    msg["Subject"] = f"[Vendas RJ] Documento de identidade — {nome_cand}"
-    msg["From"] = cfg["from_addr"]
-    msg["To"] = to
-
-    corpo = (
-        "Documento de identidade enviado pelo formulário de credenciamento (Direcional Vendas RJ).\n\n"
-        f"Nome: {nome_cand}\n"
-        f"CPF: {dados.get('cpf', '')}\n"
-        f"E-mail no cadastro: {dados.get('email', '')}\n"
-        f"Celular: {dados.get('mobile', '')}\n"
-    )
-    msg.attach(MIMEText(corpo, "plain", "utf-8"))
-
-    part = MIMEApplication(raw, _subtype=sub)
-    part.add_header("Content-Disposition", "attachment", filename=nome_arq)
-    msg.attach(part)
-
-    try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-            server.starttls()
-            server.login(cfg["user"], cfg["password"])
-            server.sendmail(cfg["from_addr"], [to], msg.as_string())
-        return True, ""
-    except Exception as e:
-        return False, _smtp_erro_amigavel(e)
-
-
-def enviar_creci_carteira_por_email(
-    uploaded: Any, dados: Dict[str, Any], destinatario: str
-) -> Tuple[bool, str]:
-    """Fallback: envia a carteirinha CRECI por e-mail quando o upload ao Drive falha."""
-    cfg = _get_smtp_from_secrets()
-    if not cfg or not cfg["host"] or not cfg["user"]:
-        return False, (
-            "SMTP não configurado — adicione [ficha_email] com smtp_server, sender_email e sender_password nos Secrets."
-        )
-    to = (destinatario or "").strip()
-    if not email_contato_formato_valido(to):
-        return False, f"E-mail de destino inválido ({to!r})."
-
-    raw = uploaded.getvalue()
-    if not raw:
-        return False, "Arquivo vazio."
-
-    nome_arq = _drive_nome_arquivo_creci_carteira(dados, getattr(uploaded, "name", "") or "")
-    mime = (getattr(uploaded, "type", None) or "").strip().lower() or "application/octet-stream"
-    if mime == "application/pdf" or nome_arq.lower().endswith(".pdf"):
-        sub = "pdf"
-    elif mime in ("image/jpeg", "image/jpg") or nome_arq.lower().endswith((".jpg", ".jpeg")):
-        sub = "jpeg"
-    elif mime == "image/png" or nome_arq.lower().endswith(".png"):
-        sub = "png"
-    else:
-        sub = "octet-stream"
-
-    nome_cand = _nome_candidato_ficha(dados)
-    msg = MIMEMultipart()
-    msg["Subject"] = f"[Vendas RJ] Carteirinha CRECI — {nome_cand}"
-    msg["From"] = cfg["from_addr"]
-    msg["To"] = to
-
-    corpo = (
-        "Carteirinha do CRECI enviada pelo formulário de credenciamento (Direcional Vendas RJ).\n\n"
-        f"Nome: {nome_cand}\n"
-        f"CPF: {dados.get('cpf', '')}\n"
-        f"E-mail no cadastro: {dados.get('email', '')}\n"
-        f"Celular: {dados.get('mobile', '')}\n"
-    )
-    msg.attach(MIMEText(corpo, "plain", "utf-8"))
-
-    part = MIMEApplication(raw, _subtype=sub)
-    part.add_header("Content-Disposition", "attachment", filename=nome_arq)
-    msg.attach(part)
-
-    try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-            server.starttls()
-            server.login(cfg["user"], cfg["password"])
-            server.sendmail(cfg["from_addr"], [to], msg.as_string())
-        return True, ""
-    except Exception as e:
-        return False, _smtp_erro_amigavel(e)
-
-
 def enviar_email_pdf(pdf_bytes: bytes, dados: dict[str, Any], destinatario_extra: str | None) -> tuple[bool, str]:
     cfg = _get_smtp_from_secrets()
     if not cfg or not cfg["host"] or not cfg["user"]:
@@ -5813,10 +5470,6 @@ def _limpar_session_formulario():
         "ficha_sf_retry_sid",
         "ficha_sf_retry_wname",
         "ficha_debug_envio",
-        "ficha_creci_carteira_upload",
-        "ficha_creci_drive_link",
-        "ficha_creci_drive_erro",
-        "ficha_creci_email_para",
         "ficha_boas_vindas_popup_concluido",
     ):
         if k in st.session_state:
@@ -6004,9 +5657,6 @@ def _processar_envio_cadastro() -> None:
     ss["ficha_sf_retry_row"] = row_num
     ss["ficha_sf_retry_sid"] = sid
     ss["ficha_sf_retry_wname"] = wname
-    ss["ficha_creci_drive_link"] = None
-    ss["ficha_creci_drive_erro"] = None
-    ss["ficha_creci_email_para"] = None
     bar_envio.progress(0.52)
 
     _aplicar_secrets_sf()
@@ -6082,14 +5732,14 @@ def _processar_envio_cadastro() -> None:
         json.dumps(payload, ensure_ascii=False, default=str)[:7000],
     )
     bar_envio.progress(0.85)
-    cid, err = criar_contato_payload(sf, payload)
+    cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
     bar_envio.progress(0.93)
     link = _url_contact(cid) if cid else ""
 
     if cid:
         _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
         atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Sucesso", "", link, payload_final=payload
+            sid, wname, creds, row_num, "Sucesso", "", link, payload_final=payload_utilizado
         )
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
@@ -6100,7 +5750,7 @@ def _processar_envio_cadastro() -> None:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
         _registrar_debug_envio("sf_create_erro", err_full)
         atualizar_status_envio_salesforce(
-            sid, wname, creds, row_num, "Erro", err_full[:49000], "", payload_final=payload
+            sid, wname, creds, row_num, "Erro", err_full[:49000], "", payload_final=payload_utilizado
         )
         ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
@@ -6193,7 +5843,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
         return
 
     _aplicar_enriquecimentos_payload_sf(payload, dados_c, sf, avisos)
-    cid, err = criar_contato_payload(sf, payload)
+    cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
     link = _url_contact(cid) if cid else ""
 
     if cid:
@@ -6205,7 +5855,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
             "Sucesso",
             "",
             link,
-            payload_final=payload,
+            payload_final=payload_utilizado,
         )
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
@@ -6222,7 +5872,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
             "Erro",
             err_full[:49000],
             "",
-            payload_final=payload,
+            payload_final=payload_utilizado,
         )
         ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
 
