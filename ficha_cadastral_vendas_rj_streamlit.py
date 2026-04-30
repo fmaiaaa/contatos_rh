@@ -5229,8 +5229,8 @@ def montar_corpo_email_boas_vindas(
     bloco_pdf_plain = (
         "Anexamos neste e-mail o PDF da sua ficha cadastral (cópia do que você enviou pelo formulário).\n\n"
         if tem_pdf_anexo
-        else "Não foi possível gerar o PDF automaticamente neste envio; após o cadastro, conclua o aviso "
-        "de boas-vindas no formulário e use os recursos na página seguinte, ou peça uma nova cópia ao RH.\n\n"
+        else "Não foi possível gerar o PDF automaticamente neste envio; após o cadastro, avance no aviso "
+        "de boas-vindas no formulário e use os recursos no popup seguinte, ou peça uma nova cópia ao RH.\n\n"
     )
     bloco_pdf_html = (
         f'<p style="margin:0 0 16px 0;padding:14px 16px;background:{COR_INPUT_BG};border-radius:10px;'
@@ -5238,8 +5238,8 @@ def montar_corpo_email_boas_vindas(
         f"<strong>PDF em anexo:</strong> segue a cópia em PDF da sua ficha cadastral.</p>"
         if tem_pdf_anexo
         else f'<p style="margin:0 0 16px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">'
-        f"Se o PDF não estiver disponível neste e-mail, após o cadastro clique em <strong>Concluir</strong> "
-        f"no aviso inicial e use os recursos na página seguinte, ou solicite uma nova cópia ao RH.</p>"
+        f"Se o PDF não estiver disponível neste e-mail, após o cadastro clique em <strong>Avançar</strong> "
+        f"no aviso inicial e use os recursos no popup seguinte, ou solicite uma nova cópia ao RH.</p>"
     )
 
     plain = (
@@ -5253,7 +5253,7 @@ def montar_corpo_email_boas_vindas(
         + "\n".join(linhas_txt)
         + "\n\n"
         + bloco_pdf_plain
-        + "No formulário, após clicar em **Concluir** no aviso de boas-vindas, a página mostra o mapa de "
+        + "No formulário, após clicar em **Avançar** no aviso de boas-vindas, o popup seguinte mostra o mapa de "
         + "empreendimentos, o vídeo do simulador e links úteis.\n\n"
         + "Direcional Engenharia · Vendas Rio de Janeiro"
     )
@@ -5299,7 +5299,7 @@ Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe 
 <tr><td style="padding:8px 28px 8px 28px;">
 {bloco_pdf_html}
 <p style="margin:0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-Após clicar em <strong>Concluir</strong> no aviso inicial de boas-vindas, a <strong>página do formulário</strong>
+Após clicar em <strong>Avançar</strong> no aviso inicial de boas-vindas, um <strong>novo popup</strong>
 exibe o <strong>mapa de empreendimentos</strong>, o <strong>vídeo</strong> do simulador e os links úteis.
 </p>
 </td></tr>
@@ -6295,8 +6295,8 @@ def gerar_workbook_ficha_cadastro_bytes(dados: Dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
-def _render_recursos_pos_concluir_na_pagina() -> None:
-    """Mapa, vídeo do simulador e links — na página principal após «Concluir» no popup de boas-vindas."""
+def _render_recursos_pos_cadastro() -> None:
+    """Mapa, vídeo do simulador e links após popup de boas-vindas."""
     ss = st.session_state
     if ss.get("ficha_modo_teste_design"):
         st.info(
@@ -6359,7 +6359,7 @@ def _render_recursos_pos_concluir_na_pagina() -> None:
 
 @st.dialog("Boas-vindas", width="medium")
 def _dialog_recursos_pos_cadastro() -> None:
-    """Popup inicial: sucesso, mensagem de boas-vindas e vídeo do RH; mapa e demais recursos ficam na página após «Concluir»."""
+    """Popup inicial: sucesso, mensagem de boas-vindas e vídeo do RH."""
     ss = st.session_state
     modo_design = bool(ss.get("ficha_modo_teste_design"))
 
@@ -6369,8 +6369,8 @@ def _dialog_recursos_pos_cadastro() -> None:
             mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
         )
         st.markdown(
-            "Assista ao vídeo de boas-vindas do RH e clique em **Concluir** para ver na página o mapa, "
-            "o vídeo do simulador e os links úteis."
+            "Assista ao vídeo de boas-vindas do RH e clique em **Avançar** para abrir o próximo popup "
+            "com mapa, vídeo do simulador e links úteis."
         )
         st.caption("No modo teste, PDF e e-mail usam dados fictícios.")
     else:
@@ -6380,7 +6380,7 @@ def _dialog_recursos_pos_cadastro() -> None:
 **Recebemos o seu cadastro com sucesso.** Você deve receber **automaticamente** no e-mail informado uma mensagem
 com a apresentação da Direcional, **links de materiais** e, quando possível, o **PDF da ficha** em anexo.
 
-Assista ao vídeo de boas-vindas do RH abaixo. Em seguida clique em **Concluir** para abrir na página o **mapa** de
+Assista ao vídeo de boas-vindas do RH abaixo. Em seguida clique em **Avançar** para abrir o próximo popup com o **mapa** de
 empreendimentos, o **vídeo** do simulador e os **links** úteis.
             """.strip()
         )
@@ -6398,9 +6398,15 @@ empreendimentos, o **vídeo** do simulador e os **links** úteis.
     st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_BOAS_VINDAS_RH}]({URL_YOUTUBE_BOAS_VINDAS_RH})")
 
     st.markdown("")
-    if st.button("Concluir", type="primary", use_container_width=True, key="ficha_dialog_boas_vindas_concluir"):
+    if st.button("Avançar", type="primary", use_container_width=True, key="ficha_dialog_boas_vindas_avancar"):
         ss["ficha_boas_vindas_popup_concluido"] = True
         st.rerun()
+
+
+@st.dialog("Próximos passos", width="large")
+def _dialog_recursos_pos_boas_vindas() -> None:
+    """Segundo popup com mapa, vídeo do simulador e links úteis."""
+    _render_recursos_pos_cadastro()
 
 
 def main():
@@ -6424,9 +6430,9 @@ def main():
     if ss.get("ficha_sucesso"):
         if not ss.get("ficha_boas_vindas_popup_concluido"):
             _dialog_recursos_pos_cadastro()
+        else:
+            _dialog_recursos_pos_boas_vindas()
         _cabecalho_pagina()
-        if ss.get("ficha_boas_vindas_popup_concluido"):
-            _render_recursos_pos_concluir_na_pagina()
         st.markdown(
             '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
             unsafe_allow_html=True,
@@ -6441,8 +6447,8 @@ def main():
             expanded=_design_teste_expander_aberto(),
         ):
             st.markdown(
-                "Simula o **cadastro concluído**: abre o **popup** de boas-vindas (vídeo do RH); após **Concluir**, "
-                "o **mapa**, o vídeo do simulador e os **links** aparecem na página. Não grava na planilha nem no "
+                "Simula o **cadastro concluído**: abre o **popup** de boas-vindas (vídeo do RH); após **Avançar**, "
+                "abre um segundo **popup** com mapa, vídeo do simulador e links úteis. Não grava na planilha nem no "
                 "Salesforce. PDF e e-mail usam **dados fictícios**."
             )
             st.caption(
