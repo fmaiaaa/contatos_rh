@@ -108,7 +108,9 @@ def _html_erro_salesforce_multilinha(msg: Any) -> str:
 
 
 def _registrar_debug_envio(etapa: str, detalhe: Any = "") -> None:
-    """Armazena trilha de debug do envio para inspeção em tela."""
+    """Debug de envio desativado por padrão (não registra trilha)."""
+    if os.environ.get("FICHA_DEBUG_ENVIO", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
     ss = st.session_state
     trilha = list(ss.get("ficha_debug_envio") or [])
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3648,20 +3650,8 @@ def honeypot_ok() -> bool:
 
 def verificar_antes_envio() -> tuple[bool, str]:
     """
-    Ordem: UA → tempo mínimo → honeypot (se existir campo) → taxa.
-    Ao passar, registra a tentativa na janela de rate limit.
+    Verificação pré-envio desativada para não bloquear o fluxo.
     """
-    if user_agent_bloqueado():
-        return False, "Acesso não autorizado a partir deste cliente."
-    ok, msg = tempo_minimo_envio_ok()
-    if not ok:
-        return False, msg
-    if not honeypot_ok():
-        return False, "Não foi possível concluir o envio porque um campo de validação automática foi preenchido. Revise o formulário e tente novamente."
-    ok, msg = limite_taxa_ok()
-    if not ok:
-        return False, msg
-    registrar_tentativa_envio()
     return True, ""
 
 
@@ -4110,16 +4100,6 @@ def aplicar_estilo():
         div[data-testid="stMultiSelect"] label,
         div[data-testid="stCheckbox"] label {{
             color: {COR_TEXTO_LABEL} !important;
-        }}
-        /* Honeypot: campo após #ficha-hp-anchor (não preencher) */
-        #ficha-hp-anchor ~ div [data-testid="stTextInput"] {{
-            position: absolute !important;
-            left: -9999px !important;
-            width: 1px !important;
-            height: 1px !important;
-            overflow: hidden !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
         }}
         .ficha-hero-bar {{
             height: 4px;
@@ -5769,16 +5749,6 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                     )
             else:
                 st.markdown(
-                    '<p id="ficha-hp-anchor" style="display:none" aria-hidden="true"></p>',
-                    unsafe_allow_html=True,
-                )
-                st.text_input(
-                    "Company website",
-                    key="ficha_hp_website",
-                    label_visibility="collapsed",
-                    max_chars=96,
-                )
-                st.markdown(
                     '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
                     "credenciamento na Direcional, conforme a LGPD. "
                     '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
@@ -5857,7 +5827,6 @@ def _limpar_session_formulario():
         "ficha_erros_envio",
         "ficha_seg_t0",
         "ficha_rl_envios_ts",
-        "ficha_hp_website",
         "ficha_modo_teste_design",
         "ficha_sf_retry_row",
         "ficha_sf_retry_sid",
@@ -6507,7 +6476,8 @@ def main():
             _alert_vermelho(fe.get("text") or "")
 
     trilha = list(ss.get("ficha_debug_envio") or [])
-    if trilha:
+    debug_habilitado = os.environ.get("FICHA_DEBUG_ENVIO", "").strip().lower() in ("1", "true", "yes", "on")
+    if debug_habilitado and trilha:
         with st.expander("Debug do envio (planilha e Salesforce)", expanded=False):
             st.caption(
                 "Use este painel para diagnóstico quando houver divergência entre planilha e Salesforce."
