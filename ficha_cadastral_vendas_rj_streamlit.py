@@ -5201,7 +5201,6 @@ def montar_corpo_email_boas_vindas(
     """Corpo do e-mail automático: apresentação Direcional, cadastro, materiais de vendas e PDF."""
     nome = _nome_candidato_ficha(dados)
     nome_esc = html.escape(nome)
-    logo = html.escape(URL_LOGO_DIRECIONAL_EMAIL)
     azul = COR_AZUL_ESC
     verm = COR_VERMELHO
     borda = COR_BORDA
@@ -5217,15 +5216,6 @@ def montar_corpo_email_boas_vindas(
             f'<br><span style="font-size:12px;color:{COR_TEXTO_MUTED};word-break:break-all;">{html.escape(url)}</span>'
             f"</li>"
         )
-    if link_contato_sf:
-        linhas_txt.append(f"- Seu cadastro no Salesforce: {link_contato_sf}")
-        itens_html.append(
-            f'<li style="margin:10px 0;line-height:1.45;">'
-            f'<a href="{html.escape(link_contato_sf)}" '
-            f'style="color:{azul};font-weight:600;text-decoration:none;">'
-            f"Abrir seu cadastro no Salesforce</a></li>"
-        )
-
     bloco_pdf_plain = (
         "Anexamos neste e-mail o PDF da sua ficha cadastral (cópia do que você enviou pelo formulário).\n\n"
         if tem_pdf_anexo
@@ -5269,11 +5259,6 @@ def montar_corpo_email_boas_vindas(
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;
 box-shadow:0 8px 28px rgba({RGB_AZUL_CSS},0.08);border:1px solid {borda};">
 <tr>
-<td align="center" style="background:{azul};padding:22px 20px;border-bottom:4px solid {verm};">
-<img src="{logo}" alt="Direcional Engenharia" width="168" style="display:block;max-width:100%;height:auto;">
-</td>
-</tr>
-<tr>
 <td style="padding:28px 24px 8px 24px;">
 <p style="margin:0 0 8px 0;font-size:20px;font-weight:700;color:{azul};text-align:center;">
 Bem-vindo(a) à Direcional Vendas RJ</p>
@@ -5290,7 +5275,7 @@ Obrigado(a) por escolher seguir conosco.
 <tr><td style="padding:16px 28px 8px 28px;">
 <p style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:{azul};">Materiais e canais para vendas</p>
 <p style="margin:0 0 12px 0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe — os mesmos recursos do formulário.
+Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe.
 </p>
 <ul style="margin:0;padding-left:18px;color:#334155;font-size:14px;">
 {"".join(itens_html)}
@@ -5298,10 +5283,6 @@ Abaixo, links para marketing, simulador, treinamentos, portal e grupo da equipe 
 </td></tr>
 <tr><td style="padding:8px 28px 8px 28px;">
 {bloco_pdf_html}
-<p style="margin:0;font-size:13px;line-height:1.55;color:{COR_TEXTO_MUTED};">
-Após clicar em <strong>Avançar</strong> no aviso inicial de boas-vindas, um <strong>novo popup</strong>
-exibe o <strong>mapa de empreendimentos</strong>, o <strong>vídeo</strong> do simulador e os links úteis.
-</p>
 </td></tr>
 <tr><td style="padding:20px 24px 28px 24px;border-top:1px solid {borda};">
 <p style="margin:0;font-size:12px;color:{COR_TEXTO_MUTED};text-align:center;">
