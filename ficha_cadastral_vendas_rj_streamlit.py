@@ -3727,8 +3727,10 @@ def aplicar_estilo():
         [data-testid="stAppViewContainer"] {{
             background: transparent !important;
             background-color: transparent !important;
-            min-width: 1100px !important; /* Força experiência desktop também no celular */
-            overflow-x: auto !important;
+            width: 100% !important;
+            max-width: 100vw !important;
+            min-width: 0 !important;
+            box-sizing: border-box !important;
         }}
         /* Cabeçalho e barra (share, GitHub, estrela, lápis): totalmente transparentes — sem tarja branca do tema */
         header[data-testid="stHeader"],
@@ -5617,8 +5619,9 @@ def _processar_envio_cadastro() -> None:
     sid = str(gs.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
     wname = str(gs.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME).strip() or DEFAULT_WORKSHEET_NAME
 
-    st.caption("**Carregando…** Aguarde — gravando seu cadastro. Não feche a página.")
-    bar_envio = st.progress(0.0)
+    st.caption(
+        "Estamos salvando seu cadastro. Pode aguardar nesta tela — em instantes você verá a confirmação."
+    )
 
     payload, avisos = montar_payload_salesforce(dados)
     _registrar_debug_envio(
@@ -5638,7 +5641,6 @@ def _processar_envio_cadastro() -> None:
     ) -> Optional[int]:
         """Anexa linha e preenche status de erro; usado somente quando o cadastro Salesforce não teve sucesso."""
         try:
-            bar_envio.progress(0.88)
             row_n = anexar_linha(linha, cab, sid, wname, creds, gs)
             atualizar_status_envio_salesforce(
                 sid,
@@ -5685,7 +5687,6 @@ def _processar_envio_cadastro() -> None:
             ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
             return None
 
-    bar_envio.progress(0.18)
     ss["ficha_dados_enviados"] = dados
     ss["sf_contact_id"] = None
     ss["sf_erro"] = None
@@ -5695,7 +5696,6 @@ def _processar_envio_cadastro() -> None:
     ss.pop("ficha_sf_retry_wname", None)
 
     _aplicar_secrets_sf()
-    bar_envio.progress(0.32)
     if not _credenciais_salesforce_ok():
         _registrar_debug_envio("sf_config_ausente", "Secrets USER/PASSWORD/TOKEN ausentes.")
         row_num = _gravar_falha_planilha(
@@ -5709,7 +5709,6 @@ def _processar_envio_cadastro() -> None:
         ss["ficha_sf_retry_wname"] = wname
         ss["sf_erro"] = "Salesforce não configurado nos Secrets."
         _tentar_enviar_email_boas_vindas(dados, None)
-        bar_envio.progress(1.0)
         _definir_sucesso_pos_cadastro()
         st.rerun()
         return
@@ -5727,15 +5726,11 @@ def _processar_envio_cadastro() -> None:
         ss["ficha_sf_retry_wname"] = wname
         ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
         _tentar_enviar_email_boas_vindas(dados, None)
-        bar_envio.progress(1.0)
         _definir_sucesso_pos_cadastro()
         st.rerun()
         return
 
-    bar_envio.progress(0.48)
-
     sf = conectar_salesforce()
-    bar_envio.progress(0.62)
     if not sf:
         _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
         row_num = _gravar_falha_planilha(
@@ -5750,7 +5745,6 @@ def _processar_envio_cadastro() -> None:
         ss["sf_erro"] = "Falha ao conectar ao Salesforce."
         ss["sf_avisos"] = avisos
         _tentar_enviar_email_boas_vindas(dados, None)
-        bar_envio.progress(1.0)
         _definir_sucesso_pos_cadastro()
         st.rerun()
         return
@@ -5760,9 +5754,7 @@ def _processar_envio_cadastro() -> None:
         "payload_sf_enriquecido",
         json.dumps(payload, ensure_ascii=False, default=str)[:7000],
     )
-    bar_envio.progress(0.76)
     cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
-    bar_envio.progress(0.93)
 
     if cid:
         _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
@@ -5788,9 +5780,7 @@ def _processar_envio_cadastro() -> None:
     ss["sf_avisos"] = avisos
     if avisos:
         _registrar_debug_envio("avisos_fluxo", " | ".join(str(x) for x in avisos))
-    bar_envio.progress(0.96)
     _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
-    bar_envio.progress(1.0)
     _definir_sucesso_pos_cadastro()
     st.rerun()
 
@@ -5859,7 +5849,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
         return
 
-    with st.spinner("Tentando novamente no Salesforce..."):
+    with st.spinner("Só um momento — estamos concluindo o envio."):
         sf = conectar_salesforce()
     if not sf:
         atualizar_status_envio_salesforce(
