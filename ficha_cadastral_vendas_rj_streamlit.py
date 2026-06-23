@@ -618,17 +618,110 @@ def _campos_def() -> List[Campo]:
     * = obrigatório no layout (req=True), salvo quando combinado com outro campo.
     """
     return [
-        # ——— Informações para contato ———
+        # ——— Dados Pessoais ———
         _z(
             key="regional",
             label="Regional de cadastro *",
-            sec="Informações para contato",
+            sec="Dados Pessoais",
             tipo="select",
             sf="Regional__c",
             opcoes=["--Nenhum--", "RJ", "MG"],
             req=True,
             help="Selecione a regional para carregar os gerentes correspondentes.",
         ),
+        _z(
+            key="nome_completo",
+            label="Nome completo *",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf=None,
+            req=True,
+            help="Primeira palavra = nome (Primeiro Nome no Salesforce); o restante = sobrenome. Apelido gerado automaticamente.",
+        ),
+        _z(
+            key="birthdate",
+            label="Data de nascimento *",
+            sec="Dados Pessoais",
+            tipo="date",
+            sf="Birthdate",
+            req=True,
+            help="Toque no ícone do calendário para escolher a data, ou digite (dia-mês-ano).",
+        ),
+        _z(
+            key="estado_civil",
+            label="Estado Civil *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="EstadoCivil__c",
+            opcoes=ESTADO_CIVIL_OPTS,
+            req=True,
+        ),
+        _z(
+            key="nome_conjuge",
+            label="Nome do Cônjuge",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf="Nome_do_Conjuge__c",
+            req=False,
+            help="Preencha apenas se o estado civil for **Casado** (obrigatório nesse caso).",
+        ),
+        _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
+        _z(
+            key="nacionalidade",
+            label="Nacionalidade *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="Nacionalidade__c",
+            opcoes=NACIONALIDADE_OPTS,
+            req=True,
+        ),
+        _z(
+            key="uf_naturalidade",
+            label="UF Nascimento *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="UF_Naturalidade__c",
+            opcoes=ESTADOS_UF,
+            req=True,
+            help="A naturalidade enviada ao Salesforce é a capital desta UF (automático).",
+        ),
+        _z(
+            key="naturalidade",
+            label="Naturalidade",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf="Naturalidade__c",
+            req=False,
+            help="Derivada da UF Nascimento (capital do estado); não editável no formulário.",
+        ),
+        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
+        _z(
+            key="uf_rg",
+            label="UF RG *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="UF_RG__c",
+            opcoes=ESTADOS_UF,
+            req=True,
+        ),
+        _z(
+            key="tipo_pix",
+            label="Tipo do PIX *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf="Tipo_do_PIX__c",
+            opcoes=TIPO_PIX,
+            req=True,
+        ),
+        _z(
+            key="dados_pix",
+            label="Dados para PIX *",
+            sec="Dados Pessoais",
+            tipo="text",
+            sf="Dados_para_PIX__c",
+            req=True,
+        ),
+        # ——— Informações para contato ———
         _z(
             key="account_id",
             label="Nome da conta — Id (Account)",
@@ -656,15 +749,6 @@ def _campos_def() -> List[Campo]:
             opcoes=["--Nenhum--"],
             req=True,
             help="Selecione o Nome da Conta (gerente de vendas) para vínculo no campo AccountId do Salesforce.",
-        ),
-        _z(
-            key="nome_completo",
-            label="Nome completo *",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf=None,
-            req=True,
-            help="Primeira palavra = nome (Primeiro Nome no Salesforce); o restante = sobrenome. Apelido gerado automaticamente.",
         ),
         _z(
             key="salutation",
@@ -757,90 +841,6 @@ def _campos_def() -> List[Campo]:
             sf="Data_da_Entrevista__c",
             req=False,
             help="Definida automaticamente na data do envio.",
-        ),
-        # ——— Dados Pessoais ———
-        _z(
-            key="birthdate",
-            label="Data de nascimento *",
-            sec="Dados Pessoais",
-            tipo="date",
-            sf="Birthdate",
-            req=True,
-            help="Toque no ícone do calendário para escolher a data, ou digite (dia-mês-ano).",
-        ),
-        _z(
-            key="estado_civil",
-            label="Estado Civil *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="EstadoCivil__c",
-            opcoes=ESTADO_CIVIL_OPTS,
-            req=True,
-        ),
-        _z(
-            key="nome_conjuge",
-            label="Nome do Cônjuge",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf="Nome_do_Conjuge__c",
-            req=False,
-            help="Preencha apenas se o estado civil for **Casado** (obrigatório nesse caso).",
-        ),
-        _z(key="cpf", label="CPF *", sec="Dados Pessoais", tipo="text", sf="CPF__c", req=True),
-        _z(
-            key="nacionalidade",
-            label="Nacionalidade *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="Nacionalidade__c",
-            opcoes=NACIONALIDADE_OPTS,
-            req=True,
-        ),
-        _z(
-            key="uf_naturalidade",
-            label="UF Nascimento *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="UF_Naturalidade__c",
-            opcoes=ESTADOS_UF,
-            req=True,
-            help="A naturalidade enviada ao Salesforce é a capital desta UF (automático).",
-        ),
-        _z(
-            key="naturalidade",
-            label="Naturalidade",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf="Naturalidade__c",
-            req=False,
-            help="Derivada da UF Nascimento (capital do estado); não editável no formulário.",
-        ),
-        _z(key="rg", label="RG *", sec="Dados Pessoais", tipo="text", sf="RG__c", req=True),
-        _z(
-            key="uf_rg",
-            label="UF RG *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="UF_RG__c",
-            opcoes=ESTADOS_UF,
-            req=True,
-        ),
-        _z(
-            key="tipo_pix",
-            label="Tipo do PIX *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf="Tipo_do_PIX__c",
-            opcoes=TIPO_PIX,
-            req=True,
-        ),
-        _z(
-            key="dados_pix",
-            label="Dados para PIX *",
-            sec="Dados Pessoais",
-            tipo="text",
-            sf="Dados_para_PIX__c",
-            req=True,
         ),
         # ——— Endereço (residencial) ———
         _z(
@@ -1163,7 +1163,7 @@ def _campos_def() -> List[Campo]:
 CAMPOS: List[Campo] = _campos_def()
 
 # Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
-# valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
+# valores fixos via Secrets → [ficha_defaults] (origem, status, ids opcionais).
 # tipo_corretor / multiplicadores / apelido / datas: enriquecer_derivados_vendas_rj.
 CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
     {
@@ -4409,7 +4409,7 @@ def _campo_api_gerente_vendas() -> str:
 def _opcoes_gerente_vendas() -> list[str]:
     """
     Opções do select «Gerente de vendas»: valores de «Nome da Conta».
-    Prioridade: coluna Nome da Conta (ou Nome da Conta - BH) na aba Gerentes -> lista fixa definida no código.
+    Prioridade: coluna Nome da Conta - RJ ou Nome da Conta - MG na aba Gerentes -> lista fixa definida no código.
     """
     base = ["--Nenhum--"]
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
@@ -4429,9 +4429,12 @@ def _opcoes_gerente_vendas() -> list[str]:
         
         col_g = str(gs.get("NOME_CONTA_COLUMN") or gs.get("nome_conta_column") or DEFAULT_COL_NOME_CONTA).strip() or DEFAULT_COL_NOME_CONTA
         
-        regional_selecionada = _norm_picklist(st.session_state.get("fld_regional"))
+        dados_completos = _coletar_dados_formulario_completo()
+        regional_selecionada = _norm_picklist(dados_completos.get("regional"))
         if regional_selecionada == "MG":
-            col_g = "Nome da Conta - BH"
+            col_g = "Nome da Conta - MG"
+        elif regional_selecionada == "RJ":
+            col_g = "Nome da Conta - RJ"
             
         try:
             creds_json = json.dumps(creds, sort_keys=True)
@@ -4640,6 +4643,7 @@ def _snapshot_persistir_secao_atual(sec: str) -> None:
     if sec == "Informações para contato":
         if "fld_unidade_negocio" in ss:
             snap["unidade_negocio"] = ss["fld_unidade_negocio"]
+    if sec == "Dados Pessoais":
         if "fld_regional" in ss:
             snap["regional"] = ss["fld_regional"]
     if sec == "CRECI/TTI" and "fld_possui_creci" in ss:
@@ -4664,6 +4668,7 @@ def _garantir_campos_secao_de_snapshot(sec: str) -> None:
     if sec == "Informações para contato":
         if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
             ss["fld_unidade_negocio"] = snap["unidade_negocio"]
+    if sec == "Dados Pessoais":
         if "fld_regional" not in ss and "regional" in snap:
             ss["fld_regional"] = snap["regional"]
 
