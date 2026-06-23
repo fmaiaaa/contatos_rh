@@ -5301,4 +5301,857 @@ def _section_container():
 
 
 def _render_secao_formulario(secoes: list[str]) -> None:
-    """Uma seção
+    """Uma seção por vez; navegação por botões na parte inferior."""
+    ss = st.session_state
+    ss.setdefault("ficha_secao_idx", 0)
+    n = len(secoes)
+    if n == 0:
+        _alert_vermelho("Nenhuma seção de formulário configurada.")
+        return
+
+    idx = max(0, min(int(ss["ficha_secao_idx"]), n - 1))
+    ss["ficha_secao_idx"] = idx
+    sec = secoes[idx]
+    _garantir_campos_secao_de_snapshot(sec)
+
+    if ss.get("ficha_erros_secao_idx") is not None and int(ss["ficha_erros_secao_idx"]) != idx:
+        ss.pop("ficha_erros_secao", None)
+        ss.pop("ficha_erros_secao_idx", None)
+
+    rotulo_curto = _tab_label(sec)
+    st.caption(f"Só mais um pouco: **{idx + 1}** de **{n}** · {rotulo_curto}")
+    pct = 100.0 * float(idx + 1) / float(n)
+    st.markdown(
+        f'<div class="ficha-etapas-progress" role="progressbar" '
+        f'aria-valuenow="{idx + 1}" aria-valuemin="1" aria-valuemax="{n}" '
+        f'aria-label="Progresso das etapas do cadastro">'
+        f'<div class="ficha-etapas-progress-track">'
+        f'<div class="ficha-etapas-progress-fill" style="width:{pct:.4f}%"></div>'
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    with _section_container():
+        st.markdown(
+            f'<p class="section-head">{sec}</p>',
+            unsafe_allow_html=True,
+        )
+        # Campos que controlam visibilidade de outros devem ficar FORA do st.form: dentro do form
+        # o Streamlit só sincroniza o state no envio — ex.: «Sim» em CRECI, rede em Informações,
+        # **Estado civil** em Dados Pessoais (senão «Casado» não atualiza a tempo e o nome do cônjuge some).
+        dados_sec = _coletar_dados_formulario_completo()
+        if sec == "CRECI/TTI":
+            c_pc = next((c for c in CAMPOS if c["key"] == "possui_creci"), None)
+            if c_pc:
+                _widget_campo(c_pc)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] != "possui_creci"
+            ]
+        elif sec == "Informações para contato":
+            c_un = next((c for c in CAMPOS if c["key"] == "unidade_negocio"), None)
+            if c_un:
+                _widget_campo(c_un)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] != "unidade_negocio"
+            ]
+        elif sec == "Dados Pessoais":
+            # Mesma razão do CRECI/rede: estado civil fora do form para o select atualizar o state
+            # antes do submit; nome e nascimento ficam fora só para manter a ordem visual (nome → nasc. → estado).
+            _chaves_fora_form_dados_pessoais = ("nome_completo", "birthdate", "estado_civil")
+            for _k in _chaves_fora_form_dados_pessoais:
+                c0 = next((x for x in CAMPOS if x["key"] == _k and x["sec"] == sec), None)
+                if c0:
+                    _widget_campo(c0)
+            dados_sec = _coletar_dados_formulario_completo()
+            cols = [
+                c
+                for c in campos_por_secao_visiveis(sec, dados_sec)
+                if c["key"] not in _chaves_fora_form_dados_pessoais
+            ]
+        else:
+            cols = campos_por_secao_visiveis(sec, dados_sec)
+
+        # st.form: ao usar «Avançar» / «Enviar», todos os valores da etapa são gravados de uma vez
+        # (evita depender de Enter ou blur em text_input/select).
+        form_key = f"ficha_etapa_{idx}"
+        with st.form(form_key, clear_on_submit=False, border=False):
+            # Grid 2 colunas: pares lado a lado; quando ímpar, o último ocupa largura total.
+            for i in range(0, len(cols), 2):
+                c1 = cols[i]
+                c2 = cols[i + 1] if i + 1 < len(cols) else None
+                if c2 is None:
+                    _widget_campo(c1)
+                    continue
+                left, right = st.columns(2)
+                with left:
+                    _widget_campo(c1)
+                with right:
+                    _widget_campo(c2)
+
+            st.markdown("<br/>", unsafe_allow_html=True)
+            if idx < n - 1:
+                col_avancar, col_voltar = st.columns(2)
+                with col_avancar:
+                    clicou_avancar = st.form_submit_button(
+                        "Avançar",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(idx <= 0),
+                    )
+            else:
+                st.markdown(
+                    '<div class="ficha-input-label">Estou de acordo com o uso dos meus dados para o '
+                    "credenciamento na Direcional, conforme a LGPD. "
+                    '<span class="ficha-star-req" aria-hidden="true">*</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.checkbox(
+                    "Estou de acordo com o uso dos meus dados para o credenciamento na Direcional, conforme a LGPD. "
+                    "(campo obrigatório)",
+                    key="fld_lgpd_ficha",
+                    label_visibility="collapsed",
+                )
+                col_enviar, col_voltar = st.columns(2)
+                with col_enviar:
+                    clicou_enviar = st.form_submit_button(
+                        "Enviar meu cadastro",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with col_voltar:
+                    clicou_voltar = st.form_submit_button(
+                        "Voltar",
+                        use_container_width=True,
+                        disabled=(len(secoes) <= 1),
+                    )
+
+        if idx < n - 1:
+            if clicou_voltar:
+                ss["ficha_secao_idx"] = idx - 1
+                ss.pop("ficha_erros_secao", None)
+                ss.pop("ficha_erros_secao_idx", None)
+                st.rerun()
+            if clicou_avancar:
+                dados = _coletar_dados_formulario_completo()
+                erros_sec = validar_obrigatorios_secao(sec, dados)
+                if erros_sec:
+                    ss["ficha_erros_secao"] = erros_sec
+                    ss["ficha_erros_secao_idx"] = idx
+                    st.rerun()
+                _snapshot_persistir_secao_atual(sec)
+                _snapshot_mesclar_todos_fld_do_session_state()
+                ss.pop("ficha_erros_secao", None)
+                ss.pop("ficha_erros_secao_idx", None)
+                ss["ficha_secao_idx"] = idx + 1
+                st.rerun()
+        else:
+            if clicou_voltar:
+                ss.pop("ficha_erros_envio", None)
+                ss["ficha_secao_idx"] = max(0, len(secoes) - 2)
+                st.rerun()
+            if clicou_enviar:
+                _processar_envio_cadastro()
+
+        if ss.get("ficha_erros_secao_idx") == idx and ss.get("ficha_erros_secao"):
+            lista = "<br>".join(f"• {html.escape(e)}" for e in ss["ficha_erros_secao"])
+            _alert_vermelho_html(
+                f"<strong>Preencha os campos obrigatórios desta etapa:</strong><br>{lista}"
+            )
+
+
+def _limpar_session_formulario():
+    for c in CAMPOS:
+        sk = f"fld_{c['key']}"
+        if sk in st.session_state:
+            del st.session_state[sk]
+    for k in (
+        "fld_lgpd_ficha",
+        "fc_mail_extra",
+        "fc_mail_extra_popup",
+        "ficha_sucesso",
+        "ficha_secao_idx",
+        "ficha_erros_secao",
+        "ficha_erros_secao_idx",
+        "ficha_snap_campos",
+        "ficha_email_boas_vindas_ok",
+        "ficha_email_boas_vindas_msg",
+        "ficha_erros_envio",
+        "ficha_seg_t0",
+        "ficha_rl_envios_ts",
+        "ficha_modo_teste_design",
+        "ficha_sf_retry_row",
+        "ficha_sf_retry_sid",
+        "ficha_sf_retry_wname",
+        "ficha_debug_envio",
+        "ficha_boas_vindas_popup_concluido",
+    ):
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def _definir_sucesso_pos_cadastro() -> None:
+    """Marca cadastro concluído e reabre o popup de boas-vindas (antes de «Concluir»)."""
+    ss = st.session_state
+    ss["ficha_sucesso"] = True
+    ss["ficha_boas_vindas_popup_concluido"] = False
+
+
+def _finalizar_popup_e_novo_cadastro() -> None:
+    """Após «Finalizar» no popup: limpa tudo e volta ao formulário (sem tela final)."""
+    _limpar_session_formulario()
+    ss = st.session_state
+    for k in ("ficha_dados_enviados", "sf_contact_id", "sf_erro", "sf_avisos"):
+        ss.pop(k, None)
+
+
+def _design_teste_habilitado() -> bool:
+    """Modo teste de layout: env `FICHA_DESIGN_TEST=1` ou URL `?design_test=1`."""
+    if FICHA_MODO_PRODUCAO:
+        return False
+    if (os.environ.get("FICHA_DESIGN_TEST") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        v = st.query_params.get("design_test", "")
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _design_teste_expander_aberto() -> bool:
+    try:
+        v = st.query_params.get("design_test", "")
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _dados_ficha_demo_design() -> dict[str, Any]:
+    """Dados fictícios para pré-visualizar PDF e e-mail no modo teste de design."""
+    demo: dict[str, Any] = {}
+    for c in CAMPOS:
+        k = c["key"]
+        tipo = c["tipo"]
+        op = c.get("opcoes") or []
+        if tipo == "multiselect":
+            cand = [x for x in op if x and str(x).strip() and x != "--Nenhum--"]
+            demo[k] = [cand[0]] if cand else ["RJ"]
+        elif tipo == "select":
+            cand = [x for x in op if x and str(x).strip() and x != "--Nenhum--"]
+            demo[k] = cand[0] if cand else "—"
+        elif tipo == "date":
+            demo[k] = date(1990, 5, 15)
+        elif tipo == "number":
+            demo[k] = 1.0
+        elif tipo == "checkbox":
+            demo[k] = True
+        elif tipo == "id":
+            demo[k] = ""
+        else:
+            demo[k] = f"[Preview] {c['label'][:48]}"
+    demo["nome_completo"] = "Maria Silva Santos (pré-visualização design)"
+    demo["account_name"] = _nome_conta_rh_padrao()
+    demo["cpf"] = "123.456.789-09"
+    demo["email"] = "maria.silva.demo@exemplo.com.br"
+    demo["mobile"] = "(21) 99999-0000"
+    return enriquecer_derivados_vendas_rj(demo)
+
+
+def _ativar_cenario_teste_design() -> None:
+    """Simula sucesso + popup sem planilha/Salesforce; preenche dados demo para ver PDF/e-mail."""
+    ss = st.session_state
+    _definir_sucesso_pos_cadastro()
+    ss["ficha_modo_teste_design"] = True
+    ss["ficha_dados_enviados"] = _dados_ficha_demo_design()
+    ss["sf_contact_id"] = None
+    ss["sf_erro"] = None
+    ss["sf_avisos"] = []
+
+
+def _processar_envio_cadastro() -> None:
+    """Tenta Salesforce primeiro; grava na planilha Google só se o cadastro falhar (sem contato / erro)."""
+    ss = st.session_state
+    ss["ficha_debug_envio"] = []
+    _registrar_debug_envio("início_envio", "Fluxo principal iniciado.")
+    ss.pop("ficha_erros_envio", None)
+    ok_sec, msg_sec = verificar_antes_envio()
+    if not ok_sec:
+        _registrar_debug_envio("bloqueio_pré_envio", msg_sec)
+        ss["ficha_erros_envio"] = {"kind": "text", "text": msg_sec}
+        return
+    secoes_env = secoes_com_campos_visiveis()
+    idx_env = max(0, min(int(ss.get("ficha_secao_idx", 0)), len(secoes_env) - 1))
+    if secoes_env:
+        _snapshot_persistir_secao_atual(secoes_env[idx_env])
+    # Última etapa: valores do form acabam de entrar no session_state; etapas antigas já no snap.
+    _snapshot_mesclar_todos_fld_do_session_state()
+    dados = enriquecer_derivados_vendas_rj(_coletar_dados_formulario_completo())
+    erros = validar_obrigatorios(dados)
+    if not ss.get("fld_lgpd_ficha"):
+        erros.append("Concordância LGPD *")
+    if erros:
+        _registrar_debug_envio("falha_validação", "; ".join(str(x) for x in erros))
+        ss["ficha_erros_envio"] = {"kind": "validation", "items": erros}
+        return
+
+    ss.pop("ficha_modo_teste_design", None)
+
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if not creds:
+        _registrar_debug_envio("erro_google_credentials", "SERVICE_ACCOUNT_JSON ausente/inválido.")
+        _LOG_FICHA.error(
+            "Ficha cadastro: envio indisponível (mensagem genérica ao usuário) — "
+            "credenciais Google ausentes ou SERVICE_ACCOUNT_JSON inválido/ausente em "
+            "st.secrets['google_sheets']; verifique Secrets no deploy."
+        )
+        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
+        return
+
+    gs = {}
+    if hasattr(st, "secrets"):
+        try:
+            gs = dict(st.secrets.get("google_sheets", {}))
+        except Exception:
+            gs = {}
+    sid = str(gs.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
+    wname = str(gs.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME).strip() or DEFAULT_WORKSHEET_NAME
+
+    st.caption(
+        "Estamos salvando seu cadastro. Pode aguardar nesta tela — em instantes você verá a confirmação."
+    )
+
+    payload, avisos = montar_payload_salesforce(dados)
+    _registrar_debug_envio(
+        "payload_salesforce_montado",
+        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+    )
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados))
+    linha = linha_planilha(dados, payload)
+    cab = cabecalho_planilha()
+
+    def _gravar_falha_planilha(
+        log_erro: str,
+        *,
+        link: str = "",
+        payload_final: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Anexa linha e preenche status de erro; usado somente quando o cadastro Salesforce não teve sucesso."""
+        try:
+            row_n = anexar_linha(linha, cab, sid, wname, creds, gs)
+            atualizar_status_envio_salesforce(
+                sid,
+                wname,
+                creds,
+                row_n,
+                "Erro",
+                (log_erro or "")[:49000],
+                link or "",
+                payload_final=payload_final,
+            )
+            _registrar_debug_envio(
+                "planilha_append_falha_ok",
+                f"linha={row_n} planilha={sid} aba={wname}",
+            )
+            return row_n
+        except Exception as e:
+            erro_txt = str(e or "").strip()
+            erro_low = erro_txt.lower()
+            msg = FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO
+            if "spreadsheet" in erro_low and "not found" in erro_low:
+                msg = (
+                    "Não foi possível concluir o envio porque a planilha configurada não foi encontrada "
+                    "ou não está acessível para a conta de serviço."
+                )
+            elif "worksheet" in erro_low and "not found" in erro_low:
+                msg = (
+                    "Não foi possível concluir o envio porque a aba configurada na planilha não foi encontrada."
+                )
+            elif "permission" in erro_low or "forbidden" in erro_low or "insufficient" in erro_low:
+                msg = (
+                    "Não foi possível concluir o envio por falta de permissão na planilha."
+                )
+            _LOG_FICHA.exception(
+                "Ficha cadastro: falha em anexar_linha (planilha) ao registrar falha Salesforce. "
+                "planilha_id=%r aba=%r mensagem_ao_usuario=%r tipo_excecao=%s erro_str=%r",
+                sid,
+                wname,
+                msg,
+                type(e).__name__,
+                erro_txt or repr(e),
+            )
+            _registrar_debug_envio("planilha_append_erro", f"{type(e).__name__}: {e}")
+            ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
+            return None
+
+    ss["ficha_dados_enviados"] = dados
+    ss["sf_contact_id"] = None
+    ss["sf_erro"] = None
+    ss["sf_avisos"] = []
+    ss.pop("ficha_sf_retry_row", None)
+    ss.pop("ficha_sf_retry_sid", None)
+    ss.pop("ficha_sf_retry_wname", None)
+
+    _aplicar_secrets_sf()
+    if not _credenciais_salesforce_ok():
+        _registrar_debug_envio("sf_config_ausente", "Secrets USER/PASSWORD/TOKEN ausentes.")
+        row_num = _gravar_falha_planilha(
+            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
+            payload_final=payload,
+        )
+        if row_num is None:
+            return
+        ss["ficha_sf_retry_row"] = row_num
+        ss["ficha_sf_retry_sid"] = sid
+        ss["ficha_sf_retry_wname"] = wname
+        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        _tentar_enviar_email_boas_vindas(dados, None)
+        _definir_sucesso_pos_cadastro()
+        st.rerun()
+        return
+
+    if not _SF_SDK_DISPONIVEL:
+        _registrar_debug_envio("sf_sdk_indisponivel", "simple_salesforce não instalado.")
+        row_num = _gravar_falha_planilha(
+            "simple_salesforce não instalado.",
+            payload_final=payload,
+        )
+        if row_num is None:
+            return
+        ss["ficha_sf_retry_row"] = row_num
+        ss["ficha_sf_retry_sid"] = sid
+        ss["ficha_sf_retry_wname"] = wname
+        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        _tentar_enviar_email_boas_vindas(dados, None)
+        _definir_sucesso_pos_cadastro()
+        st.rerun()
+        return
+
+    sf = conectar_salesforce()
+    if not sf:
+        _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
+        row_num = _gravar_falha_planilha(
+            "Falha ao conectar ao Salesforce (credenciais ou rede).",
+            payload_final=payload,
+        )
+        if row_num is None:
+            return
+        ss["ficha_sf_retry_row"] = row_num
+        ss["ficha_sf_retry_sid"] = sid
+        ss["ficha_sf_retry_wname"] = wname
+        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
+        ss["sf_avisos"] = avisos
+        _tentar_enviar_email_boas_vindas(dados, None)
+        _definir_sucesso_pos_cadastro()
+        st.rerun()
+        return
+
+    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
+    _registrar_debug_envio(
+        "payload_sf_enriquecido",
+        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+    )
+    cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
+
+    if cid:
+        _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
+        ss["sf_contact_id"] = cid
+        ss["sf_erro"] = None
+        ss.pop("ficha_sf_retry_row", None)
+        ss.pop("ficha_sf_retry_sid", None)
+        ss.pop("ficha_sf_retry_wname", None)
+    else:
+        err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        _registrar_debug_envio("sf_create_erro", err_full)
+        row_num = _gravar_falha_planilha(
+            err_full[:49000] if err_full else "",
+            payload_final=payload_utilizado,
+        )
+        if row_num is None:
+            return
+        ss["ficha_sf_retry_row"] = row_num
+        ss["ficha_sf_retry_sid"] = sid
+        ss["ficha_sf_retry_wname"] = wname
+        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+
+    ss["sf_avisos"] = avisos
+    if avisos:
+        _registrar_debug_envio("avisos_fluxo", " | ".join(str(x) for x in avisos))
+    _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
+    _definir_sucesso_pos_cadastro()
+    st.rerun()
+
+
+def _retentar_salesforce_ultimo_envio() -> None:
+    """
+    Repete a criação do contato no Salesforce com os mesmos dados da linha de falha na planilha.
+    Em caso de sucesso, remove a linha da planilha (aba só guarda cadastros que falharam).
+    Em caso de erro, atualiza a mesma linha (log / payload); não insere nova linha.
+    """
+    ss = st.session_state
+    dados = ss.get("ficha_dados_enviados")
+    row_num = ss.get("ficha_sf_retry_row")
+    sid = ss.get("ficha_sf_retry_sid")
+    wname = ss.get("ficha_sf_retry_wname")
+    if not isinstance(dados, dict) or row_num is None:
+        ss["sf_erro"] = "Não há dados salvos para retentativa. Use «Começar um novo cadastro»."
+        return
+    if not sid or not wname:
+        ss["sf_erro"] = "Contexto da planilha perdido; não é possível retentar o envio ao Salesforce."
+        return
+
+    ok_sec, msg_sec = verificar_antes_envio()
+    if not ok_sec:
+        ss["sf_erro"] = f"Retentativa bloqueada: {msg_sec}"
+        return
+
+    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    if not creds:
+        ss["sf_erro"] = (
+            "Credenciais Google Sheets ausentes — necessárias para atualizar ou remover a linha na planilha."
+        )
+        return
+
+    dados_c = dict(dados)
+    payload, avisos = montar_payload_salesforce(dados_c)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados_c))
+
+    _aplicar_secrets_sf()
+    if not _credenciais_salesforce_ok():
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        return
+
+    if not _SF_SDK_DISPONIVEL:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "simple_salesforce não instalado.",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        return
+
+    with st.spinner("Só um momento — estamos concluindo o envio."):
+        sf = conectar_salesforce()
+    if not sf:
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            "Falha ao conectar ao Salesforce (credenciais ou rede).",
+            "",
+            payload_final=payload,
+        )
+        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
+        ss["sf_avisos"] = avisos
+        return
+
+    _aplicar_enriquecimentos_payload_sf(payload, dados_c, sf, avisos)
+    cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
+
+    if cid:
+        try:
+            remover_linha_worksheet_google(
+                str(sid),
+                str(wname),
+                creds,
+                int(row_num),
+            )
+        except Exception:
+            _LOG_FICHA.exception(
+                "Ficha cadastro: falha ao remover linha da planilha após sucesso na retentativa Salesforce."
+            )
+        ss["sf_contact_id"] = cid
+        ss["sf_erro"] = None
+        ss.pop("ficha_sf_retry_row", None)
+        ss.pop("ficha_sf_retry_sid", None)
+        ss.pop("ficha_sf_retry_wname", None)
+    else:
+        err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Erro",
+            err_full[:49000],
+            "",
+            payload_final=payload_utilizado,
+        )
+        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+
+    ss["sf_avisos"] = avisos
+    _tentar_enviar_email_boas_vindas(dados_c, cid if cid else None)
+
+
+def gerar_workbook_ficha_cadastro_bytes(dados: Dict[str, Any]) -> bytes:
+    """
+    Planilha com aba «Respostas» (rótulos na linha 1, valores na 2) e «Dicionário»
+    (rótulo × nome de API Salesforce).
+    """
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Respostas"
+    cols = campos_planilha_corretor()
+    for j, c in enumerate(cols, start=1):
+        ws1.cell(row=1, column=j, value=c["label"])
+        k = c["key"]
+        v = dados.get(k)
+        if c["tipo"] == "multiselect" and isinstance(v, list):
+            ws1.cell(row=2, column=j, value="; ".join(str(x) for x in v))
+        elif isinstance(v, datetime):
+            ws1.cell(row=2, column=j, value=v.isoformat())
+        elif isinstance(v, date):
+            ws1.cell(row=2, column=j, value=v.isoformat())
+        elif v is None:
+            ws1.cell(row=2, column=j, value="")
+        else:
+            ws1.cell(row=2, column=j, value=str(v))
+
+    ws2 = wb.create_sheet("Dicionário")
+    ws2.cell(row=1, column=1, value="Rótulo do campo")
+    ws2.cell(row=1, column=2, value="Nome do campo (API Salesforce)")
+    r = 2
+    for c in CAMPOS:
+        sf = c.get("sf")
+        if not sf:
+            continue
+        lab = str(c.get("label") or "")
+        if lab.endswith(" *"):
+            lab = lab[:-2].rstrip()
+        ws2.cell(row=r, column=1, value=lab)
+        ws2.cell(row=r, column=2, value=str(sf))
+        r += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _render_recursos_pos_cadastro() -> None:
+    """Mapa, vídeo do simulador e links após popup de boas-vindas."""
+    ss = st.session_state
+    if ss.get("ficha_modo_teste_design"):
+        st.info(
+            "Modo teste de design: pré-visualização com **dados fictícios** — nenhum envio real foi feito."
+        )
+    st.markdown("##### Empreendimentos no mapa")
+    st.caption(
+        "Minimapa: **+** / **−** para zoom, arraste para mover e **tela cheia** no canto superior direito."
+    )
+    try:
+        from empreendimentos_mapa import render_mapa_empreendimentos_streamlit
+
+        render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
+    except Exception:
+        st.caption("Mapa indisponível no momento.")
+    st.markdown("##### Como usar o simulador")
+    st.markdown(
+        f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
+        f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_SIMULADOR_EMBED)}" '
+        f'title="Como usar o simulador de negociação" loading="lazy" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
+        f'allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_SIMULADOR}]({URL_YOUTUBE_SIMULADOR})")
+
+    st.markdown("##### Links úteis")
+    st.link_button(
+        "Materiais de marketing (Linktree)",
+        URL_LINKTREE_MARKETING,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Pedir acesso ao simulador de negociação",
+        URL_FORM_SIMULADOR,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Treinamentos — Diri Academy",
+        URL_DIRI_ACADEMY,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Salesforce (portal de vendas)",
+        URL_SALESFORCE_VENDAS,
+        use_container_width=True,
+    )
+    st.link_button(
+        "Entrar no grupo — WhatsApp",
+        URL_WHATSAPP_EQUIPE,
+        use_container_width=True,
+    )
+
+    st.markdown("")
+    if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_pos_cadastro_fechar"):
+        _finalizar_popup_e_novo_cadastro()
+        st.rerun()
+
+
+@st.dialog("Boas-vindas", width="medium")
+def _dialog_recursos_pos_cadastro() -> None:
+    """Popup inicial: sucesso, mensagem de boas-vindas e vídeo do RH."""
+    ss = st.session_state
+    modo_design = bool(ss.get("ficha_modo_teste_design"))
+
+    if modo_design:
+        _render_status_final_tela(
+            sucesso=True,
+            mensagem="(Modo teste) Pré-visualização apenas — nenhum envio real foi feito.",
+        )
+        st.markdown(
+            "Assista ao vídeo de boas-vindas do RH e clique em **Avançar** para abrir o próximo popup "
+            "com mapa, vídeo do simulador e links úteis."
+        )
+        st.caption("No modo teste, PDF e e-mail usam dados fictícios.")
+    else:
+        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
+        st.markdown(
+            """
+**Recebemos o seu cadastro com sucesso.** Você deve receber **automaticamente** no e-mail informado uma mensagem
+com a apresentação da Direcional, **links de materiais** e, quando possível, o **PDF da ficha** em anexo.
+
+Assista ao vídeo de boas-vindas do RH abaixo. Em seguida clique em **Avançar** para abrir o próximo popup com o **mapa** de
+empreendimentos, o **vídeo** do simulador e os **links** úteis.
+            """.strip()
+        )
+
+    st.markdown("##### Vídeo de boas-vindas — RH")
+    st.markdown(
+        f'<div class="ficha-popup-video-wrap" style="height:{POPUP_MAPA_ALTURA_PX}px;">'
+        f'<iframe class="ficha-popup-video" src="{html.escape(URL_YOUTUBE_BOAS_VINDAS_RH_EMBED)}" '
+        f'title="Boas-vindas — RH" loading="lazy" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
+        f'allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Abrir no YouTube: [{URL_YOUTUBE_BOAS_VINDAS_RH}]({URL_YOUTUBE_BOAS_VINDAS_RH})")
+
+    st.markdown("")
+    if st.button("Avançar", type="primary", use_container_width=True, key="ficha_dialog_boas_vindas_avancar"):
+        ss["ficha_boas_vindas_popup_concluido"] = True
+        st.rerun()
+
+
+@st.dialog("Próximos passos", width="large")
+def _dialog_recursos_pos_boas_vindas() -> None:
+    """Segundo popup com mapa, vídeo do simulador e links úteis."""
+    _render_recursos_pos_cadastro()
+
+
+def main():
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(
+        page_title="Credenciamento | Direcional Vendas RJ",
+        page_icon=str(fav) if fav else None,
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
+    _aplicar_secrets_sf()
+    aplicar_estilo()
+    injetar_cliente_e_meta()
+
+    ss = st.session_state
+    ss.setdefault("ficha_sucesso", False)
+
+    if _teste_planilha_sf_habilitado():
+        _render_sidebar_teste_planilha_sf()
+
+    if ss.get("ficha_sucesso"):
+        if not ss.get("ficha_boas_vindas_popup_concluido"):
+            _dialog_recursos_pos_cadastro()
+        else:
+            _dialog_recursos_pos_boas_vindas()
+        _cabecalho_pagina()
+        st.markdown(
+            '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    _cabecalho_pagina(com_intro_formulario=True)
+
+    if _design_teste_habilitado():
+        with st.expander(
+            "Modo teste de design — popup de conclusão (sem enviar dados)",
+            expanded=_design_teste_expander_aberto(),
+        ):
+            st.markdown(
+                "Simula o **cadastro concluído**: abre o **popup** de boas-vindas (vídeo do RH); após **Avançar**, "
+                "abre um segundo **popup** com mapa, vídeo do simulador e links úteis. Não grava na planilha nem no "
+                "Salesforce. PDF e e-mail usam **dados fictícios**."
+            )
+            st.caption(
+                "Ative este bloco com a variável de ambiente **FICHA_DESIGN_TEST=1** "
+                "ou com **?design_test=1** na URL (o expander abre já expandido)."
+            )
+            if st.button(
+                "Simular cadastro enviado e abrir o popup",
+                type="secondary",
+                key="ficha_simular_sucesso_design",
+            ):
+                _ativar_cenario_teste_design()
+                st.rerun()
+
+    _init_defaults()
+    iniciar_sessao_formulario()
+    secoes = secoes_com_campos_visiveis()
+    _render_secao_formulario(secoes)
+
+    fe = ss.get("ficha_erros_envio")
+    if fe:
+        kind = fe.get("kind")
+        if kind == "validation":
+            linhas = "<br>".join(f"• {html.escape(e)}" for e in fe.get("items") or [])
+            _alert_vermelho_html(
+                f"<strong>Quase lá</strong> — falta completar:<br>{linhas}"
+            )
+        elif kind == "html":
+            _alert_vermelho(FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO)
+        elif kind == "text":
+            _alert_vermelho(fe.get("text") or "")
+
+    trilha = list(ss.get("ficha_debug_envio") or [])
+    debug_habilitado = os.environ.get("FICHA_DEBUG_ENVIO", "").strip().lower() in ("1", "true", "yes", "on")
+    if debug_habilitado and trilha:
+        with st.expander("Debug do envio (planilha e Salesforce)", expanded=False):
+            st.caption(
+                "Use este painel para diagnóstico quando houver divergência entre planilha e Salesforce."
+            )
+            st.json(trilha)
+
+
+if __name__ == "__main__":
+    main()
