@@ -264,6 +264,8 @@ def record_type_id_contato_payload() -> str:
     return rid
 
 # Ordem de navegação no Streamlit (não altera mapeamento de campos para Salesforce)
+REGIONAL_CADASTRO_OPTS: Tuple[str, ...] = ("RJ", "MG")
+
 SEC_ORDER: Tuple[str, ...] = (
     "Dados Pessoais",
     "Endereço",
@@ -646,6 +648,16 @@ def _campos_def() -> List[Campo]:
             opcoes=["--Nenhum--"],
             req=True,
             help="Selecione o Nome da Conta (gerente de vendas) para vínculo no campo AccountId do Salesforce.",
+        ),
+        _z(
+            key="regional_cadastro",
+            label="Regional de Cadastro *",
+            sec="Dados Pessoais",
+            tipo="select",
+            sf=None,
+            opcoes=list(REGIONAL_CADASTRO_OPTS),
+            req=True,
+            help="RJ ou MG — define a lista de gerentes de vendas disponível no cadastro.",
         ),
         _z(
             key="nome_completo",
@@ -2712,6 +2724,26 @@ GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS: Tuple[str, ...] = tuple(
         if linha.strip()
     )
 )
+
+GERENTE_VENDAS_MG_OPCOES: Tuple[str, ...] = (
+    "RIVA VENDAS MG - EQUIPE ANDRE ALVES",
+    "RIVA VENDAS MG - EQUIPE DANIEL VIANA",
+    "RIVA VENDAS MG - EQUIPE DIEGO AUGUSTO",
+    "RIVA VENDAS MG - EQUIPE FLAVIANA RONARA",
+    "RIVA VENDAS MG - EQUIPE GABRIELLE CRISTINE",
+    "RIVA VENDAS MG - EQUIPE GUILHERME ALVES",
+    "RIVA VENDAS MG - EQUIPE HIAGO GONÇALVES",
+    "RIVA VENDAS MG - EQUIPE JEFERSON RODRIGO",
+    "RIVA VENDAS MG - EQUIPE LUANA SANTOS",
+    "RIVA VENDAS MG - EQUIPE LUISA PACHECO",
+    "RIVA VENDAS MG - EQUIPE MARIA JULIANA PINHO",
+    "RIVA VENDAS MG - EQUIPE MONICA ABREU",
+    "RIVA VENDAS MG - EQUIPE RODRIGO FABIANO",
+    "RIVA VENDAS MG - EQUIPE TIAGO PEREIRA",
+    "RIVA VENDAS MG - EQUIPE SORAIA CECÍLIA",
+    "RIVA MG - LUCINEIA FERRAZ",
+    "RIVA MG - VINICIUS PINHEIRO",
+)
 # Mensagens ao corretor: sem citar planilha, Salesforce ou outros sistemas internos.
 FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO = (
     "Não foi possível concluir o envio no momento. Tente novamente em alguns minutos."
@@ -4406,12 +4438,18 @@ def _campo_api_gerente_vendas() -> str:
     return val
 
 
-def _opcoes_gerente_vendas() -> list[str]:
-    """
-    Opções do select «Gerente de vendas»: valores de «Nome da Conta».
-    Prioridade: coluna Nome da Conta na aba Gerentes -> lista fixa definida no código.
-    """
-    base = ["--Nenhum--"]
+def _regional_cadastro_atual() -> str:
+    """Regional de cadastro (RJ/MG) escolhida no início do formulário."""
+    try:
+        dados = _coletar_dados_formulario_completo()
+        reg = str(dados.get("regional_cadastro") or "").strip().upper()
+    except Exception:
+        reg = str(st.session_state.get("fld_regional_cadastro") or "RJ").strip().upper()
+    return reg if reg in REGIONAL_CADASTRO_OPTS else "RJ"
+
+
+def _opcoes_gerente_vendas_rj() -> list[str]:
+    """Lista RJ: aba Gerentes da planilha ou fallback fixo no código."""
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
     if creds:
         gs: dict[str, Any] = {}
@@ -4433,8 +4471,19 @@ def _opcoes_gerente_vendas() -> list[str]:
             creds_json = "{}"
         tupla = _valores_coluna_gerentes_cached(sid, ws_g, col_g, creds_json)
         if tupla:
-            return base + [x for x in tupla if x and x != "--Nenhum--"]
-    return base + [x for x in GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS if x and x != "--Nenhum--"]
+            return [x for x in tupla if x and x != "--Nenhum--"]
+    return [x for x in GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS if x and x != "--Nenhum--"]
+
+
+def _opcoes_gerente_vendas() -> list[str]:
+    """
+    Opções do select «Gerente de vendas» conforme Regional de Cadastro.
+    MG: lista fixa Riva MG. RJ: aba Gerentes / lista fixa RJ.
+    """
+    base = ["--Nenhum--"]
+    if _regional_cadastro_atual() == "MG":
+        return base + list(GERENTE_VENDAS_MG_OPCOES)
+    return base + _opcoes_gerente_vendas_rj()
 
 
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
@@ -4460,6 +4509,22 @@ def _coerce_date_widget_value(val: Any) -> Optional[date]:
         return datetime.strptime(iso, "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def _limpar_gerente_ao_mudar_regional() -> None:
+    """Se a regional de cadastro mudar, zera gerente fora da nova lista."""
+    opts = _opcoes_gerente_vendas()
+    sk = "fld_gerente_vendas"
+    cur = st.session_state.get(sk)
+    if cur is not None and cur not in opts:
+        st.session_state[sk] = opts[0]
+    snap = st.session_state.get("ficha_snap_campos")
+    if isinstance(snap, dict):
+        g = snap.get("gerente_vendas")
+        if g is not None and g not in opts:
+            snap = dict(snap)
+            snap["gerente_vendas"] = opts[0]
+            st.session_state["ficha_snap_campos"] = snap
 
 
 def _widget_campo(c: dict):
@@ -4529,6 +4594,19 @@ def _widget_campo(c: dict):
             opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
         if k == "gerente_vendas":
             opts = _opcoes_gerente_vendas()
+        if k == "regional_cadastro":
+            opts = list(REGIONAL_CADASTRO_OPTS)
+            cur = st.session_state.get(sk)
+            if cur is not None and cur not in opts:
+                st.session_state[sk] = opts[0]
+            return st.selectbox(
+                widget_label,
+                options=opts,
+                key=sk,
+                help=help_txt,
+                label_visibility=lv,
+                on_change=_limpar_gerente_ao_mudar_regional,
+            )
         if k == "possui_creci":
             opts = ["Sim", "Não"]
             return st.selectbox(
@@ -4571,7 +4649,7 @@ def _coletar_dados_formulario() -> dict[str, Any]:
 # Picklists que definem visibilidade em outras etapas: se `fld_*` ficar vazio no state
 # (widget desmontado / placeholder) mas o snapshot tem valor válido, usar o snapshot.
 _CROSS_STEP_PICKLIST_KEYS: frozenset[str] = frozenset(
-    {"estado_civil", "unidade_negocio", "possui_creci"}
+    {"estado_civil", "unidade_negocio", "possui_creci", "regional_cadastro"}
 )
 
 
@@ -4688,6 +4766,8 @@ def _merge_defaults_ficha_em_dict(dados: Dict[str, Any]) -> Dict[str, Any]:
 def _init_defaults():
     """Padrões Vendas RJ; regional/origem/status/ids vêm de [ficha_defaults] nos Secrets."""
     fd = _ficha_defaults_de_secrets()
+    if "fld_regional_cadastro" not in st.session_state:
+        st.session_state["fld_regional_cadastro"] = "RJ"
     if "fld_regional" not in st.session_state:
         st.session_state["fld_regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
     if "fld_status_corretor" not in st.session_state:
@@ -5356,7 +5436,12 @@ def _render_secao_formulario(secoes: list[str]) -> None:
         elif sec == "Dados Pessoais":
             # Mesma razão do CRECI/rede: estado civil fora do form para o select atualizar o state
             # antes do submit; nome e nascimento ficam fora só para manter a ordem visual (nome → nasc. → estado).
-            _chaves_fora_form_dados_pessoais = ("nome_completo", "birthdate", "estado_civil")
+            _chaves_fora_form_dados_pessoais = (
+                "regional_cadastro",
+                "nome_completo",
+                "birthdate",
+                "estado_civil",
+            )
             for _k in _chaves_fora_form_dados_pessoais:
                 c0 = next((x for x in CAMPOS if x["key"] == _k and x["sec"] == sec), None)
                 if c0:
