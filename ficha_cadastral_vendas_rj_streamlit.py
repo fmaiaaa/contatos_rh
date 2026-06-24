@@ -618,16 +618,34 @@ def _campos_def() -> List[Campo]:
     * = obrigatório no layout (req=True), salvo quando combinado com outro campo.
     """
     return [
-        # ——— Dados Pessoais ———
+        # ——— Informações para contato ———
         _z(
-            key="regional",
-            label="Regional de cadastro *",
-            sec="Dados Pessoais",
+            key="account_id",
+            label="Nome da conta — Id (Account)",
+            sec="Informações para contato",
+            tipo="id",
+            sf="AccountId",
+            req=False,
+            help="Id Salesforce da conta (18 caracteres).",
+        ),
+        _z(
+            key="owner_id",
+            label="Proprietário do contato",
+            sec="Informações para contato",
+            tipo="id",
+            sf="OwnerId",
+            req=False,
+            help="Id do usuário proprietário (opcional).",
+        ),
+        _z(
+            key="gerente_vendas",
+            label="Gerente de vendas *",
+            sec="Informações para contato",
             tipo="select",
-            sf="Regional__c",
-            opcoes=["--Nenhum--", "RJ", "MG"],
+            sf="AccountId",
+            opcoes=["--Nenhum--"],
             req=True,
-            help="Selecione a regional para carregar os gerentes correspondentes.",
+            help="Selecione o Nome da Conta (gerente de vendas) para vínculo no campo AccountId do Salesforce.",
         ),
         _z(
             key="nome_completo",
@@ -638,6 +656,108 @@ def _campos_def() -> List[Campo]:
             req=True,
             help="Primeira palavra = nome (Primeiro Nome no Salesforce); o restante = sobrenome. Apelido gerado automaticamente.",
         ),
+        _z(
+            key="salutation",
+            label="Tratamento",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Salutation",
+            opcoes=SALUTATIONS,
+            req=False,
+        ),
+        _z(
+            key="apelido",
+            label="Apelido",
+            sec="Informações para contato",
+            tipo="text",
+            sf="Apelido__c",
+            req=False,
+            help="Preenchido automaticamente: primeiro nome + _RJ01",
+        ),
+        _z(
+            key="status_corretor",
+            label="Status Corretor *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Status_Corretor__c",
+            opcoes=STATUS_CORRETOR,
+            req=True,
+        ),
+        _z(
+            key="regional",
+            label="Regional *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Regional__c",
+            opcoes=REGIONAIS,
+            req=True,
+        ),
+        _z(
+            key="origem",
+            label="Origem *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Origem__c",
+            opcoes=ORIGENS,
+            req=True,
+        ),
+        _z(
+            key="sexo",
+            label="Sexo *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Sexo__c",
+            opcoes=SEXOS,
+            req=True,
+        ),
+        _z(
+            key="camiseta",
+            label="Camiseta *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Camiseta__c",
+            opcoes=CAMISETAS,
+            req=True,
+        ),
+        _z(
+            key="unidade_negocio",
+            label="Fará parte de qual rede? *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Unidade_Negocio__c",
+            opcoes=UNIDADES_NEGOCIO,
+            req=True,
+            help="Direcional, Riva ou imobiliária parceira (externa).",
+        ),
+        _z(
+            key="atividade",
+            label="Função na operação *",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Atividade__c",
+            opcoes=ATIVIDADE_OPTS,
+            req=True,
+            help="No fluxo Vendas RJ o formulário restringe a Corretor Parceiro, Corretor (próprio) e Captador. Corretor = corretor próprio. Parceira externa: gravado como Corretor Parceiro.",
+        ),
+        _z(
+            key="escolaridade",
+            label="Escolaridade",
+            sec="Informações para contato",
+            tipo="select",
+            sf="Escolaridade__c",
+            opcoes=ESCOLARIDADE_OPTS,
+            req=False,
+        ),
+        _z(
+            key="data_entrevista",
+            label="Data da Entrevista",
+            sec="Informações para contato",
+            tipo="date",
+            sf="Data_da_Entrevista__c",
+            req=False,
+            help="Definida automaticamente na data do envio.",
+        ),
+        # ——— Dados Pessoais ———
         _z(
             key="birthdate",
             label="Data de nascimento *",
@@ -720,127 +840,6 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Dados_para_PIX__c",
             req=True,
-        ),
-        # ——— Informações para contato ———
-        _z(
-            key="account_id",
-            label="Nome da conta — Id (Account)",
-            sec="Informações para contato",
-            tipo="id",
-            sf="AccountId",
-            req=False,
-            help="Id Salesforce da conta (18 caracteres).",
-        ),
-        _z(
-            key="owner_id",
-            label="Proprietário do contato",
-            sec="Informações para contato",
-            tipo="id",
-            sf="OwnerId",
-            req=False,
-            help="Id do usuário proprietário (opcional).",
-        ),
-        _z(
-            key="gerente_vendas",
-            label="Gerente de vendas *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="AccountId",
-            opcoes=["--Nenhum--"],
-            req=True,
-            help="Selecione o Nome da Conta (gerente de vendas) para vínculo no campo AccountId do Salesforce.",
-        ),
-        _z(
-            key="salutation",
-            label="Tratamento",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Salutation",
-            opcoes=SALUTATIONS,
-            req=False,
-        ),
-        _z(
-            key="apelido",
-            label="Apelido",
-            sec="Informações para contato",
-            tipo="text",
-            sf="Apelido__c",
-            req=False,
-            help="Preenchido automaticamente: primeiro nome + _RJ01",
-        ),
-        _z(
-            key="status_corretor",
-            label="Status Corretor *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Status_Corretor__c",
-            opcoes=STATUS_CORRETOR,
-            req=True,
-        ),
-        _z(
-            key="origem",
-            label="Origem *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Origem__c",
-            opcoes=ORIGENS,
-            req=True,
-        ),
-        _z(
-            key="sexo",
-            label="Sexo *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Sexo__c",
-            opcoes=SEXOS,
-            req=True,
-        ),
-        _z(
-            key="camiseta",
-            label="Camiseta *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Camiseta__c",
-            opcoes=CAMISETAS,
-            req=True,
-        ),
-        _z(
-            key="unidade_negocio",
-            label="Fará parte de qual rede? *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Unidade_Negocio__c",
-            opcoes=UNIDADES_NEGOCIO,
-            req=True,
-            help="Direcional, Riva ou imobiliária parceira (externa).",
-        ),
-        _z(
-            key="atividade",
-            label="Função na operação *",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Atividade__c",
-            opcoes=ATIVIDADE_OPTS,
-            req=True,
-            help="No fluxo Vendas RJ o formulário restringe a Corretor Parceiro, Corretor (próprio) e Captador. Corretor = corretor próprio. Parceira externa: gravado como Corretor Parceiro.",
-        ),
-        _z(
-            key="escolaridade",
-            label="Escolaridade",
-            sec="Informações para contato",
-            tipo="select",
-            sf="Escolaridade__c",
-            opcoes=ESCOLARIDADE_OPTS,
-            req=False,
-        ),
-        _z(
-            key="data_entrevista",
-            label="Data da Entrevista",
-            sec="Informações para contato",
-            tipo="date",
-            sf="Data_da_Entrevista__c",
-            req=False,
-            help="Definida automaticamente na data do envio.",
         ),
         # ——— Endereço (residencial) ———
         _z(
@@ -1163,7 +1162,7 @@ def _campos_def() -> List[Campo]:
 CAMPOS: List[Campo] = _campos_def()
 
 # Ocultos no Streamlit: integração/sistema (preenchidos por processos ou planilha) e
-# valores fixos via Secrets → [ficha_defaults] (origem, status, ids opcionais).
+# valores fixos via Secrets → [ficha_defaults] (regional, origem, status, ids opcionais).
 # tipo_corretor / multiplicadores / apelido / datas: enriquecer_derivados_vendas_rj.
 CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
     {
@@ -1172,6 +1171,7 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
         "retorno_integracao_pessoa",
         "retorno_integracao_bancaria",
         "status_corretor",
+        "regional",
         "origem",
         "account_id",
         "owner_id",
@@ -1586,7 +1586,7 @@ def _proximo_apelido_disponivel(sf: Any, primeiro_nome: str) -> Optional[str]:
             continue
         if n > max_n:
             max_n = n
-        prox = max_n + 1
+    prox = max_n + 1
     return f"{base}_RJ{prox:02d}"
 
 
@@ -4409,7 +4409,7 @@ def _campo_api_gerente_vendas() -> str:
 def _opcoes_gerente_vendas() -> list[str]:
     """
     Opções do select «Gerente de vendas»: valores de «Nome da Conta».
-    Prioridade: coluna Nome da Conta - RJ ou Nome da Conta - MG na aba Gerentes -> lista fixa definida no código.
+    Prioridade: coluna Nome da Conta na aba Gerentes -> lista fixa definida no código.
     """
     base = ["--Nenhum--"]
     creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
@@ -4426,16 +4426,7 @@ def _opcoes_gerente_vendas() -> list[str]:
             or gs.get("gerentes_worksheet")
             or DEFAULT_GERENTES_WORKSHEET
         ).strip() or DEFAULT_GERENTES_WORKSHEET
-        
         col_g = str(gs.get("NOME_CONTA_COLUMN") or gs.get("nome_conta_column") or DEFAULT_COL_NOME_CONTA).strip() or DEFAULT_COL_NOME_CONTA
-        
-        dados_completos = _coletar_dados_formulario_completo()
-        regional_selecionada = _norm_picklist(dados_completos.get("regional"))
-        if regional_selecionada == "MG":
-            col_g = "Nome da Conta - MG"
-        elif regional_selecionada == "RJ":
-            col_g = "Nome da Conta - RJ"
-            
         try:
             creds_json = json.dumps(creds, sort_keys=True)
         except (TypeError, ValueError):
@@ -4580,7 +4571,7 @@ def _coletar_dados_formulario() -> dict[str, Any]:
 # Picklists que definem visibilidade em outras etapas: se `fld_*` ficar vazio no state
 # (widget desmontado / placeholder) mas o snapshot tem valor válido, usar o snapshot.
 _CROSS_STEP_PICKLIST_KEYS: frozenset[str] = frozenset(
-    {"estado_civil", "unidade_negocio", "possui_creci", "regional"}
+    {"estado_civil", "unidade_negocio", "possui_creci"}
 )
 
 
@@ -4640,12 +4631,8 @@ def _snapshot_persistir_secao_atual(sec: str) -> None:
         if sk in ss:
             snap[k] = ss[sk]
     # Renderizados fora do st.form: garantir cópia explícita no «Avançar» (mesmo critério do loop).
-    if sec == "Informações para contato":
-        if "fld_unidade_negocio" in ss:
-            snap["unidade_negocio"] = ss["fld_unidade_negocio"]
-    if sec == "Dados Pessoais":
-        if "fld_regional" in ss:
-            snap["regional"] = ss["fld_regional"]
+    if sec == "Informações para contato" and "fld_unidade_negocio" in ss:
+        snap["unidade_negocio"] = ss["fld_unidade_negocio"]
     if sec == "CRECI/TTI" and "fld_possui_creci" in ss:
         snap["possui_creci"] = ss["fld_possui_creci"]
     ss["ficha_snap_campos"] = snap
@@ -4668,9 +4655,6 @@ def _garantir_campos_secao_de_snapshot(sec: str) -> None:
     if sec == "Informações para contato":
         if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
             ss["fld_unidade_negocio"] = snap["unidade_negocio"]
-    if sec == "Dados Pessoais":
-        if "fld_regional" not in ss and "regional" in snap:
-            ss["fld_regional"] = snap["regional"]
 
 
 def _ficha_defaults_de_secrets() -> dict[str, Any]:
@@ -4686,6 +4670,8 @@ def _merge_defaults_ficha_em_dict(dados: Dict[str, Any]) -> Dict[str, Any]:
     """Preenche campos ocultos (não exportados na aba do corretor) a partir de [ficha_defaults]."""
     out = dict(dados)
     fd = _ficha_defaults_de_secrets()
+    if not str(out.get("regional") or "").strip():
+        out["regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
     if not str(out.get("status_corretor") or "").strip():
         out["status_corretor"] = (
             str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
@@ -4700,8 +4686,10 @@ def _merge_defaults_ficha_em_dict(dados: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _init_defaults():
-    """Padrões Vendas RJ; origem/status/ids vêm de [ficha_defaults] nos Secrets."""
+    """Padrões Vendas RJ; regional/origem/status/ids vêm de [ficha_defaults] nos Secrets."""
     fd = _ficha_defaults_de_secrets()
+    if "fld_regional" not in st.session_state:
+        st.session_state["fld_regional"] = str(fd.get("regional", "RJ")).strip() or "RJ"
     if "fld_status_corretor" not in st.session_state:
         st.session_state["fld_status_corretor"] = (
             str(fd.get("status_corretor", "Pré credenciado")).strip() or "Pré credenciado"
