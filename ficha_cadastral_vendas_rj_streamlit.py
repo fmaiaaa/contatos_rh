@@ -147,6 +147,46 @@ def criar_contato_payload_com_fallback_naturalidade(
     return None, err2, payload_retry
 
 
+def _mensagem_erro_sf_amigavel(err: Any) -> str:
+    """Resumo curto para a planilha (coluna link / log) — sem stack trace."""
+    txt = (str(err).strip() if err is not None else "") or ""
+    u = txt.upper()
+    compact = re.sub(r"\s+", "", u)
+    low = txt.lower()
+
+    if "DUPLICATE_VALUE" in compact or "duplicad" in low or "duplica o valor" in low:
+        if "apelido" in low:
+            return "Falha de duplicação (apelido já existe)"
+        if "cpf" in low or "email" in low:
+            return "Falha de duplicação (cadastro já existente)"
+        return "Falha de duplicação"
+    if "INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST" in compact or "lista de opções restrita" in low:
+        return "Valor inválido em campo do formulário"
+    if "INVALID_CROSS_REFERENCE_KEY" in compact:
+        if "RECORDTYPE" in compact or "TIPODEREGISTRO" in compact.replace("_", "") or "registro" in low:
+            return "Tipo de registro não permitido"
+        return "Referência inválida no Salesforce"
+    if "REQUIRED_FIELD_MISSING" in compact or "campo obrigatório" in low:
+        return "Campo obrigatório ausente"
+    if "STRING_TOO_LONG" in compact:
+        return "Texto excede o limite permitido"
+    if "INVALID_EMAIL" in compact:
+        return "E-mail inválido"
+    if "AUTHENTICATION" in u or "AUTHENTIC" in u or "SalesforceAuthenticationFailed" in txt:
+        return "Falha de autenticação no Salesforce"
+    if "SalesforceMalformedRequest" in txt or "MALFORMED" in u:
+        return "Falha na validação do Salesforce"
+    if "simple_salesforce" in low or "não instalado" in low:
+        return "Integração Salesforce indisponível"
+    if "conectar" in low and "salesforce" in low:
+        return "Falha ao conectar ao Salesforce"
+    if "não configurado" in low or "secrets user" in low:
+        return "Salesforce não configurado"
+    if not txt:
+        return "Falha no envio ao Salesforce"
+    return "Falha no envio ao Salesforce"
+
+
 def _explicacao_erro_record_type_se_aplicavel(err: Any) -> str:
     """
     INVALID_CROSS_REFERENCE_KEY em RecordTypeId: o Id 012… costuma estar certo; o usuário da API
@@ -2137,7 +2177,7 @@ def ler_planilha_corretores_bruta(
     """Cabeçalho (linha 1) e linhas de dados seguintes (ignora linhas totalmente vazias)."""
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
+    ws = _resolver_worksheet_planilha(sh, worksheet_name)
     all_v = ws.get_all_values()
     if not all_v:
         return [], []
@@ -2194,7 +2234,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
     Monta payload a partir da linha da planilha, cria contato no Salesforce.
     Retorna (ok, mensagem_html_ou_texto).
     """
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
         return False, "Configure **[google_sheets]** nos Secrets (SERVICE_ACCOUNT_JSON)."
 
@@ -2255,6 +2295,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
     _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
     cid, err = criar_contato_payload(sf, payload)
     link = _url_contact(cid) if cid else ""
+    msg_erro = _mensagem_erro_sf_amigavel(_explicacao_erro_record_type_se_aplicavel(err) if err else err)
 
     if atualizar_status_nesta_linha and row_num_atualizar >= 2:
         try:
@@ -2264,7 +2305,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
                     wname,
                     creds,
                     row_num_atualizar,
-                    "Sucesso",
+                    "Ok",
                     "",
                     link,
                     payload_final=payload,
@@ -2276,10 +2317,8 @@ def _executar_teste_criar_sf_de_linha_planilha(
                     creds,
                     row_num_atualizar,
                     "Erro",
-                    (_explicacao_erro_record_type_se_aplicavel(err))[:49000]
-                    if err
-                    else "Erro desconhecido",
-                    "",
+                    msg_erro,
+                    msg_erro,
                     payload_final=payload,
                 )
         except Exception as ex:
@@ -2316,7 +2355,7 @@ def _render_sidebar_teste_planilha_sf() -> None:
             "Em produção: **FICHA_TEST_PLANILHA_ATIVO = False**."
         )
         if st.button("Carregar linhas da planilha", key="test_pl_carregar"):
-            creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+            creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
             if not creds:
                 st.error("Secrets **google_sheets** ausente ou JSON inválido.")
             else:
@@ -2824,6 +2863,70 @@ def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _credenciais_google_sheets(st_secrets: Any = None) -> Optional[Dict[str, Any]]:
+    """
+    Credenciais da conta de serviço Google: Secrets → variável de ambiente → arquivo local.
+  """
+    if st_secrets is None and hasattr(st, "secrets"):
+        try:
+            st_secrets = st.secrets
+        except Exception:
+            st_secrets = None
+    creds = _credenciais_de_secrets(st_secrets)
+    if creds:
+        return creds
+
+    for env_key in ("GOOGLE_SERVICE_ACCOUNT_JSON", "SERVICE_ACCOUNT_JSON", "GSPREAD_SERVICE_ACCOUNT_JSON"):
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            parsed = _parse_json_conta_servico_google(raw)
+            if parsed:
+                return parsed
+
+    candidatos_arquivo: List[Any] = []
+    env_file = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE") or "").strip()
+    if env_file:
+        candidatos_arquivo.append(env_file)
+    candidatos_arquivo.extend(
+        [
+            _DIR_APP / "service_account.json",
+            _DIR_APP / "google_service_account.json",
+            _DIR_APP.parent / "config_e_dependencias" / "service_account.json",
+            _DIR_APP.parent / "config_e_dependencias" / "google_service_account.json",
+        ]
+    )
+    for path in candidatos_arquivo:
+        p = Path(path) if not isinstance(path, Path) else path
+        if not p.is_file():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("type") == "service_account":
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def _resolver_worksheet_planilha(sh: Any, worksheet_name: str) -> Any:
+    """Abre a aba pelo nome; se não existir, usa a primeira aba (gid=0 na URL)."""
+    wn = (worksheet_name or "").strip()
+    if wn:
+        try:
+            return sh.worksheet(wn)
+        except Exception:
+            pass
+    sheets = sh.worksheets()
+    if not sheets:
+        return sh.add_worksheet(
+            title=wn or DEFAULT_WORKSHEET_NAME,
+            rows=1000,
+            cols=30,
+        )
+    return sheets[0]
+
+
 def _cliente_gspread(creds_dict: Dict[str, Any]):
     import gspread
     from google.oauth2.service_account import Credentials
@@ -2885,11 +2988,11 @@ def _dicionario_texto_coluna_corretores(header: str, cabecalhos_api: frozenset[s
     if nh == _norm_cabecalho_planilha(PLANILHA_COL_LINK_SF) or nh == _norm_cabecalho_planilha(
         PLANILHA_COL_LINK_LEGACY
     ):
-        return "URL do registro no Lightning (Contact); preenchida após o insert."
+        return "Link do contato no Salesforce (sucesso) ou resumo do erro (falha), ex.: «Falha de duplicação»."
     if nh == _norm_cabecalho_planilha("Envio?"):
-        return "Controle interno: Sucesso ou Erro da criação do Contato."
+        return "Controle interno: Ok ou Erro da criação do Contato."
     if nh == _norm_cabecalho_planilha("Log / erro"):
-        return "Controle interno: mensagem de erro Salesforce ou vazio."
+        return "Controle interno: resumo amigável do erro ou vazio em caso de sucesso."
     if header in cabecalhos_api:
         return f"Contact.{header} — valor efetivo enviado no JSON (API REST / insert)."
     for c in CAMPOS:
@@ -3228,10 +3331,10 @@ def anexar_linha(
     except Exception:
         pass
     try:
-        ws = sh.worksheet(worksheet_name)
+        ws = _resolver_worksheet_planilha(sh, worksheet_name)
     except Exception:
         ws = sh.add_worksheet(
-            title=worksheet_name,
+            title=worksheet_name or DEFAULT_WORKSHEET_NAME,
             rows=1000,
             cols=max(len(cabecalho), 30),
         )
@@ -3278,7 +3381,7 @@ def atualizar_status_envio_salesforce(
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
+    ws = _resolver_worksheet_planilha(sh, worksheet_name)
     headers = ws.row_values(1)
     if not headers:
         return
@@ -3321,7 +3424,7 @@ def remover_linha_worksheet_google(
         return
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
+    ws = _resolver_worksheet_planilha(sh, worksheet_name)
     ws.delete_rows(row_1based)
 
 
@@ -3337,7 +3440,7 @@ def listar_nomes_conta_aba_gerentes(
     """
     gc = _cliente_gspread(creds_dict)
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
+    ws = _resolver_worksheet_planilha(sh, worksheet_name)
     rows = ws.get_all_values()
     if not rows:
         return []
@@ -4613,7 +4716,7 @@ def _opcoes_nome_conta() -> list[str]:
     da mesma planilha Google (Secrets [google_sheets]). Se a leitura falhar ou vier vazia,
     usa [ficha_defaults] account_names / account_name ou NOMES_CONTA_FIXOS.
     """
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if creds:
         gs: dict[str, Any] = {}
         if hasattr(st, "secrets"):
@@ -4754,7 +4857,7 @@ def _regional_cadastro_enviada_rj() -> bool:
 
 def _opcoes_gerente_vendas_rj() -> list[str]:
     """Lista RJ: aba Gerentes da planilha ou fallback fixo no código."""
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if creds:
         gs: dict[str, Any] = {}
         if hasattr(st, "secrets"):
@@ -5973,8 +6076,65 @@ def _ativar_cenario_teste_design() -> None:
     ss["sf_avisos"] = []
 
 
+def _gravar_cadastro_planilha(
+    linha: List[str],
+    cab: List[str],
+    sid: str,
+    wname: str,
+    creds: Dict[str, Any],
+    gs: Dict[str, Any],
+    *,
+    envio: str,
+    coluna_link: str,
+    log_erro: str = "",
+    payload_final: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Anexa linha na aba Corretores e preenche status, link (ou mensagem de erro) e payload API."""
+    try:
+        row_n = anexar_linha(linha, cab, sid, wname, creds, gs)
+        atualizar_status_envio_salesforce(
+            sid,
+            wname,
+            creds,
+            row_n,
+            envio,
+            (log_erro or "")[:49000],
+            coluna_link or "",
+            payload_final=payload_final,
+        )
+        _registrar_debug_envio(
+            "planilha_gravada",
+            f"linha={row_n} envio={envio} planilha={sid} aba={wname}",
+        )
+        return row_n
+    except Exception as e:
+        erro_txt = str(e or "").strip()
+        erro_low = erro_txt.lower()
+        msg = FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO
+        if "spreadsheet" in erro_low and "not found" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio porque a planilha configurada não foi encontrada "
+                "ou não está acessível para a conta de serviço."
+            )
+        elif "worksheet" in erro_low and "not found" in erro_low:
+            msg = (
+                "Não foi possível concluir o envio porque a aba configurada na planilha não foi encontrada."
+            )
+        elif "permission" in erro_low or "forbidden" in erro_low or "insufficient" in erro_low:
+            msg = "Não foi possível concluir o envio por falta de permissão na planilha."
+        _LOG_FICHA.exception(
+            "Ficha cadastro: falha ao gravar linha na planilha. planilha_id=%r aba=%r",
+            sid,
+            wname,
+        )
+        _registrar_debug_envio("planilha_append_erro", f"{type(e).__name__}: {e}")
+        ss = st.session_state
+        ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
+        return None
+
+
 def _processar_envio_cadastro() -> None:
-    """Tenta Salesforce primeiro; grava na planilha Google só se o cadastro falhar (sem contato / erro)."""
+    """Tenta Salesforce e grava sempre na planilha Google (sucesso ou falha)."""
     ss = st.session_state
     ss["ficha_debug_envio"] = []
     _registrar_debug_envio("início_envio", "Fluxo principal iniciado.")
@@ -6001,7 +6161,7 @@ def _processar_envio_cadastro() -> None:
 
     ss.pop("ficha_modo_teste_design", None)
 
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
         _registrar_debug_envio("erro_google_credentials", "SERVICE_ACCOUNT_JSON ausente/inválido.")
         _LOG_FICHA.error(
@@ -6035,60 +6195,6 @@ def _processar_envio_cadastro() -> None:
     linha = linha_planilha(dados, payload)
     cab = cabecalho_planilha()
 
-    def _gravar_falha_planilha(
-        log_erro: str,
-        *,
-        link: str = "",
-        payload_final: Optional[Dict[str, Any]] = None,
-    ) -> Optional[int]:
-        """Anexa linha e preenche status de erro; usado somente quando o cadastro Salesforce não teve sucesso."""
-        try:
-            row_n = anexar_linha(linha, cab, sid, wname, creds, gs)
-            atualizar_status_envio_salesforce(
-                sid,
-                wname,
-                creds,
-                row_n,
-                "Erro",
-                (log_erro or "")[:49000],
-                link or "",
-                payload_final=payload_final,
-            )
-            _registrar_debug_envio(
-                "planilha_append_falha_ok",
-                f"linha={row_n} planilha={sid} aba={wname}",
-            )
-            return row_n
-        except Exception as e:
-            erro_txt = str(e or "").strip()
-            erro_low = erro_txt.lower()
-            msg = FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO
-            if "spreadsheet" in erro_low and "not found" in erro_low:
-                msg = (
-                    "Não foi possível concluir o envio porque a planilha configurada não foi encontrada "
-                    "ou não está acessível para a conta de serviço."
-                )
-            elif "worksheet" in erro_low and "not found" in erro_low:
-                msg = (
-                    "Não foi possível concluir o envio porque a aba configurada na planilha não foi encontrada."
-                )
-            elif "permission" in erro_low or "forbidden" in erro_low or "insufficient" in erro_low:
-                msg = (
-                    "Não foi possível concluir o envio por falta de permissão na planilha."
-                )
-            _LOG_FICHA.exception(
-                "Ficha cadastro: falha em anexar_linha (planilha) ao registrar falha Salesforce. "
-                "planilha_id=%r aba=%r mensagem_ao_usuario=%r tipo_excecao=%s erro_str=%r",
-                sid,
-                wname,
-                msg,
-                type(e).__name__,
-                erro_txt or repr(e),
-            )
-            _registrar_debug_envio("planilha_append_erro", f"{type(e).__name__}: {e}")
-            ss["ficha_erros_envio"] = {"kind": "text", "text": msg}
-            return None
-
     ss["ficha_dados_enviados"] = dados
     ss["sf_contact_id"] = None
     ss["sf_erro"] = None
@@ -6097,79 +6203,70 @@ def _processar_envio_cadastro() -> None:
     ss.pop("ficha_sf_retry_sid", None)
     ss.pop("ficha_sf_retry_wname", None)
 
+    cid: Optional[str] = None
+    err: Any = None
+    payload_utilizado = dict(payload)
+    msg_amigavel = ""
+
     _aplicar_secrets_sf()
     if not _credenciais_salesforce_ok():
         _registrar_debug_envio("sf_config_ausente", "Secrets USER/PASSWORD/TOKEN ausentes.")
-        row_num = _gravar_falha_planilha(
-            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
-            payload_final=payload,
-        )
-        if row_num is None:
-            return
-        ss["ficha_sf_retry_row"] = row_num
-        ss["ficha_sf_retry_sid"] = sid
-        ss["ficha_sf_retry_wname"] = wname
-        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
-        _tentar_enviar_email_boas_vindas(dados, None)
-        _definir_sucesso_pos_cadastro()
-        st.rerun()
-        return
-
-    if not _SF_SDK_DISPONIVEL:
+        msg_amigavel = _mensagem_erro_sf_amigavel("Salesforce não configurado nos Secrets.")
+    elif not _SF_SDK_DISPONIVEL:
         _registrar_debug_envio("sf_sdk_indisponivel", "simple_salesforce não instalado.")
-        row_num = _gravar_falha_planilha(
-            "simple_salesforce não instalado.",
-            payload_final=payload,
-        )
-        if row_num is None:
-            return
-        ss["ficha_sf_retry_row"] = row_num
-        ss["ficha_sf_retry_sid"] = sid
-        ss["ficha_sf_retry_wname"] = wname
-        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
-        _tentar_enviar_email_boas_vindas(dados, None)
-        _definir_sucesso_pos_cadastro()
-        st.rerun()
-        return
-
-    sf = conectar_salesforce()
-    if not sf:
-        _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
-        row_num = _gravar_falha_planilha(
-            "Falha ao conectar ao Salesforce (credenciais ou rede).",
-            payload_final=payload,
-        )
-        if row_num is None:
-            return
-        ss["ficha_sf_retry_row"] = row_num
-        ss["ficha_sf_retry_sid"] = sid
-        ss["ficha_sf_retry_wname"] = wname
-        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
-        ss["sf_avisos"] = avisos
-        _tentar_enviar_email_boas_vindas(dados, None)
-        _definir_sucesso_pos_cadastro()
-        st.rerun()
-        return
-
-    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
-    _registrar_debug_envio(
-        "payload_sf_enriquecido",
-        json.dumps(payload, ensure_ascii=False, default=str)[:7000],
-    )
-    cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
+        msg_amigavel = _mensagem_erro_sf_amigavel("simple_salesforce não instalado.")
+    else:
+        sf = conectar_salesforce()
+        if not sf:
+            _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
+            msg_amigavel = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
+        else:
+            _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
+            payload_utilizado = dict(payload)
+            _registrar_debug_envio(
+                "payload_sf_enriquecido",
+                json.dumps(payload, ensure_ascii=False, default=str)[:7000],
+            )
+            cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(
+                sf, payload, avisos
+            )
+            if cid:
+                _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
+            else:
+                err_full = _explicacao_erro_record_type_se_aplicavel(err)
+                _registrar_debug_envio("sf_create_erro", err_full)
+                msg_amigavel = _mensagem_erro_sf_amigavel(err_full or err)
 
     if cid:
-        _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
+        row_num = _gravar_cadastro_planilha(
+            linha,
+            cab,
+            sid,
+            wname,
+            creds,
+            gs,
+            envio="Ok",
+            coluna_link=_url_contact(cid),
+            log_erro="",
+            payload_final=payload_utilizado,
+        )
+        if row_num is None:
+            return
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
-        ss.pop("ficha_sf_retry_row", None)
-        ss.pop("ficha_sf_retry_sid", None)
-        ss.pop("ficha_sf_retry_wname", None)
     else:
-        err_full = _explicacao_erro_record_type_se_aplicavel(err)
-        _registrar_debug_envio("sf_create_erro", err_full)
-        row_num = _gravar_falha_planilha(
-            err_full[:49000] if err_full else "",
+        if not msg_amigavel:
+            msg_amigavel = _mensagem_erro_sf_amigavel(err)
+        row_num = _gravar_cadastro_planilha(
+            linha,
+            cab,
+            sid,
+            wname,
+            creds,
+            gs,
+            envio="Erro",
+            coluna_link=msg_amigavel,
+            log_erro=msg_amigavel,
             payload_final=payload_utilizado,
         )
         if row_num is None:
@@ -6177,7 +6274,7 @@ def _processar_envio_cadastro() -> None:
         ss["ficha_sf_retry_row"] = row_num
         ss["ficha_sf_retry_sid"] = sid
         ss["ficha_sf_retry_wname"] = wname
-        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+        ss["sf_erro"] = msg_amigavel
 
     ss["sf_avisos"] = avisos
     if avisos:
@@ -6190,8 +6287,7 @@ def _processar_envio_cadastro() -> None:
 def _retentar_salesforce_ultimo_envio() -> None:
     """
     Repete a criação do contato no Salesforce com os mesmos dados da linha de falha na planilha.
-    Em caso de sucesso, remove a linha da planilha (aba só guarda cadastros que falharam).
-    Em caso de erro, atualiza a mesma linha (log / payload); não insere nova linha.
+    Em caso de sucesso, atualiza a linha (link + Ok). Em erro, atualiza mensagem amigável na mesma linha.
     """
     ss = st.session_state
     dados = ss.get("ficha_dados_enviados")
@@ -6210,7 +6306,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss["sf_erro"] = f"Retentativa bloqueada: {msg_sec}"
         return
 
-    creds = _credenciais_de_secrets(st.secrets if hasattr(st, "secrets") else None)
+    creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
         ss["sf_erro"] = (
             "Credenciais Google Sheets ausentes — necessárias para atualizar ou remover a linha na planilha."
@@ -6224,47 +6320,50 @@ def _retentar_salesforce_ultimo_envio() -> None:
 
     _aplicar_secrets_sf()
     if not _credenciais_salesforce_ok():
+        msg = _mensagem_erro_sf_amigavel("Salesforce não configurado nos Secrets.")
         atualizar_status_envio_salesforce(
             str(sid),
             str(wname),
             creds,
             int(row_num),
             "Erro",
-            "Salesforce não configurado (Secrets USER/PASSWORD/TOKEN).",
-            "",
+            msg,
+            msg,
             payload_final=payload,
         )
-        ss["sf_erro"] = "Salesforce não configurado nos Secrets."
+        ss["sf_erro"] = msg
         return
 
     if not _SF_SDK_DISPONIVEL:
+        msg = _mensagem_erro_sf_amigavel("simple_salesforce não instalado.")
         atualizar_status_envio_salesforce(
             str(sid),
             str(wname),
             creds,
             int(row_num),
             "Erro",
-            "simple_salesforce não instalado.",
-            "",
+            msg,
+            msg,
             payload_final=payload,
         )
-        ss["sf_erro"] = "Pacote simple_salesforce não instalado (veja requirements.txt)."
+        ss["sf_erro"] = msg
         return
 
     with st.spinner("Só um momento — estamos concluindo o envio."):
         sf = conectar_salesforce()
     if not sf:
+        msg = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
         atualizar_status_envio_salesforce(
             str(sid),
             str(wname),
             creds,
             int(row_num),
             "Erro",
-            "Falha ao conectar ao Salesforce (credenciais ou rede).",
-            "",
+            msg,
+            msg,
             payload_final=payload,
         )
-        ss["sf_erro"] = "Falha ao conectar ao Salesforce."
+        ss["sf_erro"] = msg
         ss["sf_avisos"] = avisos
         return
 
@@ -6272,17 +6371,16 @@ def _retentar_salesforce_ultimo_envio() -> None:
     cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
 
     if cid:
-        try:
-            remover_linha_worksheet_google(
-                str(sid),
-                str(wname),
-                creds,
-                int(row_num),
-            )
-        except Exception:
-            _LOG_FICHA.exception(
-                "Ficha cadastro: falha ao remover linha da planilha após sucesso na retentativa Salesforce."
-            )
+        atualizar_status_envio_salesforce(
+            str(sid),
+            str(wname),
+            creds,
+            int(row_num),
+            "Ok",
+            "",
+            _url_contact(cid),
+            payload_final=payload_utilizado,
+        )
         ss["sf_contact_id"] = cid
         ss["sf_erro"] = None
         ss.pop("ficha_sf_retry_row", None)
@@ -6290,17 +6388,18 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss.pop("ficha_sf_retry_wname", None)
     else:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
+        msg = _mensagem_erro_sf_amigavel(err_full or err)
         atualizar_status_envio_salesforce(
             str(sid),
             str(wname),
             creds,
             int(row_num),
             "Erro",
-            err_full[:49000],
-            "",
+            msg,
+            msg,
             payload_final=payload_utilizado,
         )
-        ss["sf_erro"] = err_full if err else "Erro desconhecido ao criar contato."
+        ss["sf_erro"] = msg
 
     ss["sf_avisos"] = avisos
     _tentar_enviar_email_boas_vindas(dados_c, cid if cid else None)
