@@ -4087,10 +4087,19 @@ def aplicar_estilo():
             0% {{ background-position: 0% 50%; }}
             100% {{ background-position: 200% 50%; }}
         }}
-        /* Modo claro no documento: evita que o navegador (PC/celular) aplique UI escura a inputs, date pickers, etc.
-           quando o sistema está em dark mode. O tema dos componentes Streamlit vem de [theme] base no config.toml. */
-        html, body, :root, [data-testid="stApp"] {{
-            color-scheme: light !important;
+        /* Modo claro fixo: ignora dark mode do sistema e escolha no menu do Streamlit. */
+        html, body, :root, [data-testid="stApp"], .stApp {{
+            color-scheme: light only !important;
+        }}
+        .stApp,
+        [data-testid="stApp"],
+        [data-testid="stApp"][data-theme="dark"],
+        .stApp[data-theme="dark"] {{
+            --primary-color: {COR_AZUL_ESC} !important;
+            --background-color: #f6f8fb !important;
+            --secondary-background-color: #ffffff !important;
+            --text-color: #1f2937 !important;
+            color-scheme: light only !important;
         }}
         :root {{
             --st-base: #f6f8fb !important;
