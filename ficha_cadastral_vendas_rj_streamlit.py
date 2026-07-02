@@ -3685,6 +3685,8 @@ COR_VERMELHO = "#cb0935"
 COR_FUNDO = "#04428f"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
+COR_CAMPO_FORM_BG = "#ffffff"
+COR_CAMPO_FORM_BORDA = "#e2e8f0"
 COR_TEXTO_MUTED = "#64748b"
 # Rótulos de campos (texto neutro; vermelho só no * via .ficha-star-req)
 COR_TEXTO_LABEL = "#1e293b"
@@ -4088,18 +4090,15 @@ def aplicar_estilo():
             100% {{ background-position: 200% 50%; }}
         }}
         /* Modo claro fixo: ignora dark mode do sistema e escolha no menu do Streamlit. */
-        html, body, :root, [data-testid="stApp"], .stApp {{
-            color-scheme: light only !important;
-        }}
         .stApp,
         [data-testid="stApp"],
         [data-testid="stApp"][data-theme="dark"],
         .stApp[data-theme="dark"] {{
             --primary-color: {COR_AZUL_ESC} !important;
             --background-color: #f6f8fb !important;
-            --secondary-background-color: #ffffff !important;
+            --secondary-background-color: {COR_CAMPO_FORM_BG} !important;
             --text-color: #1f2937 !important;
-            color-scheme: light only !important;
+            color-scheme: light !important;
         }}
         :root {{
             --st-base: #f6f8fb !important;
@@ -4306,8 +4305,42 @@ def aplicar_estilo():
         div[data-testid="stTextArea"] label,
         div[data-testid="stSelectbox"] label,
         div[data-testid="stMultiSelect"] label,
+        div[data-testid="stDateInput"] label,
         div[data-testid="stCheckbox"] label {{
             color: {COR_TEXTO_LABEL} !important;
+        }}
+        /* Campos de formulário: mesma cor de fundo (texto, select e data). */
+        .stApp div[data-testid="stTextInput"] [data-baseweb="input"],
+        .stApp div[data-testid="stTextInput"] [data-baseweb="base-input"],
+        .stApp div[data-testid="stTextInput"] input,
+        .stApp div[data-testid="stTextArea"] [data-baseweb="textarea"],
+        .stApp div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+        .stApp div[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+        .stApp div[data-testid="stDateInput"] [data-baseweb="input"],
+        .stApp div[data-testid="stDateInput"] [data-baseweb="base-input"],
+        .stApp div[data-testid="stDateInput"] input {{
+            border-radius: 10px !important;
+            border: 1px solid {COR_CAMPO_FORM_BORDA} !important;
+            background-color: {COR_CAMPO_FORM_BG} !important;
+            color: {COR_TEXTO_LABEL} !important;
+            -webkit-text-fill-color: {COR_TEXTO_LABEL} !important;
+            caret-color: {COR_TEXTO_LABEL} !important;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }}
+        .stApp div[data-testid="stDateInput"] {{
+            color-scheme: light !important;
+        }}
+        .stApp div[data-testid="stDateInput"] input::placeholder {{
+            color: {COR_TEXTO_MUTED} !important;
+            -webkit-text-fill-color: {COR_TEXTO_MUTED} !important;
+            opacity: 1 !important;
+        }}
+        .stApp div[data-baseweb="input"]:focus-within,
+        .stApp div[data-baseweb="select"]:focus-within > div,
+        .stApp div[data-testid="stDateInput"] [data-baseweb="input"]:focus-within,
+        .stApp div[data-testid="stDateInput"] input:focus {{
+            border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
+            box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
         }}
         .ficha-hero-bar {{
             height: 4px;
@@ -4371,16 +4404,6 @@ def aplicar_estilo():
             margin-bottom: 0.85rem;
             padding-bottom: 0.55rem;
             border-bottom: 2px solid #e8eef5;
-        }}
-        div[data-baseweb="input"] {{
-            border-radius: 10px !important;
-            border: 1px solid #e2e8f0 !important;
-            background-color: {COR_INPUT_BG} !important;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
-        }}
-        div[data-baseweb="input"]:focus-within {{
-            border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
-            box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
         }}
         .stButton > button {{
             border-radius: 12px !important;
