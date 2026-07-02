@@ -2,8 +2,8 @@
 """
 Ficha de credenciamento — Direcional Vendas RJ (corretores).
 
-Arquivo único para deploy (ex.: Streamlit Cloud): campos, planilha Google, segurança e app.
-Dependências: streamlit, gspread, google-auth, simple_salesforce (requirements.txt).
+Arquivo único para deploy (ex.: Streamlit Cloud): campos, planilha Google, mapa RJ, segurança e app.
+Dependências: streamlit, gspread, google-auth, simple_salesforce, folium, streamlit-folium (requirements.txt).
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import smtplib
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from datetime import date, datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape_para_pdf
@@ -44,27 +45,35 @@ except ImportError:
 _SF_SDK_DISPONIVEL = Salesforce is not None
 
 
-def conectar_salesforce():
+def conectar_salesforce() -> Any:
+    sf, _ = conectar_salesforce_diagnostico()
+    return sf
+
+
+def conectar_salesforce_diagnostico() -> Tuple[Any, Optional[str]]:
+    """Conecta ao Salesforce; retorna (cliente, mensagem_de_erro)."""
     if not _SF_SDK_DISPONIVEL:
-        return None
+        return None, "Pacote simple_salesforce nao instalado (pip install simple-salesforce)."
     username = (os.environ.get("SALESFORCE_USER") or "").strip()
     password = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
     token = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
     if not username or not password:
-        return None
+        return None, "SALESFORCE_USER ou SALESFORCE_PASSWORD nao definidos."
     try:
         if token:
-            return Salesforce(
+            sf = Salesforce(
                 username=username,
                 password=password,
                 security_token=token,
                 domain="login",
             )
-        return Salesforce(username=username, password=password, domain="login")
-    except SalesforceAuthenticationFailed:
-        return None
-    except Exception:
-        return None
+        else:
+            sf = Salesforce(username=username, password=password, domain="login")
+        return sf, None
+    except SalesforceAuthenticationFailed as e:
+        return None, f"Autenticacao recusada pelo Salesforce: {e}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
@@ -360,7 +369,15 @@ UNIDADES_NEGOCIO = [
 _UNIDADE_NEGOCIO_UI_PARA_SF: Dict[str, str] = {
     "Direcional": "Direcional",
     "Riva": "Riva",
-    UNIDADE_REDE_OUTRA_IMOBILIARIA: UNIDADE_REDE_OUTRA_IMOBILIARIA,
+    # O picklist SF só aceita Direcional/Riva; parceira externa grava rede padrão + atividade Autônomo Parceiro.
+    UNIDADE_REDE_OUTRA_IMOBILIARIA: "Direcional",
+}
+
+# Rótulos do formulário Vendas RJ → valores aceitos no picklist Atividade__c (depende do Record Type).
+_ATIVIDADE_UI_PARA_SF: Dict[str, str] = {
+    "Corretor": "Corretor",
+    "Corretor Parceiro": "Autônomo Parceiro",
+    "Captador": "Captador",
 }
 
 # Atividade restrita ao fluxo Vendas RJ (picklist SF: Corretor Parceiro, Corretor, Captador).
@@ -640,6 +657,16 @@ def _campos_def() -> List[Campo]:
             help="Id do usuário proprietário (opcional).",
         ),
         _z(
+            key="regional_cadastro",
+            label="Regional de Cadastro *",
+            sec="Informações para contato",
+            tipo="select",
+            sf=None,
+            opcoes=list(REGIONAL_CADASTRO_OPTS),
+            req=True,
+            help="RJ ou MG — define a lista de gerentes de vendas disponível nesta etapa.",
+        ),
+        _z(
             key="gerente_vendas",
             label="Gerente de vendas *",
             sec="Informações para contato",
@@ -648,16 +675,6 @@ def _campos_def() -> List[Campo]:
             opcoes=["--Nenhum--"],
             req=True,
             help="Selecione o Nome da Conta (gerente de vendas) para vínculo no campo AccountId do Salesforce.",
-        ),
-        _z(
-            key="regional_cadastro",
-            label="Regional de Cadastro *",
-            sec="Dados Pessoais",
-            tipo="select",
-            sf=None,
-            opcoes=list(REGIONAL_CADASTRO_OPTS),
-            req=True,
-            help="RJ ou MG — define a lista de gerentes de vendas disponível no cadastro.",
         ),
         _z(
             key="nome_completo",
@@ -1806,6 +1823,12 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                     payload[sf] = _UNIDADE_NEGOCIO_UI_PARA_SF.get(s, s)
                 if s == "Riva":
                     extras_obs.append("Rede de atuação informada: Riva")
+                if s == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+                    extras_obs.append("Rede de atuação informada: Outra imobiliária (parceira)")
+                continue
+            if key == "atividade":
+                if s:
+                    payload[sf] = _ATIVIDADE_UI_PARA_SF.get(s, s)
                 continue
             if key == "origem":
                 # Regra de negócio: origem sempre RH.
@@ -3663,6 +3686,237 @@ _APRESENTACAO_DIRECIONAL_PLAIN = (
 # Popup pós-cadastro: mesma altura do minimapa e do iframe do YouTube (largura 100% do diálogo)
 POPUP_MAPA_ALTURA_PX = 320
 
+# --- Mapa de empreendimentos RJ (integrado; antes: empreendimentos_mapa.py) ---
+_EMPREENDIMENTOS_RJ_MAPA: list[dict[str, Any]] = [
+    {
+        "nome": "Conquista Florianópolis",
+        "bairro": "Praça Seca",
+        "endereco": "R. Florianópolis, 920 - Praça Seca, Rio de Janeiro - RJ, 21321-050",
+        "lat": -22.903392,
+        "lon": -43.349969,
+    },
+    {
+        "nome": "Conquista Itanhangá Green",
+        "bairro": "Itanhangá",
+        "endereco": "Estr. de Jacarepaguá, 2757 - Itanhangá, Rio de Janeiro - RJ, 22755-158",
+        "lat": -22.988142,
+        "lon": -43.326913,
+    },
+    {
+        "nome": "Conquista Norte Clube",
+        "bairro": "Inhaúma",
+        "endereco": "Estrada Adhemar Bebiano, 3715 - Engenho da Rainha, Rio de Janeiro - RJ, 20766-450",
+        "lat": -22.865480,
+        "lon": -43.301218,
+    },
+    {
+        "nome": "Conquista Oceânica",
+        "bairro": "Niterói",
+        "endereco": "Rod. Amaral Peixoto, 0 - Várzea das Mocas, São Gonçalo - RJ, 24753-559",
+        "lat": -22.897669,
+        "lon": -42.986709,
+    },
+    {
+        "nome": "Conquista Parque Iguaçu",
+        "bairro": "Nova Iguaçu",
+        "endereco": "Av. Abílio Augusto Távora, 3505 - Palhada, Nova Iguaçu - RJ, 26275-580",
+        "lat": -22.761136,
+        "lon": -43.459759,
+    },
+    {
+        "nome": "Direcional Conquista Max Norte",
+        "bairro": "Pavuna",
+        "endereco": "Rua Edgar Loureiro Valdetaro, 162 - Pavuna, Rio de Janeiro - RJ, 21520-760",
+        "lat": -22.812193,
+        "lon": -43.359281,
+    },
+    {
+        "nome": "Direcional Vert Alcântara",
+        "bairro": "São Gonçalo",
+        "endereco": "Estr. dos Menezes - Alcantara, São Gonçalo - RJ, 24451-230",
+        "lat": -22.821628,
+        "lon": -43.006536,
+    },
+    {
+        "nome": "Nova Caxias Fun",
+        "bairro": "Duque de Caxias",
+        "endereco": "R. Salutaris, 54 - Vila Ouro Preto, Duque de Caxias - RJ, 25065-007",
+        "lat": -22.769324,
+        "lon": -43.284303,
+    },
+    {
+        "nome": "Nova Caxias Up",
+        "bairro": "Duque de Caxias",
+        "endereco": "R. Salutaris, 54 - Vila Ouro Preto, Duque de Caxias - RJ, 25065-007",
+        "lat": -22.769524,
+        "lon": -43.284503,
+    },
+    {
+        "nome": "Reserva do Sol",
+        "bairro": "Curicica",
+        "endereco": "R. Goianinha, 280 - Curicica, Rio de Janeiro - RJ, 22780-760",
+        "lat": -22.950506,
+        "lon": -43.380910,
+    },
+    {
+        "nome": "Residencial Jerivá",
+        "bairro": "Campo Grande",
+        "endereco": "R. Projetada A, 270 - Campo Grande, Rio de Janeiro - RJ, 23040-652",
+        "lat": -22.930526,
+        "lon": -43.573234,
+    },
+    {
+        "nome": "Residencial Laranjeiras",
+        "bairro": "Laranjeiras",
+        "endereco": "R. Projetada A, 270 - Campo Grande, Rio de Janeiro - RJ, 23040-652",
+        "lat": -22.930726,
+        "lon": -43.573434,
+    },
+    {
+        "nome": "Soul Samba (Vert Soul Samba)",
+        "bairro": "Inhaúma",
+        "endereco": "Estrada Adhemar Bebiano, 2576 - Inhaúma, Rio de Janeiro - RJ, 20766-720",
+        "lat": -22.871804,
+        "lon": -43.273545,
+    },
+    {
+        "nome": "Viva Vida Realengo",
+        "bairro": "Realengo",
+        "endereco": "R. Itajaí, n° 15 - Realengo, Rio de Janeiro - RJ, 21730-200",
+        "lat": -22.862682,
+        "lon": -43.438208,
+    },
+    {
+        "nome": "Viva Vida Recanto Clube",
+        "bairro": "Guaratiba",
+        "endereco": "Rua Aloés, 300 - Guaratiba, Rio de Janeiro - RJ",
+        "lat": -22.965865,
+        "lon": -43.649976,
+    },
+    {
+        "nome": "Inn Barra Olímpica",
+        "bairro": "Barra Olímpica",
+        "endereco": "Estr. dos Bandeirantes, 2856 - Jacarepaguá, Rio de Janeiro - RJ, 22775-110",
+        "lat": -22.961105,
+        "lon": -43.393837,
+    },
+    {
+        "nome": "UNIQ Condomínio Clube",
+        "bairro": "Nova Iguaçu",
+        "endereco": "R. Elídio Madeira, 146 - Luz, Nova Iguaçu - RJ, 26260-270",
+        "lat": -22.760950,
+        "lon": -43.472950,
+    },
+]
+
+
+def _mapa_emp_popup_html(emp: dict[str, Any]) -> str:
+    nome = html.escape(emp["nome"])
+    bairro = html.escape(emp["bairro"])
+    end = html.escape(emp["endereco"])
+    return (
+        f'<div style="min-width:220px;max-width:320px;font-family:sans-serif;font-size:13px;">'
+        f"<strong>{nome}</strong><br/>"
+        f'<span style="color:#64748b;">{bairro}</span><br/><br/>'
+        f"{end}</div>"
+    )
+
+
+def _mapa_emp_agrupar_por_endereco() -> list[list[dict[str, Any]]]:
+    buckets: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for emp in _EMPREENDIMENTOS_RJ_MAPA:
+        chave = (emp.get("endereco") or "").strip()
+        if chave not in buckets:
+            buckets[chave] = []
+        buckets[chave].append(emp)
+    return list(buckets.values())
+
+
+def _mapa_emp_tooltip_grupo(grupo: list[dict[str, Any]]) -> str:
+    return " · ".join(e["nome"] for e in grupo)
+
+
+def _mapa_emp_popup_html_grupo(grupo: list[dict[str, Any]]) -> str:
+    blocos: list[str] = []
+    for emp in grupo:
+        nome = html.escape(emp["nome"])
+        bairro = html.escape(emp["bairro"])
+        blocos.append(f"<strong>{nome}</strong><br/><span style=\"color:#64748b;\">{bairro}</span>")
+    end = html.escape(grupo[0]["endereco"])
+    sep = '<hr style="margin:10px 0;border:none;border-top:1px solid #e2e8f0;"/>'
+    return (
+        f'<div style="min-width:220px;max-width:340px;font-family:sans-serif;font-size:13px;">'
+        f"{sep.join(blocos)}<br/><br/>{end}</div>"
+    )
+
+
+def _mapa_emp_criar_folium() -> Any:
+    import folium
+    from folium.plugins import Fullscreen
+
+    grupos = _mapa_emp_agrupar_por_endereco()
+    lats = [sum(e["lat"] for e in g) / len(g) for g in grupos]
+    lons = [sum(e["lon"] for e in g) / len(g) for g in grupos]
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=10,
+        tiles="OpenStreetMap",
+        control_scale=True,
+        prefer_canvas=True,
+    )
+    Fullscreen(
+        position="topright",
+        title="Tela cheia",
+        title_cancel="Sair da tela cheia",
+        force_separate_button=True,
+    ).add_to(m)
+
+    for grupo in grupos:
+        lat = sum(e["lat"] for e in grupo) / len(grupo)
+        lon = sum(e["lon"] for e in grupo) / len(grupo)
+        popup_html = _mapa_emp_popup_html(grupo[0]) if len(grupo) == 1 else _mapa_emp_popup_html_grupo(grupo)
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=10,
+            color="#04428f",
+            weight=2,
+            fill=True,
+            fill_color="#cb0935",
+            fill_opacity=0.88,
+            popup=folium.Popup(popup_html, max_width=360),
+            tooltip=folium.Tooltip(_mapa_emp_tooltip_grupo(grupo), sticky=False),
+        ).add_to(m)
+
+    m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(24, 24))
+    return m
+
+
+def _render_mapa_empreendimentos_streamlit(
+    altura_px: int = 420,
+    *,
+    streamlit_key: str = "mapa_empreendimentos_folium",
+) -> None:
+    try:
+        from streamlit_folium import st_folium
+    except ImportError:
+        st.warning(
+            "Para ver o mapa dos empreendimentos, instale: **pip install folium streamlit-folium**"
+        )
+        return
+
+    m = _mapa_emp_criar_folium()
+    st_folium(
+        m,
+        width=None,
+        height=altura_px,
+        use_container_width=True,
+        returned_objects=[],
+        key=streamlit_key,
+    )
+
 TAB_LABELS: dict[str, str] = {
     "Informações para contato": "Informações de contato",
     "Dados Pessoais": "Pessoais",
@@ -4438,14 +4692,64 @@ def _campo_api_gerente_vendas() -> str:
     return val
 
 
-def _regional_cadastro_atual() -> str:
-    """Regional de cadastro (RJ/MG) escolhida no início do formulário."""
-    try:
-        dados = _coletar_dados_formulario_completo()
+# Renderizados fora do st.form na etapa «Informações para contato» (atualizam lista de gerentes na hora).
+_CHAVES_FORA_FORM_INFO_CONTATO: Tuple[str, ...] = (
+    "unidade_negocio",
+    "regional_cadastro",
+    "gerente_vendas",
+)
+
+
+def opcoes_gerente_vendas_por_regional(
+    regional: str,
+    *,
+    opcoes_rj: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Lista de gerentes conforme regional (função pura — usada no formulário e nos testes).
+    MG: lista fixa Riva MG. RJ: `opcoes_rj` ou fallback fixo no código.
+    """
+    base = ["--Nenhum--"]
+    reg = str(regional or "RJ").strip().upper()
+    if reg == "MG":
+        return base + list(GERENTE_VENDAS_MG_OPCOES)
+    fonte = opcoes_rj if opcoes_rj is not None else list(GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS)
+    return base + [x for x in fonte if x and x != "--Nenhum--"]
+
+
+def _regional_cadastro_atual(*, dados: Optional[Dict[str, Any]] = None) -> str:
+    """Regional de cadastro (RJ/MG) — prioriza dados explícitos, depois session_state/snapshot."""
+    if dados is not None:
         reg = str(dados.get("regional_cadastro") or "").strip().upper()
+        if reg in REGIONAL_CADASTRO_OPTS:
+            return reg
+
+    try:
+        sk = "fld_regional_cadastro"
+        if sk in st.session_state:
+            reg = str(st.session_state[sk] or "").strip().upper()
+            if reg in REGIONAL_CADASTRO_OPTS:
+                return reg
+        snap = dict(st.session_state.get("ficha_snap_campos") or {})
+        reg = str(snap.get("regional_cadastro") or "").strip().upper()
+        if reg in REGIONAL_CADASTRO_OPTS:
+            return reg
+        dados_ss = _coletar_dados_formulario_completo()
+        reg = str(dados_ss.get("regional_cadastro") or "").strip().upper()
+        if reg in REGIONAL_CADASTRO_OPTS:
+            return reg
     except Exception:
-        reg = str(st.session_state.get("fld_regional_cadastro") or "RJ").strip().upper()
-    return reg if reg in REGIONAL_CADASTRO_OPTS else "RJ"
+        pass
+    return "RJ"
+
+
+def _regional_cadastro_enviada_rj() -> bool:
+    """True se a ficha enviada (ou em preenchimento) tiver Regional de Cadastro = RJ."""
+    ss = st.session_state
+    dados = ss.get("ficha_dados_enviados")
+    if isinstance(dados, dict):
+        return _regional_cadastro_atual(dados=dados) == "RJ"
+    return _regional_cadastro_atual() == "RJ"
 
 
 def _opcoes_gerente_vendas_rj() -> list[str]:
@@ -4475,15 +4779,13 @@ def _opcoes_gerente_vendas_rj() -> list[str]:
     return [x for x in GERENTE_VENDAS_NOME_CONTA_OPCOES_FIXAS if x and x != "--Nenhum--"]
 
 
-def _opcoes_gerente_vendas() -> list[str]:
-    """
-    Opções do select «Gerente de vendas» conforme Regional de Cadastro.
-    MG: lista fixa Riva MG. RJ: aba Gerentes / lista fixa RJ.
-    """
-    base = ["--Nenhum--"]
-    if _regional_cadastro_atual() == "MG":
-        return base + list(GERENTE_VENDAS_MG_OPCOES)
-    return base + _opcoes_gerente_vendas_rj()
+def _opcoes_gerente_vendas(*, regional: Optional[str] = None) -> list[str]:
+    """Opções do select «Gerente de vendas» conforme Regional de Cadastro."""
+    reg = (regional or _regional_cadastro_atual()).strip().upper()
+    if reg == "MG":
+        return opcoes_gerente_vendas_por_regional("MG")
+    rj = _opcoes_gerente_vendas_rj()
+    return opcoes_gerente_vendas_por_regional("RJ", opcoes_rj=rj)
 
 
 def _label_obrigatorio_partes(label: str) -> tuple[str, bool]:
@@ -4511,9 +4813,18 @@ def _coerce_date_widget_value(val: Any) -> Optional[date]:
         return None
 
 
+def excluir_contato_salesforce(sf: Any, contact_id: str) -> None:
+    """Remove contato de teste no Salesforce."""
+    cid = str(contact_id or "").strip()
+    if not cid:
+        return
+    sf.Contact.delete(cid)
+
+
 def _limpar_gerente_ao_mudar_regional() -> None:
     """Se a regional de cadastro mudar, zera gerente fora da nova lista."""
-    opts = _opcoes_gerente_vendas()
+    reg = str(st.session_state.get("fld_regional_cadastro") or "RJ").strip().upper()
+    opts = _opcoes_gerente_vendas(regional=reg)
     sk = "fld_gerente_vendas"
     cur = st.session_state.get(sk)
     if cur is not None and cur not in opts:
@@ -4593,7 +4904,8 @@ def _widget_campo(c: dict):
         if k == "atividade":
             opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
         if k == "gerente_vendas":
-            opts = _opcoes_gerente_vendas()
+            reg = str(st.session_state.get("fld_regional_cadastro") or "RJ").strip().upper()
+            opts = _opcoes_gerente_vendas(regional=reg)
         if k == "regional_cadastro":
             opts = list(REGIONAL_CADASTRO_OPTS)
             cur = st.session_state.get(sk)
@@ -4709,8 +5021,11 @@ def _snapshot_persistir_secao_atual(sec: str) -> None:
         if sk in ss:
             snap[k] = ss[sk]
     # Renderizados fora do st.form: garantir cópia explícita no «Avançar» (mesmo critério do loop).
-    if sec == "Informações para contato" and "fld_unidade_negocio" in ss:
-        snap["unidade_negocio"] = ss["fld_unidade_negocio"]
+    if sec == "Informações para contato":
+        for k_extra in _CHAVES_FORA_FORM_INFO_CONTATO:
+            sk = f"fld_{k_extra}"
+            if sk in ss:
+                snap[k_extra] = ss[sk]
     if sec == "CRECI/TTI" and "fld_possui_creci" in ss:
         snap["possui_creci"] = ss["fld_possui_creci"]
     ss["ficha_snap_campos"] = snap
@@ -4731,8 +5046,10 @@ def _garantir_campos_secao_de_snapshot(sec: str) -> None:
             else:
                 ss[sk] = snap[k]
     if sec == "Informações para contato":
-        if "fld_unidade_negocio" not in ss and "unidade_negocio" in snap:
-            ss["fld_unidade_negocio"] = snap["unidade_negocio"]
+        for k_extra in _CHAVES_FORA_FORM_INFO_CONTATO:
+            sk = f"fld_{k_extra}"
+            if sk not in ss and k_extra in snap:
+                ss[sk] = snap[k_extra]
 
 
 def _ficha_defaults_de_secrets() -> dict[str, Any]:
@@ -5424,20 +5741,20 @@ def _render_secao_formulario(secoes: list[str]) -> None:
                 if c["key"] != "possui_creci"
             ]
         elif sec == "Informações para contato":
-            c_un = next((c for c in CAMPOS if c["key"] == "unidade_negocio"), None)
-            if c_un:
-                _widget_campo(c_un)
+            for _k in _CHAVES_FORA_FORM_INFO_CONTATO:
+                c0 = next((x for x in CAMPOS if x["key"] == _k), None)
+                if c0:
+                    _widget_campo(c0)
             dados_sec = _coletar_dados_formulario_completo()
             cols = [
                 c
                 for c in campos_por_secao_visiveis(sec, dados_sec)
-                if c["key"] != "unidade_negocio"
+                if c["key"] not in _CHAVES_FORA_FORM_INFO_CONTATO
             ]
         elif sec == "Dados Pessoais":
             # Mesma razão do CRECI/rede: estado civil fora do form para o select atualizar o state
             # antes do submit; nome e nascimento ficam fora só para manter a ordem visual (nome → nasc. → estado).
             _chaves_fora_form_dados_pessoais = (
-                "regional_cadastro",
                 "nome_completo",
                 "birthdate",
                 "estado_civil",
@@ -6036,7 +6353,7 @@ def gerar_workbook_ficha_cadastro_bytes(dados: Dict[str, Any]) -> bytes:
 
 
 def _render_recursos_pos_cadastro() -> None:
-    """Mapa, vídeo do simulador e links após popup de boas-vindas."""
+    """Mapa, vídeo do simulador e links após popup de boas-vindas (somente RJ)."""
     ss = st.session_state
     if ss.get("ficha_modo_teste_design"):
         st.info(
@@ -6047,9 +6364,7 @@ def _render_recursos_pos_cadastro() -> None:
         "Minimapa: **+** / **−** para zoom, arraste para mover e **tela cheia** no canto superior direito."
     )
     try:
-        from empreendimentos_mapa import render_mapa_empreendimentos_streamlit
-
-        render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
+        _render_mapa_empreendimentos_streamlit(altura_px=POPUP_MAPA_ALTURA_PX)
     except Exception:
         st.caption("Mapa indisponível no momento.")
     st.markdown("##### Como usar o simulador")
@@ -6093,6 +6408,30 @@ def _render_recursos_pos_cadastro() -> None:
 
     st.markdown("")
     if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_pos_cadastro_fechar"):
+        _finalizar_popup_e_novo_cadastro()
+        st.rerun()
+
+
+@st.dialog("Cadastro concluído", width="medium")
+def _dialog_sucesso_regional_mg() -> None:
+    """Popup de conclusão para cadastro MG (sem mapa nem vídeos RJ)."""
+    ss = st.session_state
+    modo_design = bool(ss.get("ficha_modo_teste_design"))
+    if modo_design:
+        _render_status_final_tela(
+            sucesso=True,
+            mensagem="(Modo teste) Pré-visualização — cadastro MG concluído (sem mapa/vídeos RJ).",
+        )
+    else:
+        _render_status_final_tela(sucesso=True, mensagem=FICHA_MSG_SUCESSO_PERFIL)
+        st.markdown(
+            """
+**Recebemos o seu cadastro com sucesso.** Você deve receber **automaticamente** no e-mail informado
+a confirmação e, quando possível, o **PDF da ficha** em anexo.
+            """.strip()
+        )
+    st.markdown("")
+    if st.button("Finalizar", type="primary", use_container_width=True, key="ficha_pos_cadastro_mg_fechar"):
         _finalizar_popup_e_novo_cadastro()
         st.rerun()
 
@@ -6168,10 +6507,13 @@ def main():
         _render_sidebar_teste_planilha_sf()
 
     if ss.get("ficha_sucesso"):
-        if not ss.get("ficha_boas_vindas_popup_concluido"):
-            _dialog_recursos_pos_cadastro()
+        if _regional_cadastro_enviada_rj():
+            if not ss.get("ficha_boas_vindas_popup_concluido"):
+                _dialog_recursos_pos_cadastro()
+            else:
+                _dialog_recursos_pos_boas_vindas()
         else:
-            _dialog_recursos_pos_boas_vindas()
+            _dialog_sucesso_regional_mg()
         _cabecalho_pagina()
         st.markdown(
             '<div class="footer">Direcional Engenharia · Vendas Rio de Janeiro<br/>developed by lucas maia</div>',
@@ -6187,9 +6529,9 @@ def main():
             expanded=_design_teste_expander_aberto(),
         ):
             st.markdown(
-                "Simula o **cadastro concluído**: abre o **popup** de boas-vindas (vídeo do RH); após **Avançar**, "
-                "abre um segundo **popup** com mapa, vídeo do simulador e links úteis. Não grava na planilha nem no "
-                "Salesforce. PDF e e-mail usam **dados fictícios**."
+                "Simula o **cadastro concluído**: com **Regional RJ**, abre popups de boas-vindas (vídeo do RH), "
+                "mapa, vídeo do simulador e links úteis. Com **Regional MG**, só a tela de sucesso. "
+                "Não grava na planilha nem no Salesforce."
             )
             st.caption(
                 "Ative este bloco com a variável de ambiente **FICHA_DESIGN_TEST=1** "
