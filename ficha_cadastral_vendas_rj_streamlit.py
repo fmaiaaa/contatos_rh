@@ -314,6 +314,10 @@ def record_type_id_contato_payload() -> str:
 
 # Ordem de navegação no Streamlit (não altera mapeamento de campos para Salesforce)
 REGIONAL_CADASTRO_OPTS: Tuple[str, ...] = ("RJ", "MG")
+# Limites conservadores de campos texto no Contact (evita STRING_TOO_LONG).
+SF_TEXTO_CURTO_MAX = 255
+SF_OBSERVACOES_MAX = 32000
+DEFAULT_ESCOLARIDADE_SF = "Ensino Médio"
 
 SEC_ORDER: Tuple[str, ...] = (
     "Dados Pessoais",
@@ -741,7 +745,7 @@ def _campos_def() -> List[Campo]:
             tipo="text",
             sf="Apelido__c",
             req=False,
-            help="Preenchido automaticamente: primeiro nome + _RJ01",
+            help="Preenchido automaticamente: primeiro nome + _RJ01 ou _MG01 conforme regional.",
         ),
         _z(
             key="status_corretor",
@@ -1383,6 +1387,134 @@ def _norm_picklist(val: Any) -> str:
     return s
 
 
+def _truncar_texto_sf(val: Any, max_len: int) -> str:
+    s = str(val or "")
+    if len(s) <= max_len:
+        return s
+    if max_len <= 3:
+        return s[:max_len]
+    return s[: max_len - 3] + "..."
+
+
+def _suffix_regional_apelido(dados: Optional[Dict[str, Any]] = None) -> str:
+    """Sufixo do Apelido__c conforme regional (RJ ou MG)."""
+    return "MG" if _regional_eh_mg(dados) else "RJ"
+
+
+def _regional_eh_mg(dados: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    True quando o cadastro é MG: regional explícita ou gerente da lista/fixos MG
+    (ex.: «RIVA VENDAS MG - EQUIPE …» na aba Gerentes).
+    """
+    reg = _regional_cadastro_atual(dados=dados if isinstance(dados, dict) else None)
+    if reg == "MG":
+        return True
+
+    gerente = ""
+    if isinstance(dados, dict):
+        gerente = str(dados.get("gerente_vendas") or "").strip()
+    if not gerente:
+        try:
+            gerente = str(st.session_state.get("fld_gerente_vendas") or "").strip()
+        except Exception:
+            gerente = ""
+
+    if gerente in GERENTE_VENDAS_MG_OPCOES:
+        return True
+    gu = gerente.upper()
+    if gu.startswith("RIVA MG") or "VENDAS MG" in gu or " MG -" in gu or gu.endswith(" MG"):
+        return True
+    return False
+
+
+def _truncar_payload_salesforce(payload: Dict[str, Any]) -> None:
+    """Corta textos longos antes do insert (logradouro, observações, etc.)."""
+    for k, v in list(payload.items()):
+        if not isinstance(v, str):
+            continue
+        lim = SF_OBSERVACOES_MAX if k == "Observacoes__c" else SF_TEXTO_CURTO_MAX
+        payload[k] = _truncar_texto_sf(v, lim)
+
+
+def _aplicar_defaults_payload_obrigatorios_sf(payload: Dict[str, Any]) -> None:
+    """Preenche picklists que o org costuma exigir quando vieram vazios ou «--Nenhum--»."""
+    if not str(payload.get("Escolaridade__c") or "").strip():
+        payload["Escolaridade__c"] = DEFAULT_ESCOLARIDADE_SF
+    pcm = str(payload.get("Preferred_Contact_Method__c") or "").strip()
+    if not pcm:
+        if payload.get("MobilePhone"):
+            payload["Preferred_Contact_Method__c"] = "Celular"
+        elif payload.get("Email"):
+            payload["Preferred_Contact_Method__c"] = "Email de trabalho"
+
+
+def _buscar_contact_id_existente(sf: Any, payload: Dict[str, Any]) -> Optional[str]:
+    """Evita duplicar contato na retentativa quando o 1º insert já gravou no SF."""
+    cpf = re.sub(r"\D", "", str(payload.get("CPF__c") or ""))
+    email = str(payload.get("Email") or "").strip().lower()
+    try:
+        if cpf:
+            q = (
+                "SELECT Id FROM Contact "
+                f"WHERE CPF__c = '{_soql_escape(cpf)}' "
+                "ORDER BY CreatedDate DESC LIMIT 1"
+            )
+            recs = (sf.query(q) or {}).get("records") or []
+            if recs:
+                return str(recs[0].get("Id") or "").strip() or None
+        if email:
+            q = (
+                "SELECT Id FROM Contact "
+                f"WHERE Email = '{_soql_escape(email)}' "
+                "ORDER BY CreatedDate DESC LIMIT 1"
+            )
+            recs = (sf.query(q) or {}).get("records") or []
+            if recs:
+                return str(recs[0].get("Id") or "").strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def _preparar_payload_insert_salesforce(
+    payload: Dict[str, Any],
+    dados: Dict[str, Any],
+    sf: Any,
+    avisos: List[str],
+) -> Dict[str, Any]:
+    """Enriquecimento final + defaults + truncamento (ordem única para produção e testes)."""
+    out = dict(payload)
+    _aplicar_enriquecimentos_payload_sf(out, dados, sf, avisos)
+    _aplicar_defaults_payload_obrigatorios_sf(out)
+    _truncar_payload_salesforce(out)
+    return out
+
+
+def criar_contato_salesforce_preparado(
+    sf: Any,
+    payload: Dict[str, Any],
+    dados: Dict[str, Any],
+    avisos: List[str],
+    *,
+    reutilizar_existente: bool = False,
+) -> tuple[Any, Any, Dict[str, Any]]:
+    """
+    Monta payload final e cria contato (ou reutiliza por CPF/e-mail na retentativa).
+    """
+    payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    if reutilizar_existente:
+        cid_exist = _buscar_contact_id_existente(sf, payload_final)
+        if cid_exist:
+            avisos.append(
+                "Contato já existia no Salesforce (CPF ou e-mail); planilha atualizada com o vínculo."
+            )
+            return cid_exist, None, payload_final
+    cid, err, payload_usado = criar_contato_payload_com_fallback_naturalidade(
+        sf, payload_final, avisos
+    )
+    return cid, err, payload_usado
+
+
 def _atividade_sf_norm(dados: Optional[Dict[str, Any]]) -> str:
     if not dados:
         return ""
@@ -1622,28 +1754,31 @@ def _resolver_account_id_por_nome(sf: Any, nome_conta: str) -> Optional[str]:
     return None
 
 
-def _proximo_apelido_disponivel(sf: Any, primeiro_nome: str) -> Optional[str]:
+def _proximo_apelido_disponivel(
+    sf: Any, primeiro_nome: str, suffix: str = "RJ"
+) -> Optional[str]:
     """
-    Gera apelido incremental: <primeiro>_RJ01, _RJ02, ... com base nos contatos existentes.
+    Gera apelido incremental: <primeiro>_<SUFIXO>01, _02, ... com base nos contatos existentes.
+    SUFIXO = RJ ou MG conforme regional de cadastro.
     """
     base = (primeiro_nome or "").strip()
     if not base:
         return None
+    suf = (suffix or "RJ").strip().upper() or "RJ"
     base_sf = _soql_escape(base)
     try:
         q = (
             "SELECT Apelido__c FROM Contact "
-            f"WHERE Apelido__c LIKE '{base_sf}_RJ%' "
+            f"WHERE Apelido__c LIKE '{base_sf}_{suf}%' "
             "ORDER BY LastModifiedDate DESC LIMIT 200"
         )
         res = sf.query(q)
         recs = (res or {}).get("records") or []
     except Exception:
-        # Fallback seguro se a consulta falhar por qualquer motivo.
-        return f"{base}_RJ01"
+        return f"{base}_{suf}01"
 
     max_n = 0
-    pat = re.compile(rf"^{re.escape(base)}_RJ(\d+)$", re.IGNORECASE)
+    pat = re.compile(rf"^{re.escape(base)}_{re.escape(suf)}(\d+)$", re.IGNORECASE)
     for r in recs:
         a = str((r or {}).get("Apelido__c") or "").strip()
         m = pat.match(a)
@@ -1656,7 +1791,7 @@ def _proximo_apelido_disponivel(sf: Any, primeiro_nome: str) -> Optional[str]:
         if n > max_n:
             max_n = n
     prox = max_n + 1
-    return f"{base}_RJ{prox:02d}"
+    return f"{base}_{suf}{prox:02d}"
 
 
 def _salesforce_possui_creci_field_name() -> str:
@@ -1769,7 +1904,7 @@ def _aplicar_enriquecimentos_payload_sf(
                 avisos.append(f"Nome da conta não localizado no Salesforce: {nconta}")
 
     primeiro = (payload.get("FirstName") or "").strip()
-    apel = _proximo_apelido_disponivel(sf, primeiro)
+    apel = _proximo_apelido_disponivel(sf, primeiro, _suffix_regional_apelido(dados))
     if apel:
         payload["Apelido__c"] = apel
 
@@ -1985,7 +2120,8 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     nc = (out.get("nome_completo") or "").strip().upper()
     out["nome_completo"] = nc
     primeiro = nc.split(None, 1)[0] if nc else ""
-    out["apelido"] = f"{primeiro}_RJ01" if primeiro else ""
+    suf = _suffix_regional_apelido(out)
+    out["apelido"] = f"{primeiro}_{suf}01" if primeiro else ""
     hoje = date.today().strftime("%d/%m/%Y")
     out["data_entrevista"] = hoje
     out["data_contrato"] = hoje
@@ -2292,8 +2428,9 @@ def _executar_teste_criar_sf_de_linha_planilha(
                 pass
         return False, "Falha ao conectar ao Salesforce (credenciais ou rede)."
 
-    _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
-    cid, err = criar_contato_payload(sf, payload)
+    cid, err, payload = criar_contato_salesforce_preparado(
+        sf, payload, dados, avisos, reutilizar_existente=False
+    )
     link = _url_contact(cid) if cid else ""
     msg_erro = _mensagem_erro_sf_amigavel(_explicacao_erro_record_type_se_aplicavel(err) if err else err)
 
@@ -4879,12 +5016,14 @@ def _regional_cadastro_atual(*, dados: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _regional_cadastro_enviada_rj() -> bool:
-    """True se a ficha enviada (ou em preenchimento) tiver Regional de Cadastro = RJ."""
+    """True se deve exibir mapa/vídeo/simulador RJ (não exibir para cadastro MG)."""
     ss = st.session_state
     dados = ss.get("ficha_dados_enviados")
-    if isinstance(dados, dict):
-        return _regional_cadastro_atual(dados=dados) == "RJ"
-    return _regional_cadastro_atual() == "RJ"
+    if isinstance(dados, dict) and _regional_eh_mg(dados):
+        return False
+    if _regional_eh_mg(None):
+        return False
+    return True
 
 
 def _opcoes_gerente_vendas_rj() -> list[str]:
@@ -5238,10 +5377,11 @@ def _enriquecer_mobile_phone(payload: dict[str, Any], dados: dict[str, Any]) -> 
     avisos: list[str] = []
     if payload.get("MobilePhone"):
         return avisos
-    m = _somente_digitos(str(dados.get("mobile") or ""))
-    if len(m) >= 10:
-        payload["MobilePhone"] = m[:11]
-        return avisos
+    for origem in ("mobile", "phone"):
+        m = _somente_digitos(str(dados.get(origem) or ""))
+        if len(m) >= 10:
+            payload["MobilePhone"] = m[:11]
+            return avisos
     tipo = (dados.get("tipo_pix") or "").strip()
     dp = str(dados.get("dados_pix") or "")
     if tipo in ("Telefone", "Celular"):
@@ -6094,6 +6234,14 @@ def _dados_ficha_demo_design() -> dict[str, Any]:
     demo["cpf"] = "123.456.789-09"
     demo["email"] = "maria.silva.demo@exemplo.com.br"
     demo["mobile"] = "(21) 99999-0000"
+    try:
+        reg_demo = str(st.session_state.get("fld_regional_cadastro") or "RJ").strip().upper()
+        if reg_demo in REGIONAL_CADASTRO_OPTS:
+            demo["regional_cadastro"] = reg_demo
+            if reg_demo == "MG" and GERENTE_VENDAS_MG_OPCOES:
+                demo["gerente_vendas"] = GERENTE_VENDAS_MG_OPCOES[0]
+    except Exception:
+        pass
     return enriquecer_derivados_vendas_rj(demo)
 
 
@@ -6167,6 +6315,19 @@ def _gravar_cadastro_planilha(
 
 def _processar_envio_cadastro() -> None:
     """Tenta Salesforce e grava sempre na planilha Google (sucesso ou falha)."""
+    ss = st.session_state
+    if ss.get("ficha_envio_em_andamento"):
+        _registrar_debug_envio("envio_duplicado_ignorado", "Clique duplo ou reenvio simultâneo.")
+        return
+    ss["ficha_envio_em_andamento"] = True
+    try:
+        _processar_envio_cadastro_impl()
+    finally:
+        ss.pop("ficha_envio_em_andamento", None)
+
+
+def _processar_envio_cadastro_impl() -> None:
+    """Corpo do envio (separado para lock anti-duplo clique)."""
     ss = st.session_state
     ss["ficha_debug_envio"] = []
     _registrar_debug_envio("início_envio", "Fluxo principal iniciado.")
@@ -6253,14 +6414,8 @@ def _processar_envio_cadastro() -> None:
             _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
             msg_amigavel = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
         else:
-            _aplicar_enriquecimentos_payload_sf(payload, dados, sf, avisos)
-            payload_utilizado = dict(payload)
-            _registrar_debug_envio(
-                "payload_sf_enriquecido",
-                json.dumps(payload, ensure_ascii=False, default=str)[:7000],
-            )
-            cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(
-                sf, payload, avisos
+            cid, err, payload_utilizado = criar_contato_salesforce_preparado(
+                sf, payload, dados, avisos, reutilizar_existente=False
             )
             if cid:
                 _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
@@ -6268,6 +6423,11 @@ def _processar_envio_cadastro() -> None:
                 err_full = _explicacao_erro_record_type_se_aplicavel(err)
                 _registrar_debug_envio("sf_create_erro", err_full)
                 msg_amigavel = _mensagem_erro_sf_amigavel(err_full or err)
+        if payload_utilizado:
+            _registrar_debug_envio(
+                "payload_sf_enriquecido",
+                json.dumps(payload_utilizado, ensure_ascii=False, default=str)[:7000],
+            )
 
     if cid:
         row_num = _gravar_cadastro_planilha(
@@ -6399,8 +6559,9 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss["sf_avisos"] = avisos
         return
 
-    _aplicar_enriquecimentos_payload_sf(payload, dados_c, sf, avisos)
-    cid, err, payload_utilizado = criar_contato_payload_com_fallback_naturalidade(sf, payload, avisos)
+    cid, err, payload_utilizado = criar_contato_salesforce_preparado(
+        sf, payload, dados_c, avisos, reutilizar_existente=True
+    )
 
     if cid:
         atualizar_status_envio_salesforce(
