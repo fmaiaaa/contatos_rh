@@ -1515,6 +1515,49 @@ def criar_contato_salesforce_preparado(
     return cid, err, payload_usado
 
 
+def validar_payload_minimo_salesforce(payload: Dict[str, Any]) -> List[str]:
+    """Checagens pós-preparação (antes do insert) — usado nos 100 testes de robustez."""
+    erros: List[str] = []
+    if not str(payload.get("FirstName") or "").strip():
+        erros.append("FirstName ausente")
+    if not str(payload.get("LastName") or "").strip():
+        erros.append("LastName ausente")
+    if not str(payload.get("Email") or "").strip():
+        erros.append("Email ausente")
+    if not str(payload.get("MobilePhone") or "").strip():
+        erros.append("MobilePhone ausente")
+    if not str(payload.get("Escolaridade__c") or "").strip():
+        erros.append("Escolaridade__c ausente")
+    pcm = str(payload.get("Preferred_Contact_Method__c") or "").strip()
+    if not pcm:
+        erros.append("Preferred_Contact_Method__c ausente")
+    for k, v in payload.items():
+        if isinstance(v, str) and k != "Observacoes__c" and len(v) > SF_TEXTO_CURTO_MAX:
+            erros.append(f"{k} excede {SF_TEXTO_CURTO_MAX} chars")
+    obs = payload.get("Observacoes__c")
+    if isinstance(obs, str) and len(obs) > SF_OBSERVACOES_MAX:
+        erros.append("Observacoes__c excede limite")
+    return erros
+
+
+def preparar_contato_para_insert(
+    dados: Dict[str, Any], sf: Any
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[str], List[str]]:
+    """
+    Valida formulário, monta e prepara payload SF.
+    Retorna (payload_final, dados, avisos, erros_validacao).
+    """
+    erros = validar_obrigatorios(dados)
+    if erros:
+        return {}, dados, [], erros
+    payload, avisos = montar_payload_salesforce(dados)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados))
+    payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    erros_payload = validar_payload_minimo_salesforce(payload_final)
+    return payload_final, dados, avisos, erros_payload
+
+
 def _atividade_sf_norm(dados: Optional[Dict[str, Any]]) -> str:
     if not dados:
         return ""
@@ -1616,6 +1659,22 @@ def _limpa_id(sf_field: str, val: Any) -> Optional[str]:
     return None
 
 
+def _digitos_telefone_ok(val: Any, minimo: int = 10) -> bool:
+    return len(re.sub(r"\D", "", str(val or ""))) >= minimo
+
+
+def _celular_resolvivel(dados: Dict[str, Any]) -> bool:
+    """Celular pode vir do campo mobile, phone ou PIX tipo Telefone/Celular."""
+    if _digitos_telefone_ok(dados.get("mobile")):
+        return True
+    if _digitos_telefone_ok(dados.get("phone")):
+        return True
+    tipo = (str(dados.get("tipo_pix") or "")).strip()
+    if tipo in ("Telefone", "Celular") and _digitos_telefone_ok(dados.get("dados_pix")):
+        return True
+    return False
+
+
 def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
     erros: List[str] = []
     for c in CAMPOS:
@@ -1635,6 +1694,10 @@ def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
             continue
         if c["tipo"] == "select":
             if not _norm_picklist(v):
+                erros.append(c["label"])
+            continue
+        if k == "mobile":
+            if not _celular_resolvivel(dados):
                 erros.append(c["label"])
             continue
         if v is None or (isinstance(v, str) and not str(v).strip()):
@@ -1688,6 +1751,10 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
             continue
         if c["tipo"] == "select":
             if not _norm_picklist(v):
+                erros.append(c["label"])
+            continue
+        if k == "mobile":
+            if not _celular_resolvivel(dados):
                 erros.append(c["label"])
             continue
         if v is None or (isinstance(v, str) and not str(v).strip()):
