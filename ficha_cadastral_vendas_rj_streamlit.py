@@ -317,6 +317,8 @@ REGIONAL_CADASTRO_OPTS: Tuple[str, ...] = ("RJ", "MG")
 # Limites conservadores de campos texto no Contact (evita STRING_TOO_LONG).
 SF_TEXTO_CURTO_MAX = 255
 SF_OBSERVACOES_MAX = 32000
+SF_CONTA_BANCARIA_MAX = 20
+SF_AGENCIA_BANCARIA_MAX = 4
 DEFAULT_ESCOLARIDADE_SF = "Ensino Médio"
 
 SEC_ORDER: Tuple[str, ...] = (
@@ -1433,6 +1435,10 @@ def _truncar_payload_salesforce(payload: Dict[str, Any]) -> None:
         if not isinstance(v, str):
             continue
         lim = SF_OBSERVACOES_MAX if k == "Observacoes__c" else SF_TEXTO_CURTO_MAX
+        if k == "Conta_Banc_ria__c":
+            lim = SF_CONTA_BANCARIA_MAX
+        if k == "Ag_ncia_Banc_ria__c":
+            lim = SF_AGENCIA_BANCARIA_MAX
         payload[k] = _truncar_texto_sf(v, lim)
 
 
@@ -1593,11 +1599,21 @@ def parse_data_br(val: Any) -> Optional[str]:
     s = str(val).strip()
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d"):
+    for fmt in (
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+    ):
         try:
-            return datetime.strptime(s, fmt).date().isoformat()
+            return datetime.strptime(s[:26].strip(), fmt).date().isoformat()
         except ValueError:
             continue
+    # Excel às vezes grava "1998-12-03 00:00:00" — tenta só a parte da data
+    if " " in s:
+        return parse_data_br(s.split(" ", 1)[0])
     return None
 
 
@@ -2297,6 +2313,352 @@ def _strip_valor_celula_planilha(val: Any) -> str:
     return s.strip()
 
 
+def _celula_parece_link_salesforce(val: Any) -> bool:
+    s = (str(val).strip() if val is not None else "").lower()
+    return "force.com" in s or s.startswith("http")
+
+
+def _celula_parece_data(val: Any) -> bool:
+    if isinstance(val, (date, datetime)):
+        return True
+    s = (str(val).strip() if val is not None else "")
+    if not s:
+        return False
+    return bool(
+        re.match(r"^\d{4}-\d{2}-\d{2}", s)
+        or re.match(r"^\d{1,2}/\d{1,2}/\d{4}", s)
+        or re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:", s)
+    )
+
+
+_ESTADOS_CIVIS_PLANILHA = frozenset(
+    {"solteiro", "casado", "divorciado", "viúvo", "viuvo", "união estável", "uniao estavel"}
+)
+
+
+def _score_qualidade_dados_planilha(dados: Dict[str, Any]) -> int:
+    """Pontuação heurística — linha bem alinhada costuma atingir ≥ 7."""
+    score = 0
+    nome = (dados.get("nome_completo") or "").strip()
+    nome_low = nome.casefold()
+    if _celula_parece_link_salesforce(nome):
+        score -= 5
+    if (
+        len(nome) > 5
+        and not _celula_parece_data(nome)
+        and nome_low not in _ESTADOS_CIVIS_PLANILHA
+        and "@" not in nome
+        and "force.com" not in nome_low
+    ):
+        score += 2
+    em = (dados.get("email") or "").strip()
+    if "@" in em and "." in em.split("@")[-1] and (
+        "direcionalvendas" in em.lower() or "rivavendas" in em.lower()
+    ):
+        score += 3
+    elif "@" in em and "." in em.split("@")[-1]:
+        score += 2
+    cpf_d = re.sub(r"\D", "", str(dados.get("cpf") or ""))
+    if len(cpf_d) == 11:
+        score += 3
+    elif cpf_d and len(cpf_d) != 11:
+        score -= 2
+    ger = (dados.get("gerente_vendas") or "").strip()
+    if ger and not re.search(r"_(RJ|MG)\d+$", ger, re.I) and len(ger) > 8:
+        score += 1
+    mob = re.sub(r"\D", "", str(dados.get("mobile") or ""))
+    if len(mob) >= 10:
+        score += 1
+    return score
+
+
+def _detectar_deslocamento_linha_planilha(headers: List[str], cells: List[str]) -> int:
+    """
+    Corrige linhas exportadas sem «Data e hora do envio» e/ou «Link» (deslocamento à esquerda).
+    Testa deslocamentos 0, 1 e 2 colunas e escolhe o de maior score de qualidade.
+    """
+    base = list(cells)
+    if len(base) < len(headers):
+        base += [""] * (len(headers) - len(base))
+    best_shift, best_score = 0, -999
+    for shift in (0, 1, 2, 3):
+        padded = [""] * shift + base
+        if len(padded) < len(headers):
+            padded += [""] * (len(headers) - len(padded))
+        dados = _dados_dict_de_linha_planilha_bruto(headers, padded)
+        sc = _score_qualidade_dados_planilha(dados)
+        if sc > best_score:
+            best_score, best_shift = sc, shift
+    return best_shift
+
+
+def _realinhar_celulas_planilha(headers: List[str], cells: List[str]) -> Tuple[List[str], int]:
+    shift = _detectar_deslocamento_linha_planilha(headers, cells)
+    base = list(cells)
+    if len(base) < len(headers):
+        base += [""] * (len(headers) - len(base))
+    if shift:
+        base = [""] * shift + base
+    if len(base) < len(headers):
+        base += [""] * (len(headers) - len(base))
+    return base[: len(headers)], shift
+
+
+def _sanear_dados_planilha_import(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Corrige linhas importadas da planilha: defaults de CRECI, datas Excel,
+    gerente/apelido trocado e bloco «Informações para contato» deslocado.
+    """
+    out = dict(dados)
+
+    if not str(out.get("possui_creci") or "").strip():
+        out["possui_creci"] = "Não"
+
+    iso_bd = parse_data_br(out.get("birthdate"))
+    if iso_bd:
+        out["birthdate"] = iso_bd
+
+    cpf_d = re.sub(r"\D", "", str(out.get("cpf") or ""))
+    if cpf_d:
+        out["cpf"] = cpf_d
+
+    rc = _norm_picklist(out.get("regional_cadastro"))
+    if rc not in REGIONAL_CADASTRO_OPTS:
+        out["regional_cadastro"] = "RJ"
+
+    ger = str(out.get("gerente_vendas") or "").strip()
+    if (
+        not ger
+        or re.search(r"_(RJ|MG)\d+$", ger, re.I)
+        or len(ger) < 12
+        or "EQUIPE" not in ger.upper()
+    ):
+        out["gerente_vendas"] = _nome_conta_rh_padrao()
+
+    # Recuperação quando colunas do bloco «Informações» ficaram rotacionadas na exportação
+    sexo = _norm_picklist(out.get("sexo"))
+    if sexo in _UNIDADE_NEGOCIO_UI_PARA_SF or sexo in ("Direcional", "Riva"):
+        if not _norm_picklist(out.get("unidade_negocio")):
+            out["unidade_negocio"] = sexo
+        out["sexo"] = ""
+
+    cam = _norm_picklist(out.get("camiseta"))
+    if cam in ("Corretor", "Captador", "Corretor Parceiro"):
+        if not _norm_picklist(out.get("atividade")):
+            out["atividade"] = cam
+        out["camiseta"] = ""
+
+    orig = _norm_picklist(out.get("origem"))
+    if orig in ("PP", "P", "M", "G", "GG", "XGG"):
+        if not _norm_picklist(out.get("camiseta")):
+            out["camiseta"] = orig
+        out["origem"] = "RH"
+
+    rede = _norm_picklist(out.get("unidade_negocio"))
+    if rede and ("Ensino" in rede or rede in _ESCOLARIDADE):
+        if not _norm_picklist(out.get("escolaridade")):
+            out["escolaridade"] = rede
+        out["unidade_negocio"] = "Direcional"
+
+    esc = str(out.get("escolaridade") or "").strip()
+    if esc and (_celula_parece_data(esc) or re.match(r"^\d{4}-\d{2}-\d{2}", esc)):
+        out["escolaridade"] = ""
+
+    if _norm_picklist(out.get("escolaridade")) not in _ESCOLARIDADE:
+        out["escolaridade"] = DEFAULT_ESCOLARIDADE_SF
+
+    trat = _norm_picklist(out.get("salutation"))
+    if trat in ("Sr.", "Sra.") and not _norm_picklist(out.get("sexo")):
+        out["sexo"] = "Masculino" if trat == "Sr." else "Feminino"
+
+    regcad = _norm_picklist(out.get("regional_cadastro"))
+    if regcad in ("Sr.", "Sra."):
+        if not _norm_picklist(out.get("sexo")):
+            out["sexo"] = "Masculino" if regcad == "Sr." else "Feminino"
+        out["regional_cadastro"] = "RJ"
+
+    act = _norm_picklist(out.get("atividade"))
+    if act and (_celula_parece_data(act) or re.match(r"^\d{4}-\d{2}-\d{2}", act)):
+        out["atividade"] = "Corretor"
+    if act and ("Ensino" in act or act in _ESCOLARIDADE):
+        if not _norm_picklist(out.get("escolaridade")):
+            out["escolaridade"] = act
+        out["atividade"] = "Corretor"
+
+    ag = re.sub(r"\D", "", str(out.get("agencia_bancaria") or ""))
+    if len(ag) > SF_AGENCIA_BANCARIA_MAX:
+        out["agencia_bancaria"] = ag[:SF_AGENCIA_BANCARIA_MAX]
+
+    if _norm_picklist(out.get("sexo")) not in ("Masculino", "Feminino"):
+        out["sexo"] = "Masculino"
+    if _norm_picklist(out.get("camiseta")) not in ("PP", "P", "M", "G", "GG", "XGG"):
+        out["camiseta"] = "M"
+    if not _norm_picklist(out.get("unidade_negocio")):
+        out["unidade_negocio"] = "Direcional"
+    if not _norm_picklist(out.get("atividade")):
+        out["atividade"] = "Corretor"
+
+    return out
+
+
+def formatar_log_envio_detalhado(
+    *,
+    status: str,
+    nome: str = "",
+    erros_validacao: Optional[List[str]] = None,
+    avisos: Optional[List[str]] = None,
+    err_sf: Any = None,
+    payload: Optional[Dict[str, Any]] = None,
+    contact_id: Optional[str] = None,
+    deslocamento_colunas: int = 0,
+    linhas_extra: Optional[List[str]] = None,
+) -> str:
+    """Log completo para coluna «Log / erro» — inclui validação, avisos, erro SF e payload resumido."""
+    ts = _agora_texto_brasilia()
+    partes: List[str] = [
+        f"[{ts}] status={status}",
+    ]
+    if nome:
+        partes.append(f"nome={nome}")
+    if deslocamento_colunas:
+        partes.append(f"realinhamento_colunas=+{deslocamento_colunas}")
+    if contact_id:
+        partes.append(f"contact_id={contact_id}")
+        partes.append(f"url={_url_contact(contact_id)}")
+    if erros_validacao:
+        partes.append("--- validação formulário ---")
+        partes.extend(f"• {e}" for e in erros_validacao)
+    if avisos:
+        partes.append("--- avisos preparação ---")
+        partes.extend(f"• {a}" for a in avisos if str(a).strip())
+    if err_sf:
+        partes.append("--- erro Salesforce ---")
+        partes.append(str(_explicacao_erro_record_type_se_aplicavel(err_sf)))
+    if payload:
+        try:
+            pay_txt = json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            pay_txt = str(payload)
+        if len(pay_txt) > 12000:
+            pay_txt = pay_txt[:11999] + "…"
+        partes.append("--- payload enviado ---")
+        partes.append(pay_txt)
+    if linhas_extra:
+        partes.append("--- info ---")
+        partes.extend(str(x) for x in linhas_extra if str(x).strip())
+    return "\n".join(partes).strip()[:49000]
+
+
+def processar_envio_corretor_dados(
+    dados: Dict[str, Any],
+    sf: Any,
+    *,
+    reutilizar_existente: bool = True,
+    deslocamento_colunas: int = 0,
+) -> Dict[str, Any]:
+    """
+    Pipeline completo planilha → Salesforce (sem Streamlit).
+    Retorna dict: ok, envio, log, link, contact_id, payload, avisos, erros_validacao.
+    """
+    nome = (dados.get("nome_completo") or "").strip()
+    out: Dict[str, Any] = {
+        "ok": False,
+        "envio": "Erro",
+        "log": "",
+        "link": "",
+        "contact_id": None,
+        "payload": {},
+        "avisos": [],
+        "erros_validacao": [],
+    }
+    dados = _merge_defaults_ficha_em_dict(dict(dados))
+    dados = _sanear_dados_planilha_import(dados)
+    dados = enriquecer_derivados_vendas_rj(dados)
+    erros = validar_obrigatorios(dados)
+    if erros:
+        out["erros_validacao"] = erros
+        out["log"] = formatar_log_envio_detalhado(
+            status="VALIDACAO",
+            nome=nome,
+            erros_validacao=erros,
+            deslocamento_colunas=deslocamento_colunas,
+        )
+        return out
+
+    payload, avisos = montar_payload_salesforce(dados)
+    avisos = list(avisos)
+    avisos.extend(_enriquecer_mobile_phone(payload, dados))
+    erros_payload = validar_payload_minimo_salesforce(
+        _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    )
+    if erros_payload:
+        out["erros_validacao"] = erros_payload
+        out["avisos"] = avisos
+        out["log"] = formatar_log_envio_detalhado(
+            status="PAYLOAD_INVALIDO",
+            nome=nome,
+            erros_validacao=erros_payload,
+            avisos=avisos,
+            deslocamento_colunas=deslocamento_colunas,
+            payload=payload,
+        )
+        return out
+
+    cid, err, payload_final = criar_contato_salesforce_preparado(
+        sf, payload, dados, avisos, reutilizar_existente=reutilizar_existente
+    )
+    out["payload"] = payload_final or {}
+    out["avisos"] = avisos
+    if cid:
+        out["ok"] = True
+        out["envio"] = "Ok"
+        out["contact_id"] = cid
+        out["link"] = _url_contact(cid)
+        dup = any("já existia" in str(a).lower() for a in avisos)
+        status_log = "OK_DUPLICATA_REUTILIZADA" if dup else "OK"
+        out["log"] = formatar_log_envio_detalhado(
+            status=status_log,
+            nome=nome,
+            avisos=avisos,
+            payload=payload_final,
+            contact_id=cid,
+            deslocamento_colunas=deslocamento_colunas,
+        )
+        return out
+
+    err_full = _explicacao_erro_record_type_se_aplicavel(err)
+    err_txt = str(err_full or err or "").strip()
+    err_low = err_txt.lower()
+    if "duplicat" in err_low or "cpf ja" in err_low or "cpf já" in err_low:
+        out["envio"] = "Erro (campo)"
+        status_log = "ERRO_DUPLICATA_SF"
+    elif "picklist" in err_low or "restricted" in err_low or "string_too_long" in err_low:
+        out["envio"] = "Erro (campo)"
+        status_log = "ERRO_CAMPO_SF"
+    else:
+        out["envio"] = "Erro"
+        status_log = "ERRO_SF"
+    out["log"] = formatar_log_envio_detalhado(
+        status=status_log,
+        nome=nome,
+        avisos=avisos,
+        err_sf=err_full or err,
+        payload=payload_final or payload,
+        deslocamento_colunas=deslocamento_colunas,
+        linhas_extra=[f"resumo={_mensagem_erro_sf_amigavel(err_full or err)}"],
+    )
+    return out
+
+
+def parse_linha_planilha_corretor(
+    headers: List[str], cells: List[str]
+) -> Tuple[Dict[str, Any], int, int]:
+    """Retorna (dados, deslocamento_colunas, score_qualidade)."""
+    alinhadas, shift = _realinhar_celulas_planilha(headers, cells)
+    dados = _dados_dict_de_linha_planilha_bruto(headers, alinhadas)
+    return dados, shift, _score_qualidade_dados_planilha(dados)
+
+
 def _indice_coluna_planilha_para_campo(
     hmap: Dict[str, int], headers: List[str], label_campo: str
 ) -> Optional[int]:
@@ -2331,12 +2693,17 @@ def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[s
     Layout esperado na linha 1: data e link nas duas primeiras colunas; rótulos de `campos_planilha_todos()`;
     colunas de API Salesforce; **Envio?** e **Log / erro**. Só rótulos que casam com `CAMPOS` entram no dict.
     """
+    alinhadas, _ = _realinhar_celulas_planilha(headers, cells)
+    return _dados_dict_de_linha_planilha_bruto(headers, alinhadas)
+
+
+def _dados_dict_de_linha_planilha_bruto(headers: List[str], cells: List[str]) -> Dict[str, Any]:
+    """Parse direto (sem realinhamento) — uso interno."""
     hmap: Dict[str, int] = {}
     for i, h in enumerate(headers):
         key = _norm_cabecalho_planilha(h)
         if key and key not in hmap:
             hmap[key] = i
-    # Garante células alinhadas ao número de colunas do cabeçalho
     if len(cells) < len(headers):
         cells = list(cells) + [""] * (len(headers) - len(cells))
     dados: Dict[str, Any] = {}
@@ -2449,7 +2816,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
             gs = {}
     sid, wname = _ids_planilha_modo_teste(gs)
 
-    dados = dados_dict_de_linha_planilha(headers, cells)
+    dados, shift, _score = parse_linha_planilha_corretor(headers, cells)
     dados = _merge_defaults_ficha_em_dict(dados)
     dados = enriquecer_derivados_vendas_rj(dados)
     erros = validar_obrigatorios(dados)
@@ -2510,19 +2877,35 @@ def _executar_teste_criar_sf_de_linha_planilha(
                     creds,
                     row_num_atualizar,
                     "Ok",
-                    "",
+                    formatar_log_envio_detalhado(
+                        status="OK",
+                        nome=(dados.get("nome_completo") or "").strip(),
+                        avisos=avisos,
+                        payload=payload,
+                        contact_id=cid,
+                        deslocamento_colunas=shift,
+                    ),
                     link,
                     payload_final=payload,
                 )
             else:
+                log_det = formatar_log_envio_detalhado(
+                    status="ERRO_SF",
+                    nome=(dados.get("nome_completo") or "").strip(),
+                    avisos=avisos,
+                    err_sf=_explicacao_erro_record_type_se_aplicavel(err) if err else err,
+                    payload=payload,
+                    deslocamento_colunas=shift,
+                    linhas_extra=[f"resumo={msg_erro}"],
+                )
                 atualizar_status_envio_salesforce(
                     sid,
                     wname,
                     creds,
                     row_num_atualizar,
                     "Erro",
-                    msg_erro,
-                    msg_erro,
+                    log_det,
+                    "",
                     payload_final=payload,
                 )
         except Exception as ex:
@@ -4252,16 +4635,48 @@ def _somente_digitos(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
-def _aplicar_secrets_sf():
+def _carregar_secrets_toml_local() -> Dict[str, Any]:
+    """Lê `.streamlit/secrets.toml` quando Streamlit não está ativo (scripts CLI)."""
+    path = _DIR_APP / ".streamlit" / "secrets.toml"
+    if not path.is_file():
+        return {}
     try:
-        if hasattr(st, "secrets") and "salesforce" in st.secrets:
-            sec = st.secrets["salesforce"]
-            if sec.get("USER"):
-                os.environ["SALESFORCE_USER"] = str(sec["USER"]).strip()
-            if sec.get("PASSWORD"):
-                os.environ["SALESFORCE_PASSWORD"] = str(sec["PASSWORD"]).strip()
-            if sec.get("TOKEN"):
-                os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"]).strip()
+        try:
+            import tomllib  # py3.11+
+
+            with open(path, "rb") as f:
+                return dict(tomllib.load(f))
+        except ImportError:
+            import toml  # type: ignore
+
+            with open(path, "r", encoding="utf-8") as f:
+                return dict(toml.load(f))
+    except Exception:
+        return {}
+
+
+def _aplicar_secrets_sf(secrets_dict: Optional[Dict[str, Any]] = None):
+    sec: Dict[str, Any] = {}
+    if secrets_dict and isinstance(secrets_dict.get("salesforce"), dict):
+        sec = dict(secrets_dict["salesforce"])
+    else:
+        try:
+            if hasattr(st, "secrets") and "salesforce" in st.secrets:
+                sec = dict(st.secrets["salesforce"])
+        except Exception:
+            pass
+        if not sec:
+            local = _carregar_secrets_toml_local()
+            if isinstance(local.get("salesforce"), dict):
+                sec = dict(local["salesforce"])
+    try:
+        if sec.get("USER") and not (os.environ.get("SALESFORCE_USER") or "").strip():
+            os.environ["SALESFORCE_USER"] = str(sec["USER"]).strip()
+        if sec.get("PASSWORD") and not (os.environ.get("SALESFORCE_PASSWORD") or "").strip():
+            os.environ["SALESFORCE_PASSWORD"] = str(sec["PASSWORD"]).strip()
+        if sec.get("TOKEN") and not (os.environ.get("SALESFORCE_TOKEN") or "").strip():
+            os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"]).strip()
+        if not (os.environ.get("SF_RECORD_TYPE_ID") or "").strip():
             os.environ.pop("SF_RECORD_TYPE_ID", None)
             for rt_key in ("RECORD_TYPE_ID", "record_type_id", "RECORD_TYPE_CORRETOR"):
                 rt = str(sec.get(rt_key) or "").strip()
@@ -5397,9 +5812,13 @@ def _ficha_defaults_de_secrets() -> dict[str, Any]:
     """Valores fixos não exibidos no formulário — seção [ficha_defaults] nos Secrets."""
     try:
         d = st.secrets.get("ficha_defaults", {})
-        return dict(d) if isinstance(d, dict) else {}
+        if isinstance(d, dict) and d:
+            return dict(d)
     except Exception:
-        return {}
+        pass
+    local = _carregar_secrets_toml_local()
+    d = local.get("ficha_defaults", {})
+    return dict(d) if isinstance(d, dict) else {}
 
 
 def _merge_defaults_ficha_em_dict(dados: Dict[str, Any]) -> Dict[str, Any]:
@@ -6506,7 +6925,13 @@ def _processar_envio_cadastro_impl() -> None:
             gs,
             envio="Ok",
             coluna_link=_url_contact(cid),
-            log_erro="",
+            log_erro=formatar_log_envio_detalhado(
+                status="OK",
+                nome=(dados.get("nome_completo") or "").strip(),
+                avisos=avisos,
+                payload=payload_utilizado,
+                contact_id=cid,
+            ),
             payload_final=payload_utilizado,
         )
         if row_num is None:
@@ -6516,6 +6941,14 @@ def _processar_envio_cadastro_impl() -> None:
     else:
         if not msg_amigavel:
             msg_amigavel = _mensagem_erro_sf_amigavel(err)
+        log_det = formatar_log_envio_detalhado(
+            status="ERRO_SF",
+            nome=(dados.get("nome_completo") or "").strip(),
+            avisos=avisos,
+            err_sf=_explicacao_erro_record_type_se_aplicavel(err) if err else msg_amigavel,
+            payload=payload_utilizado,
+            linhas_extra=[f"resumo={msg_amigavel}"],
+        )
         row_num = _gravar_cadastro_planilha(
             linha,
             cab,
@@ -6524,8 +6957,8 @@ def _processar_envio_cadastro_impl() -> None:
             creds,
             gs,
             envio="Erro",
-            coluna_link=msg_amigavel,
-            log_erro=msg_amigavel,
+            coluna_link="",
+            log_erro=log_det,
             payload_final=payload_utilizado,
         )
         if row_num is None:
