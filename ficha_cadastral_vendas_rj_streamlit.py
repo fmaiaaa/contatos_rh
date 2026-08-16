@@ -78,7 +78,8 @@ def conectar_salesforce_diagnostico() -> Tuple[Any, Optional[str]]:
 
 def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
     try:
-        res = sf.Contact.create(payload)
+        limpo = _filtrar_payload_contact_insert(dict(payload))
+        res = sf.Contact.create(limpo)
         return res.get("id"), None
     except Exception as e:
         err_msg = str(e)
@@ -257,9 +258,20 @@ _EMAIL_CONTATO_RE = re.compile(
 )
 
 
+def _sanear_email_contato(val: Any) -> str:
+    s = (str(val).strip() if val is not None else "") or ""
+    if not s:
+        return ""
+    s = re.sub(r"\s+", "", s.replace("\u00a0", " "))
+    s = re.sub(r"@\.", "@", s)
+    s = re.sub(r"@+", "@", s)
+    s = re.sub(r"\.{2,}", ".", s)
+    return s
+
+
 def email_contato_formato_valido(val: Any) -> bool:
     """Validação simples de e-mail para formulário e SMTP (evita destinos como «K»)."""
-    s = (str(val).strip() if val is not None else "") or ""
+    s = _sanear_email_contato(val)
     if not s or len(s) > 254:
         return False
     return bool(_EMAIL_CONTATO_RE.match(s))
@@ -320,6 +332,10 @@ SF_OBSERVACOES_MAX = 32000
 SF_CONTA_BANCARIA_MAX = 20
 SF_AGENCIA_BANCARIA_MAX = 4
 DEFAULT_ESCOLARIDADE_SF = "Ensino Médio"
+
+SF_NOME_CONJUGE_MAX = 50
+SF_CAMPOS_NUNCA_INSERT: frozenset[str] = frozenset({"Gerente_de_Vendas__c"})
+_SF_API_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(__c|Id)?$")
 
 SEC_ORDER: Tuple[str, ...] = (
     "Dados Pessoais",
@@ -422,7 +438,7 @@ _UNIDADE_NEGOCIO_UI_PARA_SF: Dict[str, str] = {
 # Rótulos do formulário Vendas RJ → valores aceitos no picklist Atividade__c (depende do Record Type).
 _ATIVIDADE_UI_PARA_SF: Dict[str, str] = {
     "Corretor": "Corretor",
-    "Corretor Parceiro": "Autônomo Parceiro",
+    "Corretor Parceiro": "Corretor Parceiro",
     "Captador": "Captador",
 }
 
@@ -1310,6 +1326,66 @@ def cabecalhos_api_salesforce_ordenados() -> List[str]:
     return sorted(keys)
 
 
+def _campos_api_contact_permitidos() -> frozenset[str]:
+    keys: set[str] = set()
+    for c in CAMPOS:
+        sf = c.get("sf")
+        if sf and sf not in SF_OMIT_INSERT:
+            keys.add(str(sf))
+    keys.update({"FirstName", "LastName", "Email", "MobilePhone", "Phone", "Description", "RecordTypeId", "Naturalidade__c", "Imobiliaria__c"})
+    chk = _salesforce_possui_creci_field_name()
+    if chk:
+        keys.add(chk)
+    return frozenset(keys - SF_CAMPOS_NUNCA_INSERT)
+
+
+def _filtrar_payload_contact_insert(payload):
+    permitidos = _campos_api_contact_permitidos()
+    out = {}
+    for k, v in payload.items():
+        if v is None or v == "":
+            continue
+        ks = str(k).strip()
+        if ks in SF_CAMPOS_NUNCA_INSERT or ks not in permitidos:
+            continue
+        if not _SF_API_FIELD_RE.match(ks):
+            continue
+        out[ks] = v
+    return out
+
+
+def _normalizar_unidade_negocio_ui(raw):
+    s = _norm_picklist(raw)
+    if not s:
+        return ""
+    low = s.casefold()
+    if "parceir" in low or "outra imob" in low:
+        return UNIDADE_REDE_OUTRA_IMOBILIARIA
+    if low == "riva" or (low.startswith("riva") and "direcional" not in low):
+        return "Riva"
+    if "direcional" in low:
+        return "Direcional"
+    return s
+
+
+def _sanear_conta_bancaria(val):
+    s = (str(val).strip() if val is not None else "") or ""
+    if not s:
+        return ""
+    if "@" in s:
+        dig = re.sub(r"\D", "", s)
+        return dig[:SF_CONTA_BANCARIA_MAX] if len(dig) >= 4 else ""
+    return re.sub(r"[^\d\-]", "", s.replace(" ", ""))[:SF_CONTA_BANCARIA_MAX]
+
+
+def _atividade_exige_imobiliaria(dados):
+    if not dados:
+        return False
+    act = _ATIVIDADE_UI_PARA_SF.get(_norm_picklist(dados.get("atividade")), _norm_picklist(dados.get("atividade")))
+    rede = _normalizar_unidade_negocio_ui(dados.get("unidade_negocio"))
+    return act == "Corretor Parceiro" or rede == UNIDADE_REDE_OUTRA_IMOBILIARIA
+
+
 # Cabeçalhos fixos da aba Corretores (linha 1)
 PLANILHA_COL_DATA_ENVIO = "Data e hora do envio"
 PLANILHA_COL_LINK_SF = "Link do contato (Salesforce)"
@@ -1439,6 +1515,8 @@ def _truncar_payload_salesforce(payload: Dict[str, Any]) -> None:
             lim = SF_CONTA_BANCARIA_MAX
         if k == "Ag_ncia_Banc_ria__c":
             lim = SF_AGENCIA_BANCARIA_MAX
+        if k == "Nome_do_Conjuge__c":
+            lim = SF_NOME_CONJUGE_MAX
         payload[k] = _truncar_texto_sf(v, lim)
 
 
@@ -1454,32 +1532,57 @@ def _aplicar_defaults_payload_obrigatorios_sf(payload: Dict[str, Any]) -> None:
             payload["Preferred_Contact_Method__c"] = "Email de trabalho"
 
 
-def _buscar_contact_id_existente(sf: Any, payload: Dict[str, Any]) -> Optional[str]:
-    """Evita duplicar contato na retentativa quando o 1º insert já gravou no SF."""
+def _buscar_contact_id_existente(sf: Any, payload: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Busca contato já cadastrado por CPF, e-mail, apelido, celular ou CRECI."""
+    candidatos: list[tuple[str, str, str]] = []
+
     cpf = re.sub(r"\D", "", str(payload.get("CPF__c") or ""))
+    if cpf:
+        candidatos.append(("CPF__c", "CPF", cpf))
+
     email = str(payload.get("Email") or "").strip().lower()
-    try:
-        if cpf:
+    if email:
+        candidatos.append(("Email", "e-mail", email))
+
+    apelido = str(payload.get("Apelido__c") or "").strip()
+    if apelido:
+        candidatos.append(("Apelido__c", "apelido", apelido))
+
+    mobile = re.sub(r"\D", "", str(payload.get("MobilePhone") or ""))
+    if len(mobile) >= 10:
+        candidatos.append(("MobilePhone", "celular", mobile))
+
+    creci = str(payload.get("CRECI__c") or "").strip()
+    if creci:
+        candidatos.append(("CRECI__c", "CRECI", creci))
+
+    for sf_field, label, val in candidatos:
+        try:
             q = (
                 "SELECT Id FROM Contact "
-                f"WHERE CPF__c = '{_soql_escape(cpf)}' "
+                f"WHERE {sf_field} = '{_soql_escape(val)}' "
                 "ORDER BY CreatedDate DESC LIMIT 1"
             )
             recs = (sf.query(q) or {}).get("records") or []
             if recs:
-                return str(recs[0].get("Id") or "").strip() or None
-        if email:
-            q = (
-                "SELECT Id FROM Contact "
-                f"WHERE Email = '{_soql_escape(email)}' "
-                "ORDER BY CreatedDate DESC LIMIT 1"
-            )
-            recs = (sf.query(q) or {}).get("records") or []
-            if recs:
-                return str(recs[0].get("Id") or "").strip() or None
-    except Exception:
-        return None
-    return None
+                cid = str(recs[0].get("Id") or "").strip() or None
+                if cid:
+                    return cid, label
+        except Exception:
+            continue
+    return None, None
+
+
+def _erro_indica_duplicata_sf(err: Any) -> bool:
+    txt = (str(err or "")).lower()
+    compact = re.sub(r"\s+", "", txt.upper())
+    return (
+        "DUPLICATE_VALUE" in compact
+        or "duplicad" in txt
+        or "duplica o valor" in txt
+        or "cpf ja" in txt
+        or "cpf já" in txt
+    )
 
 
 def _preparar_payload_insert_salesforce(
@@ -1493,7 +1596,7 @@ def _preparar_payload_insert_salesforce(
     _aplicar_enriquecimentos_payload_sf(out, dados, sf, avisos)
     _aplicar_defaults_payload_obrigatorios_sf(out)
     _truncar_payload_salesforce(out)
-    return out
+    return _filtrar_payload_contact_insert(out)
 
 
 def criar_contato_salesforce_preparado(
@@ -1502,22 +1605,32 @@ def criar_contato_salesforce_preparado(
     dados: Dict[str, Any],
     avisos: List[str],
     *,
-    reutilizar_existente: bool = False,
+    reutilizar_existente: bool = True,
 ) -> tuple[Any, Any, Dict[str, Any]]:
     """
-    Monta payload final e cria contato (ou reutiliza por CPF/e-mail na retentativa).
+    Monta payload final e cria contato (ou reutiliza por CPF/e-mail/outros campos únicos).
     """
     payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+
+    def _vincular_existente(cid_exist: str, campo: Optional[str]) -> tuple[Any, Any, Dict[str, Any]]:
+        rotulo = campo or "cadastro duplicado"
+        avisos.append(
+            f"Contato já existia no Salesforce ({rotulo}); planilha atualizada com o vínculo."
+        )
+        return cid_exist, None, payload_final
+
     if reutilizar_existente:
-        cid_exist = _buscar_contact_id_existente(sf, payload_final)
+        cid_exist, campo = _buscar_contact_id_existente(sf, payload_final)
         if cid_exist:
-            avisos.append(
-                "Contato já existia no Salesforce (CPF ou e-mail); planilha atualizada com o vínculo."
-            )
-            return cid_exist, None, payload_final
+            return _vincular_existente(cid_exist, campo)
+
     cid, err, payload_usado = criar_contato_payload_com_fallback_naturalidade(
         sf, payload_final, avisos
     )
+    if not cid and err and _erro_indica_duplicata_sf(err):
+        cid_exist, campo = _buscar_contact_id_existente(sf, payload_usado)
+        if cid_exist:
+            return _vincular_existente(cid_exist, campo)
     return cid, err, payload_usado
 
 
@@ -1991,6 +2104,13 @@ def _aplicar_enriquecimentos_payload_sf(
     if apel:
         payload["Apelido__c"] = apel
 
+    if _atividade_exige_imobiliaria(dados) and not str(payload.get("Imobiliaria__c") or "").strip():
+        aid = str(payload.get("AccountId") or "").strip()
+        if aid:
+            payload["Imobiliaria__c"] = aid
+        else:
+            avisos.append("Imobiliária parceira: Imobiliaria__c não resolvida (AccountId ausente).")
+
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     payload: Dict[str, Any] = {}
@@ -2076,15 +2196,25 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                 if s == "Telefone":
                     s = "Celular"
             if key == "unidade_negocio":
+                s = _normalizar_unidade_negocio_ui(raw)
                 if s:
-                    # Mapeamento explícito para o valor exato do picklist Salesforce (evita troca Riva/Direcional).
-                    payload[sf] = _UNIDADE_NEGOCIO_UI_PARA_SF.get(s, s)
+                    mapped = _UNIDADE_NEGOCIO_UI_PARA_SF.get(s)
+                    if mapped:
+                        payload[sf] = mapped
+                    elif s in ("Direcional", "Riva"):
+                        payload[sf] = s
+                    else:
+                        payload[sf] = "Direcional"
+                        avisos.append(f"Unidade «{raw}» normalizada para Direcional.")
                 if s == "Riva":
                     extras_obs.append("Rede de atuação informada: Riva")
                 if s == UNIDADE_REDE_OUTRA_IMOBILIARIA:
                     extras_obs.append("Rede de atuação informada: Outra imobiliária (parceira)")
                 continue
             if key == "atividade":
+                s = _norm_picklist(raw)
+                if s == "Autônomo Parceiro":
+                    s = "Corretor Parceiro"
                 if s:
                     payload[sf] = _ATIVIDADE_UI_PARA_SF.get(s, s)
                 continue
@@ -2123,6 +2253,24 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                     payload[sf] = f"{dig[:5]}-{dig[5:]}"
                 else:
                     payload[sf] = dig[:9]
+            continue
+
+        if key == "email" and sf == "Email":
+            s = _sanear_email_contato(raw)
+            if s:
+                payload[sf] = s
+            continue
+
+        if key == "conta_bancaria" and sf == "Conta_Banc_ria__c":
+            s = _sanear_conta_bancaria(raw)
+            if s:
+                payload[sf] = s
+            continue
+
+        if key == "nome_conjuge" and sf == "Nome_do_Conjuge__c":
+            s = _truncar_texto_sf(str(raw).strip() if raw is not None else "", SF_NOME_CONJUGE_MAX)
+            if s:
+                payload[sf] = s
             continue
 
         s = (str(raw).strip() if raw is not None else "") or ""
@@ -2498,6 +2646,18 @@ def _sanear_dados_planilha_import(dados: Dict[str, Any]) -> Dict[str, Any]:
     if not _norm_picklist(out.get("atividade")):
         out["atividade"] = "Corretor"
 
+    rede_norm = _normalizar_unidade_negocio_ui(out.get("unidade_negocio"))
+    if rede_norm:
+        out["unidade_negocio"] = rede_norm
+    if _norm_picklist(out.get("atividade")) == "Autônomo Parceiro":
+        out["atividade"] = "Corretor Parceiro"
+    if out.get("email"):
+        out["email"] = _sanear_email_contato(out["email"])
+    if out.get("conta_bancaria"):
+        out["conta_bancaria"] = _sanear_conta_bancaria(out["conta_bancaria"])
+    if out.get("nome_conjuge"):
+        out["nome_conjuge"] = _truncar_texto_sf(out["nome_conjuge"], SF_NOME_CONJUGE_MAX)
+
     return out
 
 
@@ -2613,8 +2773,8 @@ def processar_envio_corretor_dados(
         out["ok"] = True
         out["envio"] = "Ok"
         out["contact_id"] = cid
-        out["link"] = _url_contact(cid)
-        dup = any("já existia" in str(a).lower() for a in avisos)
+        dup = _avisos_indicam_contato_existente(avisos)
+        out["link"] = _formatar_link_contato_planilha(cid, existente=dup)
         status_log = "OK_DUPLICATA_REUTILIZADA" if dup else "OK"
         out["log"] = formatar_log_envio_detalhado(
             status=status_log,
@@ -2863,9 +3023,9 @@ def _executar_teste_criar_sf_de_linha_planilha(
         return False, "Falha ao conectar ao Salesforce (credenciais ou rede)."
 
     cid, err, payload = criar_contato_salesforce_preparado(
-        sf, payload, dados, avisos, reutilizar_existente=False
+        sf, payload, dados, avisos, reutilizar_existente=True
     )
-    link = _url_contact(cid) if cid else ""
+    link = _link_contato_para_planilha(cid, avisos) if cid else ""
     msg_erro = _mensagem_erro_sf_amigavel(_explicacao_erro_record_type_se_aplicavel(err) if err else err)
 
     if atualizar_status_nesta_linha and row_num_atualizar >= 2:
@@ -2922,9 +3082,14 @@ def _executar_teste_criar_sf_de_linha_planilha(
         av_txt = "<br><strong>Avisos:</strong><br>" + "<br>".join(f"• {html.escape(str(a))}" for a in avisos)
 
     if cid:
-        url_esc = html.escape(link)
+        url = _url_contact(cid)
+        url_esc = html.escape(url)
+        if _avisos_indicam_contato_existente(avisos):
+            titulo = f"<strong>{html.escape(_MSG_LINK_CONTATO_EXISTENTE)}</strong>"
+        else:
+            titulo = f"<strong>Contato criado.</strong> Id: <code>{html.escape(str(cid))}</code>"
         return True, (
-            f"<strong>Contato criado.</strong> Id: <code>{html.escape(str(cid))}</code><br>"
+            f"{titulo} "
             f'<a href="{url_esc}" target="_blank" rel="noopener">Abrir no Salesforce</a>'
             f"{av_txt}"
         )
@@ -4629,6 +4794,31 @@ def _tab_label(sec: str) -> str:
 
 def _url_contact(cid: str) -> str:
     return f"{BASE_URL_CONTACT_VIEW}/{cid}/view"
+
+
+_MSG_LINK_CONTATO_EXISTENTE = "Contato já criado anteriormente. Link:"
+
+
+def _avisos_indicam_contato_existente(avisos: Optional[List[str]]) -> bool:
+    for aviso in avisos or []:
+        low = str(aviso).lower()
+        if "já existia" in low or "ja existia" in low:
+            return True
+    return False
+
+
+def _formatar_link_contato_planilha(contact_id: str, *, existente: bool = False) -> str:
+    url = _url_contact(contact_id)
+    if existente:
+        return f"{_MSG_LINK_CONTATO_EXISTENTE} {url}"
+    return url
+
+
+def _link_contato_para_planilha(contact_id: str, avisos: Optional[List[str]] = None) -> str:
+    return _formatar_link_contato_planilha(
+        contact_id,
+        existente=_avisos_indicam_contato_existente(avisos),
+    )
 
 
 def _somente_digitos(s: str) -> str:
@@ -6901,7 +7091,7 @@ def _processar_envio_cadastro_impl() -> None:
             msg_amigavel = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
         else:
             cid, err, payload_utilizado = criar_contato_salesforce_preparado(
-                sf, payload, dados, avisos, reutilizar_existente=False
+                sf, payload, dados, avisos, reutilizar_existente=True
             )
             if cid:
                 _registrar_debug_envio("sf_create_ok", f"contact_id={cid}")
@@ -6924,9 +7114,11 @@ def _processar_envio_cadastro_impl() -> None:
             creds,
             gs,
             envio="Ok",
-            coluna_link=_url_contact(cid),
+            coluna_link=_link_contato_para_planilha(cid, avisos),
             log_erro=formatar_log_envio_detalhado(
-                status="OK",
+                status="OK_DUPLICATA_REUTILIZADA"
+                if _avisos_indicam_contato_existente(avisos)
+                else "OK",
                 nome=(dados.get("nome_completo") or "").strip(),
                 avisos=avisos,
                 payload=payload_utilizado,
@@ -7071,7 +7263,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
             int(row_num),
             "Ok",
             "",
-            _url_contact(cid),
+            _link_contato_para_planilha(cid, avisos),
             payload_final=payload_utilizado,
         )
         ss["sf_contact_id"] = cid
