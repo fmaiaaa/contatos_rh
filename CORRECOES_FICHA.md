@@ -119,3 +119,50 @@ GSHEETS para o suporte, sem mostrar credenciais ou a resposta HTTP bruta.
 Credenciais ausentes/inválidas também têm mensagem específica.
 Validação da correção: 45 testes isolados aprovados, incluindo compatibilidade
 TOML/JSON, Secrets como Mapping, PEM, mensagens seguras e códigos de erro HTTP.
+
+
+## Auditoria completa de limites e regras de Contact (10/11/2026)
+
+O arquivo CAMPOS_CONTACT.md inventaria os 213 campos visíveis ao usuário da API,
+com origem, condição de envio, tipo, limite e permissões. O esquema sanitizado em
+salesforce_contact_schema.json permite antecipar esses limites nos campos do
+formulário, sem autenticar a cada renderização. A validação final continua lendo
+Contact.describe e as picklists do tipo Corretor para bloquear divergências recentes.
+Falhas de acesso à UI API interrompem a criação; não há fallback para listas globais
+que possam aceitar opções proibidas ao tipo de registro.
+
+Agência aceita no máximo 4 caracteres; e-mail 80; observações 500; primeiro nome 40;
+sobrenome 80; RG 25; conta 20; nomes de familiares 50. Todos os campos de texto são
+validados conforme o metadado, com contagem UTF-16 e limite de armazenamento. O
+backend não corta nomes ou textos longos: retorna a correção necessária. Números
+validam precisão e escala, rejeitam NaN/infinito/booleanos; inteiros não passam por
+float antes do JSON. Datas, booleanos, IDs e objeto de referência são conferidos.
+Picklists e dependências são validadas e refletidas nas opções do formulário.
+
+Foram lidas 24 regras de validação, 20 ativas. As 16 aplicáveis à criação de Corretor
+foram implementadas em salesforce_regras.py e testadas com cenários de bloqueio.
+As 4 com ISCHANGED são de atualização: segundo a documentação Salesforce essa
+função retorna falso na criação. Contatos existentes continuam sem alterações.
+Cônjuge, CPF/CNPJ, celular, indicação, motivo de não recomendação, inatividade,
+reativação, UF e requisitos de CRECI/TTI são considerados conforme cada condição.
+
+Os requisitos de CRECI/TTI ficam visíveis quando exigidos pela atividade, mesmo
+com Possui CRECI = Não. Foram removidos CRECI 1, validade/matrícula com data de hoje
+e responsável fictício como artifício para satisfazer regras. A atividade Corretor
+exige CRECI e validade; Estagiário exige validade, matrícula e responsável. O usuário
+precisa informar os dados reais. Origem RH volta a integrar o JSON, pois foi
+confirmada como opção gravável no tipo Corretor. O e-mail é consultado antes de criar
+para bloquear colisão com outro contato; CPF e apelido preservam os controles e
+retentativas anteriores. Exceções de validação mantêm a mensagem específica no
+resumo, em vez de serem convertidas em Falha no envio ao Salesforce.
+
+Há 4 regras de duplicidade (2 ativas: CPF e e-mail). Das 10 definições de fluxo
+ativas de Contact, 4 executam na criação. Três delas negam acesso a InteractionCustomError;
+ApexTrigger também não foi disponibilizado ao usuário. Não é possível prometer uma
+reprodução completa de lógica não acessível ou futura. As regras e automações do
+servidor continuam sendo executadas pelo Salesforce; o app preserva seus erros,
+nunca ignora bloqueios e só confirma sucesso após Salesforce e Sheets.
+
+Validação: 66 testes aprovados; inicialização Streamlit AppTest sem exceções; os
+213 campos comparados com a API real sem divergências; 6 casos inválidos bloqueados
+com metadados reais, sem inserir ou alterar contatos durante a auditoria.

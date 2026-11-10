@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Any
 
 import requests
+from salesforce_regras import validar_valor, esquema_local
 
 
 class SessaoSalesforceLimitada(requests.Session):
@@ -53,7 +54,7 @@ def validar_dados_integracao(dados: dict) -> list[str]:
     cpf = dados.get('cpf')
     if cpf and not cpf_valido(cpf):
         erros.append('CPF inválido: confira os dígitos verificadores.')
-    for chave, label, limite in [('conta_bancaria', 'Conta Bancária', 20), ('agencia_bancaria', 'Agência Bancária', 10)]:
+    for chave, label, limite in [('conta_bancaria', 'Conta Bancária', esquema_local()['fields']['Conta_Banc_ria__c']['length']), ('agencia_bancaria', 'Agência Bancária', esquema_local()['fields']['Ag_ncia_Banc_ria__c']['length'])]:
         valor = str(dados.get(chave) or '').strip().replace(' ', '')
         if not valor:
             continue
@@ -283,6 +284,8 @@ def _schema(sf: Any, record_type: str | None) -> tuple[dict, str, dict]:
         desc = sf.Contact.describe()
         if not isinstance(desc, dict) or not isinstance(desc.get('fields'), list):
             raise ValueError('Não foi possível validar os campos e permissões do Contact no Salesforce.')
+        if desc.get('createable') is False:
+            raise ValueError('O usuário da integração não tem permissão para criar contatos no Salesforce.')
         cache = {'time': time.monotonic(), 'desc': desc, 'picklists': {}}
         vars(sf)['_ficha_schema_cache'] = cache
     desc = cache['desc']
@@ -300,9 +303,8 @@ def _schema(sf: Any, record_type: str | None) -> tuple[dict, str, dict]:
             cache['picklists'][rt] = values.get('picklistFieldValues', {})
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             raise
-        except Exception:
-            # Describe ainda valida as opções globais; o erro de restrição por tipo é preservado se ocorrer.
-            cache['picklists'][rt] = {}
+        except Exception as exc:
+            raise ValueError('Não foi possível consultar as opções permitidas do tipo Corretor. O cadastro não foi criado; confira a permissão da UI API.') from exc
     return {f['name']: f for f in desc['fields']}, rt, cache['picklists'][rt]
 
 
@@ -379,12 +381,9 @@ def normalizar_payload(sf: Any, payload: dict, avisos: list[str]) -> dict:
             if not re.fullmatch(r'[0-9xX.\-]+', value) or not digitos(value):
                 raise ValueError(f"{meta.get('label', key)}: informe o número bancário, não e-mail ou chave PIX.")
             out[key] = value
-        length = meta.get('length')
-        if isinstance(value, str) and length and len(value) > length:
-            if key in {'CPF__c', 'Email', 'MobilePhone', 'Phone', 'Conta_Banc_ria__c', 'Ag_ncia_Banc_ria__c'}:
-                raise ValueError(f"{meta.get('label', key)} excede {length} caracteres. Corrija o valor; o identificador não será cortado.")
-            out[key] = value[:length]
-            avisos.append(f"{meta.get('label', key)} ajustado ao limite de {length} caracteres do Salesforce.")
+        problemas = validar_valor(meta, value, esquema_local()['reference_prefixes'])
+        if problemas:
+            raise ValueError("; ".join(problemas))
     required = [f.get('label') or k for k, f in fields.items() if f.get('createable') and not f.get('nillable') and not f.get('defaultedOnCreate') and out.get(k) in (None, '')]
     if required:
         raise ValueError('Campos obrigatórios Salesforce ausentes: ' + ', '.join(required))

@@ -30,6 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
+from salesforce_regras import (esquema_local, validar_formulario, validar_regras_criacao,
+    limite_campo, numero, opcoes_permitidas, payload_formulario, normalizar_opcao)
 from salesforce_integracao import (SessaoSalesforceLimitada, normalizar_payload, usuario_integracao,
     mesma_identidade, ids_duplicados_cpf, apelido_duplicado, resumo_erro, digitos,
     validar_dados_integracao, alinhar_linha_legada, alinhar_cabecalhos_existentes)
@@ -328,12 +330,12 @@ REGIONAL_CADASTRO_OPTS: Tuple[str, ...] = ("RJ", "MG")
 CONTA_CADASTRO_OBRIGATORIA = "COORDENADORES DV - RJ"
 
 SF_TEXTO_CURTO_MAX = 255
-SF_OBSERVACOES_MAX = 32000
+SF_OBSERVACOES_MAX = esquema_local()["fields"]["Observacoes__c"]["length"]
 SF_CONTA_BANCARIA_MAX = 20
-SF_AGENCIA_BANCARIA_MAX = 10
+SF_AGENCIA_BANCARIA_MAX = esquema_local()["fields"]["Ag_ncia_Banc_ria__c"]["length"]
 DEFAULT_ESCOLARIDADE_SF = "Ensino Médio"
 
-SF_NOME_CONJUGE_MAX = 50
+SF_NOME_CONJUGE_MAX = esquema_local()["fields"]["Nome_do_Conjuge__c"]["length"]
 SF_CAMPOS_NUNCA_INSERT: frozenset[str] = frozenset({"Gerente_de_Vendas__c"})
 _SF_API_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(__c|Id)?$")
 
@@ -361,8 +363,7 @@ SF_OMIT_INSERT = frozenset(
         "ErroIntegracaoUAU__c",
         "RetornoIntegracaoPessoa__c",
         "Data_Descredenciamento__c",
-        # Evita falha de picklist restrita em orgs onde "Indicação" não existe para Origem__c.
-        "Origem__c",
+        # Origem RH é gravável e foi confirmada no tipo Corretor.
     }
 )
 
@@ -1111,9 +1112,8 @@ def _campos_def() -> List[Campo]:
             sf=None,
             opcoes=["Sim", "Não"],
             req=True,
-            help="Se «Sim», os campos de CRECI aparecem para preenchimento. Se «Não», eles ficam ocultos; na gravação no "
-            "Salesforce, valores vazios exigidos pelas regras do org são preenchidos automaticamente (CRECI 1, datas de hoje, "
-            "responsável Lucas Maia).",
+            help="Informe sua situação real. A atividade Corretor exige número e validade de CRECI; "
+            "Estagiário exige validade, matrícula TTI e responsável. Os campos necessários continuam visíveis para preenchimento.",
         ),
         _z(
             key="data_matricula_tti",
@@ -1580,7 +1580,11 @@ def _preparar_payload_insert_salesforce(
     _aplicar_enriquecimentos_payload_sf(out, dados, sf, avisos)
     _aplicar_defaults_payload_obrigatorios_sf(out)
     out["OwnerId"] = usuario_integracao(sf, os.environ.get("SALESFORCE_USER", ""))
-    return normalizar_payload(sf, _filtrar_payload_contact_insert(out), avisos)
+    out = normalizar_payload(sf, _filtrar_payload_contact_insert(out), avisos)
+    erros_regras = validar_regras_criacao(out)
+    if erros_regras:
+        raise ValueError("; ".join(erros_regras))
+    return out
 
 
 def criar_contato_salesforce_preparado(
@@ -1608,6 +1612,11 @@ def criar_contato_salesforce_preparado(
         if cid:
             return existente(cid)
         enviado = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+        email_novo = str(enviado.get("Email") or "").strip()
+        if email_novo:
+            duplicados_email = (sf.query("SELECT Id FROM Contact WHERE Email = '" + _soql_escape(email_novo) + "' LIMIT 1") or {}).get("records") or []
+            if duplicados_email:
+                raise ValueError("Este e-mail já está cadastrado em outro contato. Confira CPF e e-mail; nenhum contato existente foi alterado.")
         for tentativa in range(3):
             cid, erro, enviado = criar_contato_payload_com_fallback_naturalidade(sf, enviado, avisos)
             if cid:
@@ -1696,7 +1705,7 @@ def _formulario_exibe_creci_detalhado(dados: Optional[Dict[str, Any]]) -> bool:
     """Campos detalhados de CRECI só aparecem quando «Possui CRECI?» = Sim (mesmo que a atividade exija no Salesforce)."""
     if not dados:
         return False
-    return (str(dados.get("possui_creci") or "").strip()) == "Sim"
+    return (str(dados.get("possui_creci") or "").strip()) == "Sim" or _atividade_sf_norm(dados) in {"Corretor", "Estagiário"} or _status_creci_em_estagio(dados)
 
 
 def _incluir_campo_creci_detalhe_no_payload(dados: Dict[str, Any], key: str) -> bool:
@@ -1759,12 +1768,20 @@ def _erro_validacao_nascimento(v: Any) -> Optional[str]:
 
 
 def _erros_preenchimento_creci_se_sim(dados: Dict[str, Any]) -> List[str]:
-    """Se «Possui CRECI?» = Sim, exige status CRECI (número/validade/matrícula/responsável têm fallback no Salesforce se vazios)."""
-    if (str(dados.get("possui_creci") or "").strip()) != "Sim":
-        return []
-    er: List[str] = []
-    if not _norm_picklist(dados.get("status_creci")):
+    """Requisitos condicionais extraídos das regras ativas de criação."""
+    er = []
+    act = _atividade_sf_norm(dados)
+    if _norm_picklist(dados.get("unidade_negocio")) == UNIDADE_REDE_OUTRA_IMOBILIARIA:
+        act = "Corretor Parceiro"
+    if str(dados.get("possui_creci") or "").strip() == "Sim" and not _norm_picklist(dados.get("status_creci")):
         er.append("Status CRECI *")
+    if act == "Corretor" and not str(dados.get("creci") or "").strip():
+        er.append("CRECI: obrigatório para a atividade Corretor.")
+    if act in {"Corretor", "Estagiário"} and not dados.get("validade_creci"):
+        er.append("Validade CRECI: obrigatória para Corretor ou Estagiário.")
+    if act == "Estagiário" or _status_creci_em_estagio(dados):
+        if not dados.get("data_matricula_tti"): er.append("Data Matrícula TTI: obrigatória para Estagiário ou CRECI em Estágio.")
+        if not str(dados.get("nome_responsavel") or "").strip(): er.append("Nome do Responsável: obrigatório para Estagiário ou CRECI em Estágio.")
     return er
 
 
@@ -1808,7 +1825,7 @@ def _celular_resolvivel(dados: Dict[str, Any]) -> bool:
 
 
 def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
-    erros: List[str] = validar_dados_integracao(dados)
+    erros: List[str] = validar_dados_integracao(dados) + validar_formulario(dados, CAMPOS)
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
             continue
@@ -1862,7 +1879,9 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     Replica a lógica de `validar_obrigatorios` para `c['sec'] == sec` e, na seção
     «Informações para contato», as regras de conta.
     """
-    erros: List[str] = []
+    erros: List[str] = validar_formulario(dados, CAMPOS, sec)
+    chaves_secao = {c["key"] for c in CAMPOS if c["sec"] == sec}
+    erros.extend(validar_dados_integracao({k: v for k, v in dados.items() if k in chaves_secao}))
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
             continue
@@ -1920,8 +1939,8 @@ def _aplicar_nome_completo(payload: Dict[str, Any], dados: Dict[str, Any]) -> No
     if not nc:
         return
     partes = nc.split(None, 1)
-    payload["FirstName"] = partes[0][:40]
-    payload["LastName"] = (partes[1] if len(partes) > 1 else partes[0])[:80]
+    payload["FirstName"] = partes[0]
+    payload["LastName"] = partes[1] if len(partes) > 1 else partes[0]
 
 
 def _soql_escape(s: str) -> str:
@@ -2019,8 +2038,9 @@ def _ajustar_payload_creci_conforme_possui(payload: Dict[str, Any], dados: Dict[
         if chk:
             payload[chk] = True
         return
-    for k in SF_CAMPOS_CRECI_OMITIR_SEM_POSSE:
-        payload.pop(k, None)
+    if not _formulario_exibe_creci_detalhado(dados):
+        for k in SF_CAMPOS_CRECI_OMITIR_SEM_POSSE:
+            payload.pop(k, None)
     if chk:
         payload[chk] = False
 
@@ -2051,32 +2071,8 @@ def _data_hoje_iso_brasilia() -> str:
 
 
 def _aplicar_defaults_creci_campos_vazios_salesforce(payload: Dict[str, Any], dados: Dict[str, Any]) -> None:
-    """
-    Se as validation rules do org exigem CRECI/validade/matrícula/responsável e o valor não veio do formulário,
-    preenche: CRECI = 1, datas = hoje (Brasília), nome do responsável = Lucas Maia.
-    """
-    hoje_iso = _data_hoje_iso_brasilia()
-    act = _atividade_sf_norm(dados)
-    est = act in _SF_ATIVIDADE_EXIGE_DADOS_ESTAGIARIO or _status_creci_em_estagio(dados)
-
-    if act == "Corretor":
-        if _campo_creci_numero_sf_vazio_no_payload(payload.get("CRECI__c")):
-            payload["CRECI__c"] = DEFAULT_CRECI_NUMERO_FALLBACK
-        if _campo_data_sf_vazio_no_payload(payload.get("Validade_CRECI__c")):
-            payload["Validade_CRECI__c"] = hoje_iso
-
-    if act in _SF_ATIVIDADE_EXIGE_VALIDADE_CRECI and act != "Corretor":
-        if _campo_data_sf_vazio_no_payload(payload.get("Validade_CRECI__c")):
-            payload["Validade_CRECI__c"] = hoje_iso
-
-    if est:
-        if _campo_data_sf_vazio_no_payload(payload.get("Validade_CRECI__c")):
-            payload["Validade_CRECI__c"] = hoje_iso
-        if _campo_data_sf_vazio_no_payload(payload.get("Data_Matricula_TTI__c")):
-            payload["Data_Matricula_TTI__c"] = hoje_iso
-        nome = payload.get("Nome_do_Responsavel__c")
-        if nome is None or (isinstance(nome, str) and not nome.strip()):
-            payload["Nome_do_Responsavel__c"] = DEFAULT_NOME_RESPONSAVEL_CRECI_FALLBACK
+    """Não inventa CRECI, validade, matrícula ou responsável; regras exigem dados informados."""
+    return
 
 
 def _aplicar_enriquecimentos_payload_sf(
@@ -2167,7 +2163,8 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if raw is None or raw == "":
                 continue
             try:
-                payload[sf] = float(str(raw).replace(",", "."))
+                n = numero(raw)
+                payload[sf] = int(n) if n == n.to_integral_value() else float(n)
             except ValueError:
                 avisos.append(f"{c['label']}: número inválido — omitido.")
             continue
@@ -2268,7 +2265,7 @@ def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             continue
 
         if key == "nome_conjuge" and sf == "Nome_do_Conjuge__c":
-            s = _truncar_texto_sf(str(raw).strip() if raw is not None else "", SF_NOME_CONJUGE_MAX)
+            s = str(raw).strip() if raw is not None else ""
             if s:
                 payload[sf] = s
             continue
@@ -2356,11 +2353,11 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     primeiro = nc.split(None, 1)[0] if nc else ""
     suf = _suffix_regional_apelido(out)
     out["apelido"] = f"{primeiro}_{suf}01" if primeiro else ""
-    hoje = date.today().strftime("%d/%m/%Y")
+    hoje = datetime.strptime(_data_hoje_iso_brasilia(), "%Y-%m-%d").strftime("%d/%m/%Y")
     out["data_entrevista"] = hoje
     out["data_contrato"] = hoje
     out["data_credenciamento"] = hoje
-    if (str(out.get("possui_creci") or "").strip()) != "Sim":
+    if not _formulario_exibe_creci_detalhado(out):
         for k in CAMPOS_CRECI_DETALHES:
             if k in out:
                 del out[k]
@@ -2638,7 +2635,7 @@ def _sanear_dados_planilha_import(dados: Dict[str, Any]) -> Dict[str, Any]:
 
     ag = re.sub(r"\D", "", str(out.get("agencia_bancaria") or ""))
     if len(ag) > SF_AGENCIA_BANCARIA_MAX:
-        out["agencia_bancaria"] = ag[:SF_AGENCIA_BANCARIA_MAX]
+        out["agencia_bancaria"] = ag
 
     if _norm_picklist(out.get("sexo")) not in ("Masculino", "Feminino"):
         out["sexo"] = "Masculino"
@@ -2808,7 +2805,7 @@ def processar_envio_corretor_dados(
         err_sf=err_full or err,
         payload=payload_final or payload,
         deslocamento_colunas=deslocamento_colunas,
-        linhas_extra=[f"resumo={_mensagem_erro_sf_amigavel(err_full or err)}"],
+        linhas_extra=[f"resumo={_mensagem_erro_sf_amigavel(err or err_full)}"],
     )
     return out
 
@@ -3030,7 +3027,7 @@ def _executar_teste_criar_sf_de_linha_planilha(
         sf, payload, dados, avisos, reutilizar_existente=True
     )
     link = _link_contato_para_planilha(cid, avisos) if cid else ""
-    msg_erro = _mensagem_erro_sf_amigavel(_explicacao_erro_record_type_se_aplicavel(err) if err else err)
+    msg_erro = _mensagem_erro_sf_amigavel(err)
 
     if atualizar_status_nesta_linha and row_num_atualizar >= 2:
         try:
@@ -5794,6 +5791,9 @@ def _widget_campo(c: dict):
     label = c["label"]
     help_txt = c.get("help")
     tipo = c["tipo"]
+    max_chars = limite_campo(c)
+    if max_chars:
+        help_txt = ((help_txt + " ") if help_txt else "") + f"Máximo de {max_chars} caracteres."
 
     plain, obrig = _label_obrigatorio_partes(label)
     lv = "collapsed" if obrig else "visible"
@@ -5817,9 +5817,9 @@ def _widget_campo(c: dict):
                 "nomesobrenome.direcionalvendas@gmail.com</span>).</p>",
                 unsafe_allow_html=True,
             )
-        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
+        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv, max_chars=max_chars)
     if tipo == "textarea":
-        return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv)
+        return st.text_area(widget_label, key=sk, help=help_txt, height=88, label_visibility=lv, max_chars=max_chars)
     if tipo == "date":
         atual = _coerce_date_widget_value(st.session_state.get(sk))
         if sk in st.session_state:
@@ -5848,11 +5848,16 @@ def _widget_campo(c: dict):
             label_visibility=lv,
         )
     if tipo == "id":
-        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
+        return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv, max_chars=max_chars)
     if tipo == "select":
         opts = c.get("opcoes") or [""]
         if k == "atividade":
-            opts = list(ATIVIDADE_VENDAS_RJ_OPTS)
+            permitidas_atividade = opcoes_permitidas("Atividade__c", {})
+            opts = [o for o in ATIVIDADE_VENDAS_RJ_OPTS if not o or normalizar_opcao("Atividade__c", o, {}) in permitidas_atividade]
+        if c.get("sf") in esquema_local()["picklists"] and k not in {"atividade", "unidade_negocio", "regional_cadastro", "possui_creci", "gerente_vendas"}:
+            contexto = payload_formulario(_coletar_dados_formulario_completo(), CAMPOS)
+            permitidas = opcoes_permitidas(c["sf"], contexto)
+            opts = [""] + permitidas
         if k == "gerente_vendas":
             reg = str(st.session_state.get("fld_regional_cadastro") or "RJ").strip().upper()
             opts = _opcoes_gerente_vendas(regional=reg)
@@ -5886,6 +5891,9 @@ def _widget_campo(c: dict):
                 (o for o in opts if str(o).strip() == str(cur).strip()),
                 None,
             )
+            if matched is None and c.get("sf") in esquema_local()["picklists"]:
+                convertido = normalizar_opcao(c["sf"], cur, payload_formulario(_coletar_dados_formulario_completo(), CAMPOS))
+                matched = convertido if convertido in opts else None
             if matched is not None:
                 st.session_state[sk] = matched
             else:
@@ -5896,7 +5904,7 @@ def _widget_campo(c: dict):
         return st.multiselect(
             widget_label, options=opts, default=[], key=sk, help=help_txt, label_visibility=lv
         )
-    return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv)
+    return st.text_input(widget_label, key=sk, help=help_txt, label_visibility=lv, max_chars=max_chars)
 
 
 def _coletar_dados_formulario() -> dict[str, Any]:
@@ -7139,7 +7147,7 @@ def _processar_envio_cadastro_impl() -> None:
             else:
                 err_full = _explicacao_erro_record_type_se_aplicavel(err)
                 _registrar_debug_envio("sf_create_erro", err_full)
-                msg_amigavel = _mensagem_erro_sf_amigavel(err_full or err)
+                msg_amigavel = _mensagem_erro_sf_amigavel(err or err_full)
         if payload_utilizado:
             _registrar_debug_envio(
                 "payload_sf_enriquecido",
@@ -7318,7 +7326,7 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss.pop("ficha_sf_retry_wname", None)
     else:
         err_full = _explicacao_erro_record_type_se_aplicavel(err)
-        msg = _mensagem_erro_sf_amigavel(err_full or err)
+        msg = _mensagem_erro_sf_amigavel(err or err_full)
         atualizar_status_envio_salesforce(
             str(sid),
             str(wname),

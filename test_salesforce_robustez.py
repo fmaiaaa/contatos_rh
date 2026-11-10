@@ -20,11 +20,11 @@ class RobustezTests(unittest.TestCase):
         specs = [('LastName','string',80), ('FirstName','string',40), ('CPF__c','string',14),
                  ('OwnerId','reference',18), ('AccountId','reference',18), ('RecordTypeId','reference',18),
                  ('Atividade__c','picklist',255), ('Status_CRECI__c','picklist',255),
-                 ('Conta_Banc_ria__c','string',20), ('Ag_ncia_Banc_ria__c','string',10)]
+                 ('Conta_Banc_ria__c','string',20), ('Ag_ncia_Banc_ria__c','string',4)]
         fields=[dict(name=k,label=k,type=t,length=l,createable=True,nillable=k!='LastName',defaultedOnCreate=False,restrictedPicklist=t=='picklist') for k,t,l in specs]
         next(f for f in fields if f['name']=='Status_CRECI__c')['controllerName']='Atividade__c'
         sf=SimpleNamespace(Contact=Mock(),restful=Mock())
-        sf.Contact.describe.return_value={'fields':fields,'recordTypeInfos':[{'name':'Corretor','recordTypeId':'012CORRETOR','available':True}]}
+        sf.Contact.describe.return_value={'fields':fields,'recordTypeInfos':[{'name':'Corretor','recordTypeId':'012000000000001','available':True}]}
         sf.restful.return_value={'picklistFieldValues':{
             'Atividade__c':{'values':[{'value':'Corretor Parceiro'},{'value':'Corretor'}]},
             'Status_CRECI__c':{'controllerValues':{'Corretor Parceiro':0,'Corretor':1},'values':[{'value':'Definitivo','validFor':[0,1]}]}}}
@@ -49,10 +49,13 @@ class RobustezTests(unittest.TestCase):
 
     def test_schema_limites_reais_e_banco_sem_corte(self):
         avisos=[]
-        p=i.normalizar_payload(self.schema(),{'LastName':'A'*90,'Ag_ncia_Banc_ria__c':'1234567890'},avisos)
+        p=i.normalizar_payload(self.schema(),{'LastName':'A'*80,'Ag_ncia_Banc_ria__c':'1234'},avisos)
         self.assertEqual(len(p['LastName']),80)
-        self.assertEqual(p['Ag_ncia_Banc_ria__c'],'1234567890')
-        self.assertTrue(avisos)
+        self.assertEqual(p['Ag_ncia_Banc_ria__c'],'1234')
+        with self.assertRaisesRegex(ValueError,'máximo de 80'):
+            i.normalizar_payload(self.schema(),{'LastName':'A'*81},avisos)
+        with self.assertRaisesRegex(ValueError,'máximo de 4'):
+            i.normalizar_payload(self.schema(),{'LastName':'Exemplo','Ag_ncia_Banc_ria__c':'12345'},avisos)
         for v in ['alguem1234@example.org','123456789012345678901']:
             with self.assertRaises(ValueError): i.normalizar_payload(self.schema(),{'LastName':'Exemplo','Conta_Banc_ria__c':v},[])
 
@@ -86,7 +89,7 @@ class RobustezTests(unittest.TestCase):
     def test_novo_proprietario_e_integracao(self):
         sf=SimpleNamespace(query=Mock(return_value={'records':[{'Id':'005ATIVO','IsActive':True}]}))
         with patch.object(app,'_aplicar_enriquecimentos_payload_sf'),patch.object(app,'normalizar_payload',side_effect=lambda sf,p,a:p),patch.dict(app.os.environ,{'SALESFORCE_USER':'integracao'}):
-            p=app._preparar_payload_insert_salesforce({'OwnerId':'005ANTIGO','LastName':'Exemplo'},{},sf,[])
+            p=app._preparar_payload_insert_salesforce({'OwnerId':'005ANTIGO','LastName':'Exemplo','CPF__c':CPF,'MobilePhone':'21999999999'},{},sf,[])
         self.assertEqual(p['OwnerId'],'005ATIVO')
 
     def test_owner_inativo_bloqueia_apenas_nova_criacao(self):
