@@ -178,5 +178,66 @@ class IntegracaoTests(unittest.TestCase):
         sh.worksheets.assert_not_called()
 
 
+class CredenciaisSheetsTests(unittest.TestCase):
+    def setUp(self):
+        self.info={'type':'service_account','project_id':'teste','private_key':'PEM\\nLINHA\\n','client_email':'teste@example.org','token_uri':'https://oauth2.googleapis.com/token'}
+
+    def test_formato_connections_gsheets_do_toml(self):
+        config={'connections':{'gsheets':self.info},'salesforce':{'USER':'nao_compartilhar'}}
+        resultado=app._credenciais_de_secrets(config)
+        self.assertEqual(resultado['client_email'],'teste@example.org')
+        self.assertEqual(resultado['private_key'],'PEM\nLINHA\n')
+        self.assertNotIn('salesforce',resultado)
+        self.assertEqual(self.info['private_key'],'PEM\\nLINHA\\n')
+
+    def test_json_legado_e_toml_google_sheets_continuam_aceitos(self):
+        import json
+        for config in [{'google_sheets':{'SERVICE_ACCOUNT_JSON':json.dumps(self.info)}},
+                       {'google_sheets':{'SERVICE_ACCOUNT_JSON':self.info}},
+                       {'google_sheets':self.info}]:
+            with self.subTest(config=list(config)):
+                self.assertEqual(app._credenciais_de_secrets(config)['type'],'service_account')
+
+    def test_secrets_streamlit_sao_mapping_e_nao_dict(self):
+        from collections import UserDict
+        config=UserDict(connections=UserDict(gsheets=UserDict(self.info)))
+        self.assertEqual(app._credenciais_de_secrets(config)['client_email'],'teste@example.org')
+
+    def test_incompletas_nao_viram_credenciais_nem_vazam_segredos(self):
+        for config in [None,{}, {'connections':{'gsheets':{'private_key':'SEGREDO'}}},
+                       {'google_sheets':{'SERVICE_ACCOUNT_JSON':'JSON incorreto SEGREDO'}},
+                       {'connections':{'gsheets':dict(self.info,private_key='')}}]:
+            self.assertIsNone(app._credenciais_de_secrets(config))
+
+    def test_json_vazio_nao_impede_connections_valida(self):
+        config={'google_sheets':{'SERVICE_ACCOUNT_JSON':'{}'},'connections':{'gsheets':self.info}}
+        self.assertEqual(app._credenciais_de_secrets(config)['client_email'],'teste@example.org')
+
+class DiagnosticoSheetsTests(unittest.TestCase):
+    def test_erros_nao_mostram_segredos_e_indicam_causa(self):
+        from google.auth.exceptions import RefreshError
+        from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
+        cases=[(PermissionError('CHAVE_SECRETA'),'GSHEETS_AUTH'),
+               (RefreshError('CHAVE_SECRETA'),'GSHEETS_AUTH'),
+               (SpreadsheetNotFound('CHAVE_SECRETA'),'GSHEETS_NOT_FOUND'),
+               (WorksheetNotFound('CHAVE_SECRETA'),'GSHEETS_WORKSHEET'),
+               (ValueError('CHAVE_SECRETA'),'GSHEETS_CONFIGURATION'),
+               (app.requests.Timeout('CHAVE_SECRETA'),'GSHEETS_NETWORK'),
+               (RuntimeError('CHAVE_SECRETA'),'GSHEETS_WRITE')]
+        for error,code in cases:
+            with self.subTest(code=code):
+                result=app._mensagem_erro_planilha(error)
+                self.assertIn(code,result)
+                self.assertNotIn('CHAVE_SECRETA',result)
+
+    def test_erros_http_google_tem_diagnostico(self):
+        from gspread.exceptions import APIError
+        for status,code in [(403,'GSHEETS_PERMISSION'),(429,'GSHEETS_QUOTA'),(503,'GSHEETS_UNAVAILABLE'),(400,'GSHEETS_API')]:
+            response=Mock(status_code=status)
+            response.json.return_value={'error':{'code':status,'message':'CHAVE_SECRETA','status':'ERRO'}}
+            message=app._mensagem_erro_planilha(APIError(response))
+            self.assertIn(code,message)
+            self.assertNotIn('CHAVE_SECRETA',message)
+
 if __name__ == '__main__':
     unittest.main()

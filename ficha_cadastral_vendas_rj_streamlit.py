@@ -3593,30 +3593,35 @@ def _ids_planilha_modo_teste(gs: Dict[str, Any]) -> Tuple[str, str]:
 
 
 def _credenciais_de_secrets(st_secrets: Any) -> Optional[Dict[str, Any]]:
-    """Lê JSON da conta de serviço a partir de st.secrets['google_sheets']. Nunca propaga exceção."""
+    """Aceita conta de serviço em JSON ou TOML, inclusive [connections.gsheets]."""
     try:
         if st_secrets is None:
             return None
-        gs = (
-            st_secrets.get("google_sheets")
-            if hasattr(st_secrets, "get")
-            else st_secrets["google_sheets"]
-        )
-    except (KeyError, TypeError, AttributeError):
-        return None
-    try:
-        if not gs:
-            return None
-        raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
-        if not raw:
-            return None
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            return _parse_json_conta_servico_google(raw)
-        return None
+        gs = st_secrets.get("google_sheets", {})
+        connections = st_secrets.get("connections", {})
+        sources = []
+        if gs:
+            raw = gs.get("SERVICE_ACCOUNT_JSON") or gs.get("service_account_json")
+            if raw:
+                sources.append(_parse_json_conta_servico_google(raw) if isinstance(raw, str) else dict(raw))
+            sources.append(dict(gs))
+        if connections:
+            nested = connections.get("gsheets")
+            if nested:
+                sources.append(dict(nested))
+        for source in sources:
+            if not isinstance(source, dict) or source.get("type") != "service_account":
+                continue
+            if not all(isinstance(source.get(k), str) and source[k].strip() for k in ("private_key", "client_email", "token_uri")):
+                continue
+            out = dict(source)
+            # Também aceita a chave PEM copiada com sequências literais de nova linha.
+            out["private_key"] = out["private_key"].replace("\\n", "\n")
+            return out
     except Exception:
+        # Secrets ausentes ou malformados não expõem dados de autenticação na interface.
         return None
+    return None
 
 
 def _credenciais_google_sheets(st_secrets: Any = None) -> Optional[Dict[str, Any]]:
@@ -6931,6 +6936,32 @@ def _ativar_cenario_teste_design() -> None:
     ss["sf_avisos"] = []
 
 
+def _mensagem_erro_planilha(erro: Exception) -> str:
+    """Diagnóstico útil sem expor chaves, tokens ou conteúdo da resposta HTTP."""
+    from gspread.exceptions import APIError, SpreadsheetNotFound, WorksheetNotFound
+    from google.auth.exceptions import RefreshError
+    if isinstance(erro, SpreadsheetNotFound):
+        return "A planilha de cadastro não foi encontrada ou não está compartilhada com a conta de serviço. Informe o suporte (GSHEETS_NOT_FOUND)."
+    if isinstance(erro, (PermissionError, RefreshError)):
+        return "O acesso à planilha foi recusado. O suporte precisa verificar as credenciais e o compartilhamento (GSHEETS_AUTH)."
+    if isinstance(erro, WorksheetNotFound):
+        return "A aba de cadastro não foi encontrada e não pôde ser criada. Informe o suporte (GSHEETS_WORKSHEET)."
+    if isinstance(erro, APIError):
+        code = getattr(erro, 'code', None) or getattr(getattr(erro, 'response', None), 'status_code', None)
+        if code in (401, 403):
+            return "A conta de serviço não tem acesso à planilha. O suporte precisa conferir as permissões (GSHEETS_PERMISSION)."
+        if code == 429:
+            return "O limite temporário de acesso à planilha foi atingido. Aguarde alguns minutos e tente novamente (GSHEETS_QUOTA)."
+        if isinstance(code, int) and code >= 500:
+            return "O Google Sheets está temporariamente indisponível. Tente novamente em alguns minutos (GSHEETS_UNAVAILABLE)."
+        return "O Google Sheets recusou a gravação. Informe o suporte (GSHEETS_API)."
+    if isinstance(erro, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return "A conexão com a planilha foi interrompida. Tente novamente; a linha já confirmada será reaproveitada (GSHEETS_NETWORK)."
+    if isinstance(erro, ValueError):
+        return "A configuração ou o cabeçalho da planilha precisa de revisão pelo suporte (GSHEETS_CONFIGURATION)."
+    return "Não foi possível confirmar a gravação na planilha. Informe o suporte (GSHEETS_WRITE)."
+
+
 def _gravar_cadastro_planilha(
     linha: List[str],
     cab: List[str],
@@ -6974,20 +7005,7 @@ def _gravar_cadastro_planilha(
         st.session_state.pop("ficha_linha_pendente", None)
         return row_n
     except Exception as e:
-        erro_txt = str(e or "").strip()
-        erro_low = erro_txt.lower()
-        msg = FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO
-        if "spreadsheet" in erro_low and "not found" in erro_low:
-            msg = (
-                "Não foi possível concluir o envio porque a planilha configurada não foi encontrada "
-                "ou não está acessível para a conta de serviço."
-            )
-        elif "worksheet" in erro_low and "not found" in erro_low:
-            msg = (
-                "Não foi possível concluir o envio porque a aba configurada na planilha não foi encontrada."
-            )
-        elif "permission" in erro_low or "forbidden" in erro_low or "insufficient" in erro_low:
-            msg = "Não foi possível concluir o envio por falta de permissão na planilha."
+        msg = _mensagem_erro_planilha(e)
         _LOG_FICHA.exception(
             "Ficha cadastro: falha ao gravar linha na planilha. planilha_id=%r aba=%r",
             sid,
@@ -7054,13 +7072,13 @@ def _processar_envio_cadastro_impl() -> None:
 
     creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
-        _registrar_debug_envio("erro_google_credentials", "SERVICE_ACCOUNT_JSON ausente/inválido.")
+        _registrar_debug_envio("erro_google_credentials", "Conta de serviço Google ausente/inválida em google_sheets ou connections.gsheets.")
         _LOG_FICHA.error(
             "Ficha cadastro: envio indisponível (mensagem genérica ao usuário) — "
             "credenciais Google ausentes ou SERVICE_ACCOUNT_JSON inválido/ausente em "
-            "st.secrets['google_sheets']; verifique Secrets no deploy."
+            "st.secrets['google_sheets'] ou ['connections']['gsheets']; verifique Secrets no deploy."
         )
-        ss["ficha_erros_envio"] = {"kind": "text", "text": FICHA_MSG_ENVIO_INDISPONIVEL_GENERICO}
+        ss["ficha_erros_envio"] = {"kind": "text", "text": "Não foi possível iniciar o envio: a configuração de acesso à planilha está ausente ou inválida. Informe o suporte responsável pelo cadastro."}
         return
 
     gs = {}

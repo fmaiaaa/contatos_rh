@@ -96,3 +96,26 @@ Foram também realizadas autenticação e operações reais de recuperação no 
 credenciais locais autorizadas; nenhuma credencial, planilha de pessoas ou relatório individual
 é incluído no repositório. O teste automatizado não substitui um teste do formulário no navegador
 de produção após o deploy do Streamlit.
+
+
+## Credenciais Google Sheets em TOML
+
+O carregamento de Secrets aceita agora a seção nativa `[connections.gsheets]`,
+com os campos da conta de serviço diretamente em TOML, além de `[google_sheets]`
+com campos diretos ou `SERVICE_ACCOUNT_JSON` em string/dicionário. A chave PEM
+com sequências literais de nova linha é normalizada sem alterar os Secrets originais.
+Credenciais incompletas não iniciam o envio. Não é necessário migrar uma seção
+`[connections.gsheets]` válida para JSON.
+
+Antes, esse formato era ignorado, provocando a mensagem genérica ao enviar,
+antes mesmo de chamar Salesforce ou Sheets. A regressão foi reproduzida com o
+arquivo local autorizado: o parser anterior retornou None; o novo reconheceu a
+conta e autenticou de verdade na planilha, lendo os 132 cabeçalhos de
+Corretores Nova Base, sem escrever registros no teste.
+
+Falhas de gravação agora distinguem acesso recusado, planilha/aba ausente,
+cota, indisponibilidade, rede e configuração. As mensagens incluem um código
+GSHEETS para o suporte, sem mostrar credenciais ou a resposta HTTP bruta.
+Credenciais ausentes/inválidas também têm mensagem específica.
+Validação da correção: 45 testes isolados aprovados, incluindo compatibilidade
+TOML/JSON, Secrets como Mapping, PEM, mensagens seguras e códigos de erro HTTP.
