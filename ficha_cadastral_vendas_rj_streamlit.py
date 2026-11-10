@@ -3976,6 +3976,15 @@ def _indice_coluna_link_contato(headers: List[str]) -> Optional[int]:
     return None
 
 
+def _fixar_dimensoes_aba_corretores(ws: Any) -> None:
+    """Dimensões fixas em toda a grade, sem ajuste automático pelo conteúdo."""
+    ws.spreadsheet.batch_update({"requests": [
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "ROWS"}, "properties": {"pixelSize": 32}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS"}, "properties": {"pixelSize": 180}, "fields": "pixelSize"}},
+        {"repeatCell": {"range": {"sheetId": ws.id}, "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}}, "fields": "userEnteredFormat.wrapStrategy"}},
+    ]})
+
+
 def _formatar_visual_aba_corretores(ws: Any, cabecalho: List[str]) -> None:
     """Linha 1: cores por bloco (sistema | formulário+automáticos | API SF | controle), bordas e congelamento."""
     try:
@@ -4129,8 +4138,13 @@ def anexar_linha(
         except Exception:
             pass
 
-    ws.append_row(linha, value_input_option="USER_ENTERED")
-    return len(ws.get_all_values())
+    resultado = ws.append_row(linha, value_input_option="RAW")
+    intervalo = (resultado.get("updates") or {}).get("updatedRange", "")
+    match = re.search(r"![A-Z]+(\d+):[A-Z]+\d+$", intervalo)
+    if not match:
+        raise RuntimeError("Google Sheets não confirmou a linha gravada.")
+    _fixar_dimensoes_aba_corretores(ws)
+    return int(match.group(1))
 
 
 def atualizar_status_envio_salesforce(
@@ -4152,7 +4166,7 @@ def atualizar_status_envio_salesforce(
     ws = _resolver_worksheet_planilha(sh, worksheet_name)
     headers = ws.row_values(1)
     if not headers:
-        return
+        raise RuntimeError("Planilha sem cabeçalho; vínculo não confirmado.")
     ncols = len(headers)
     row_vals = _linha_planilha_padded(ws, row_1based, ncols)
 
@@ -4160,7 +4174,11 @@ def atualizar_status_envio_salesforce(
     if idx_link is not None and idx_link < len(row_vals):
         row_vals[idx_link] = link or ""
 
+    if idx_link is None:
+        raise RuntimeError("Coluna do vínculo Salesforce ausente na planilha.")
     ie = _indice_coluna_por_cabecalho(headers, "Envio?")
+    if ie is None:
+        raise RuntimeError("Coluna de status Salesforce ausente na planilha.")
     if ie is not None and ie < len(row_vals):
         row_vals[ie] = envio
     il = _indice_coluna_por_cabecalho(headers, "Log / erro")
@@ -4177,8 +4195,12 @@ def atualizar_status_envio_salesforce(
     ws.update(
         f"A{row_1based}:{end_col}{row_1based}",
         [row_vals],
-        value_input_option="USER_ENTERED",
+        value_input_option="RAW",
     )
+    confirmado = _linha_planilha_padded(ws, row_1based, ncols)
+    if confirmado[ie] != envio or confirmado[idx_link] != (link or ""):
+        raise RuntimeError("Google Sheets não confirmou o status e o vínculo Salesforce.")
+    _fixar_dimensoes_aba_corretores(ws)
 
 
 def remover_linha_worksheet_google(
@@ -4923,6 +4945,18 @@ def aplicar_estilo():
             --secondary-background-color: {COR_CAMPO_FORM_BG} !important;
             --text-color: #1f2937 !important;
             color-scheme: light !important;
+        }}
+        :root, html, body {{ color-scheme: only light !important; }}
+        [data-baseweb="popover"], [data-baseweb="menu"],
+        [data-baseweb="calendar"], [role="listbox"],
+        [data-testid="stDialog"] [role="dialog"] {{
+            color-scheme: only light !important;
+            background-color: #ffffff !important;
+            color: #1f2937 !important;
+        }}
+        [role="option"], [data-baseweb="calendar"] button {{
+            color: #1f2937 !important;
+            background-color: #ffffff !important;
         }}
         :root {{
             --st-base: #f6f8fb !important;
@@ -5685,13 +5719,8 @@ def _regional_cadastro_atual(*, dados: Optional[Dict[str, Any]] = None) -> str:
 
 def _regional_cadastro_enviada_rj() -> bool:
     """True se deve exibir mapa/vídeo/simulador RJ (não exibir para cadastro MG)."""
-    ss = st.session_state
-    dados = ss.get("ficha_dados_enviados")
-    if isinstance(dados, dict) and _regional_eh_mg(dados):
-        return False
-    if _regional_eh_mg(None):
-        return False
-    return True
+    dados = st.session_state.get("ficha_dados_enviados")
+    return isinstance(dados, dict) and str(dados.get("regional_cadastro") or "").strip().upper() == "RJ"
 
 
 def _opcoes_gerente_vendas_rj() -> list[str]:
@@ -6845,7 +6874,7 @@ def _limpar_session_formulario():
 def _definir_sucesso_pos_cadastro() -> None:
     """Marca cadastro concluído e reabre o popup de boas-vindas (antes de «Concluir»)."""
     ss = st.session_state
-    ss["ficha_sucesso"] = True
+    ss["ficha_sucesso"] = bool(ss.get("sf_contact_id") and not ss.get("sf_erro"))
     ss["ficha_boas_vindas_popup_concluido"] = False
 
 
@@ -6994,6 +7023,10 @@ def _processar_envio_cadastro() -> None:
     ss["ficha_envio_em_andamento"] = True
     try:
         _processar_envio_cadastro_impl()
+    except Exception:
+        _LOG_FICHA.exception("Falha no envio ou na confirmação das integrações da ficha.")
+        ss["ficha_sucesso"] = False
+        ss["ficha_erros_envio"] = {"kind": "text", "text": "Não foi possível confirmar o cadastro nas integrações. Tente novamente."}
     finally:
         ss.pop("ficha_envio_em_andamento", None)
 
@@ -7025,6 +7058,14 @@ def _processar_envio_cadastro_impl() -> None:
         return
 
     ss.pop("ficha_modo_teste_design", None)
+
+    if ss.get("ficha_sf_retry_row") and dados == ss.get("ficha_dados_enviados"):
+        _retentar_salesforce_ultimo_envio()
+        if ss.get("ficha_sucesso"):
+            st.rerun()
+        else:
+            ss["ficha_erros_envio"] = {"kind": "text", "text": "O cadastro ainda não foi concluído no Salesforce. " + (ss.get("sf_erro") or "Tente novamente.")}
+        return
 
     creds = _credenciais_google_sheets(st.secrets if hasattr(st, "secrets") else None)
     if not creds:
@@ -7159,7 +7200,11 @@ def _processar_envio_cadastro_impl() -> None:
     ss["sf_avisos"] = avisos
     if avisos:
         _registrar_debug_envio("avisos_fluxo", " | ".join(str(x) for x in avisos))
-    _tentar_enviar_email_boas_vindas(dados, cid if cid else None)
+    if not cid:
+        ss["ficha_sucesso"] = False
+        ss["ficha_erros_envio"] = {"kind": "text", "text": "Seus dados foram salvos na planilha, mas o cadastro ainda não foi concluído no Salesforce. " + (ss.get("sf_erro") or "Tente novamente.")}
+        return
+    _tentar_enviar_email_boas_vindas(dados, cid)
     _definir_sucesso_pos_cadastro()
     st.rerun()
 
@@ -7283,7 +7328,10 @@ def _retentar_salesforce_ultimo_envio() -> None:
         ss["sf_erro"] = msg
 
     ss["sf_avisos"] = avisos
-    _tentar_enviar_email_boas_vindas(dados_c, cid if cid else None)
+    if cid:
+        ss.pop("ficha_erros_envio", None)
+        _tentar_enviar_email_boas_vindas(dados_c, cid)
+        _definir_sucesso_pos_cadastro()
 
 
 def gerar_workbook_ficha_cadastro_bytes(dados: Dict[str, Any]) -> bytes:

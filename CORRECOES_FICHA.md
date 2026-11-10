@@ -24,3 +24,22 @@ Os testes usam clientes simulados e não alteram dados reais.
 
 Esta alteração vale para novos envios e reprocessamentos pela ficha. Não executa
 migração em massa dos contatos históricos diretamente no Salesforce.
+
+## Confirmação, planilha e apresentação
+
+O cadastro só abre a conclusão depois do sucesso Salesforce e da gravação na
+planilha configurada em `google_sheets.SPREADSHEET_ID` / `WORKSHEET_NAME`.
+Falhas Salesforce ficam registradas na planilha sem conclusão ou e-mail de boas-vindas.
+Ao reenviar os mesmos dados, a aplicação atualiza a linha de falha existente.
+O número da linha é obtido da resposta de append da API, evitando conflitos entre
+envios simultâneos. Status e vínculo são confirmados por leitura após a escrita.
+Valores são escritos como RAW para preservar zeros iniciais e texto literal.
+
+Após gravar, toda a grade da aba Corretores recebe altura de 32 px, largura de
+180 px e texto com CLIP, sem crescimento conforme o conteúdo. O conteúdo integral
+permanece na célula. A formatação é aplicada também às linhas já existentes.
+
+Somente a regional de cadastro RJ explicitamente salva no envio abre vídeos/mapa;
+MG e regional ausente não recebem essa tela, independentemente da conta Salesforce.
+O tema padrão é claro em `.streamlit/config.toml`, com CSS claro também nos menus,
+calendários e popups, independentemente da preferência do sistema operacional.
