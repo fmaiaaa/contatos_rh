@@ -4550,23 +4550,16 @@ BASE_URL_CONTACT_VIEW = "https://direcional.lightning.force.com/lightning/r/Cont
 
 # Recursos exibidos no popup pós-cadastro (corretor)
 URL_LINKTREE_MARKETING = "https://linktr.ee/comercialdirecionalrj"
-URL_FORM_SIMULADOR = "https://forms.gle/NLibApxbaimEbdBEA"
-URL_YOUTUBE_SIMULADOR = "https://youtu.be/dE42s0g7K-c"
-URL_YOUTUBE_SIMULADOR_EMBED = "https://www.youtube.com/embed/dE42s0g7K-c"
+URL_YOUTUBE_SIMULADOR = "https://www.youtube.com/watch?v=682g45gH_oc"
+URL_YOUTUBE_SIMULADOR_EMBED = "https://www.youtube.com/embed/682g45gH_oc"
 # Vídeo de boas-vindas do RH (primeiro passo no popup após o cadastro).
 URL_YOUTUBE_BOAS_VINDAS_RH = "https://youtu.be/7cm3wFnoCSY"
 URL_YOUTUBE_BOAS_VINDAS_RH_EMBED = "https://www.youtube.com/embed/7cm3wFnoCSY"
-URL_DIRI_ACADEMY = "https://diriacademy.skore.io/login"
-URL_SALESFORCE_VENDAS = "https://direcional.my.site.com/vendas"
 URL_WHATSAPP_EQUIPE = "https://chat.whatsapp.com/KnZg4Zax3Z20viB7XEWvmo"
 
 # Mesmos links do popup — reutilizados no e-mail automático de boas-vindas.
 LINKS_POS_CADASTRO: list[tuple[str, str]] = [
     ("Materiais de marketing (Linktree)", URL_LINKTREE_MARKETING),
-    ("Pedir acesso ao simulador de negociação", URL_FORM_SIMULADOR),
-    ("Vídeo — como usar o simulador (YouTube)", URL_YOUTUBE_SIMULADOR),
-    ("Treinamentos — Diri Academy", URL_DIRI_ACADEMY),
-    ("Salesforce (portal de vendas)", URL_SALESFORCE_VENDAS),
     ("Entrar no grupo — WhatsApp", URL_WHATSAPP_EQUIPE),
 ]
 
@@ -5276,6 +5269,19 @@ def aplicar_estilo():
             color: #ffffff !important;
             border: none !important;
             font-weight: 700 !important;
+        }}
+        /* Materiais de marketing: azul, inclusive no popup. */
+        a[href="{URL_LINKTREE_MARKETING}"] {{
+            background: {COR_AZUL_ESC} !important;
+            color: #ffffff !important;
+            border: 1px solid {COR_AZUL_ESC} !important;
+            border-radius: 12px !important;
+            font-weight: 600 !important;
+            text-decoration: none !important;
+        }}
+        a[href="{URL_LINKTREE_MARKETING}"]:hover {{
+            filter: brightness(1.12);
+            color: #ffffff !important;
         }}
         /* Link botão — WhatsApp (verde marca #25D366) */
         a[href*="whatsapp.com"],
@@ -7411,21 +7417,6 @@ def _render_recursos_pos_cadastro() -> None:
     st.link_button(
         "Materiais de marketing (Linktree)",
         URL_LINKTREE_MARKETING,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Pedir acesso ao simulador de negociação",
-        URL_FORM_SIMULADOR,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Treinamentos — Diri Academy",
-        URL_DIRI_ACADEMY,
-        use_container_width=True,
-    )
-    st.link_button(
-        "Salesforce (portal de vendas)",
-        URL_SALESFORCE_VENDAS,
         use_container_width=True,
     )
     st.link_button(
