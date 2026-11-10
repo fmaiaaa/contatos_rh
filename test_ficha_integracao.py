@@ -109,7 +109,7 @@ class IntegracaoTests(unittest.TestCase):
             with self.subTest(cid=cid, linha=linha), ExitStack() as stack:
                 state = {'fld_lgpd_ficha': True}
                 stack.enter_context(patch.object(app.st, 'session_state', state))
-                stack.enter_context(patch.object(app.st, 'secrets', {'google_sheets': {'SPREADSHEET_ID': 'associada'}}))
+                stack.enter_context(patch.object(app.st, 'secrets', {'google_sheets': {'SPREADSHEET_ID': 'associada', 'WORKSHEET_NAME': 'Antiga'}}))
                 stack.enter_context(patch.object(app.st, 'caption'))
                 stack.enter_context(patch.object(app.st, 'rerun'))
                 funcs = {
@@ -131,6 +131,7 @@ class IntegracaoTests(unittest.TestCase):
                 self.assertEqual(bool(state.get('ficha_sucesso')), esperado)
                 self.assertEqual(email.called, esperado)
                 self.assertEqual(mocks['_gravar_cadastro_planilha'].call_args.args[2], 'associada')
+                self.assertEqual(mocks['_gravar_cadastro_planilha'].call_args.args[3], 'Corretores Nova Base')
 
     def test_status_na_planilha_deve_ser_confirmado_por_leitura(self):
         ws = Mock()
@@ -138,6 +139,39 @@ class IntegracaoTests(unittest.TestCase):
         with patch.object(app, '_cliente_gspread'), patch.object(app, '_resolver_worksheet_planilha', return_value=ws):
             with self.assertRaisesRegex(RuntimeError, 'não confirmou'):
                 app.atualizar_status_envio_salesforce('associada', 'Corretores', {}, 42, 'Ok', '', 'https://contato')
+
+    def test_secrets_atualizados_substituem_credenciais_antigas(self):
+        with patch.dict(os.environ, {'SALESFORCE_USER': 'antigo', 'SALESFORCE_PASSWORD': 'antiga', 'SALESFORCE_TOKEN': 'antigo'}):
+            app._aplicar_secrets_sf({'salesforce': {'USER': 'novo', 'PASSWORD': 'nova', 'TOKEN': '', 'DOMAIN': 'direcional.my'}})
+            self.assertEqual(os.environ['SALESFORCE_USER'], 'novo')
+            self.assertEqual(os.environ['SALESFORCE_PASSWORD'], 'nova')
+            self.assertEqual(os.environ['SALESFORCE_TOKEN'], '')
+            self.assertEqual(os.environ['SALESFORCE_DOMAIN'], 'direcional.my')
+
+    def test_login_usa_dominio_da_organizacao(self):
+        with patch.dict(os.environ, {'SALESFORCE_USER': 'teste', 'SALESFORCE_PASSWORD': 'teste', 'SALESFORCE_DOMAIN': 'https://direcional.my.salesforce.com/'}), patch.object(app, '_SF_SDK_DISPONIVEL', True), patch.object(app, 'Salesforce', return_value=self.sf, create=True) as login:
+            sf, erro = app.conectar_salesforce_diagnostico()
+        self.assertIs(sf, self.sf)
+        self.assertIsNone(erro)
+        self.assertEqual(login.call_args.kwargs['domain'], 'direcional.my')
+
+    def test_aba_nova_criada_sem_usar_primeira_aba(self):
+        from gspread.exceptions import WorksheetNotFound
+        sh = Mock()
+        sh.worksheet.side_effect = WorksheetNotFound('ausente')
+        resultado = app._resolver_worksheet_planilha(sh, app.DEFAULT_WORKSHEET_NAME)
+        self.assertEqual(app.DEFAULT_WORKSHEET_NAME, 'Corretores Nova Base')
+        self.assertIs(resultado, sh.add_worksheet.return_value)
+        self.assertEqual(sh.add_worksheet.call_args.kwargs['title'], 'Corretores Nova Base')
+        sh.worksheets.assert_not_called()
+
+    def test_erro_de_permissao_nao_cria_aba_nem_redireciona(self):
+        sh = Mock()
+        sh.worksheet.side_effect = RuntimeError('sem permissao')
+        with self.assertRaisesRegex(RuntimeError, 'sem permissao'):
+            app._resolver_worksheet_planilha(sh, 'Corretores Nova Base')
+        sh.add_worksheet.assert_not_called()
+        sh.worksheets.assert_not_called()
 
 
 if __name__ == '__main__':

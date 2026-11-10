@@ -59,23 +59,28 @@ def conectar_salesforce_diagnostico() -> Tuple[Any, Optional[str]]:
     token = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
     if not username or not password:
         return None, "SALESFORCE_USER ou SALESFORCE_PASSWORD nao definidos."
+    domain = (os.environ.get("SALESFORCE_DOMAIN") or "direcional.my").strip()
+    domain = domain.removeprefix("https://").removesuffix("/").removesuffix(".salesforce.com")
+    if not re.fullmatch(r"[a-zA-Z0-9.-]+", domain):
+        return None, "Domínio Salesforce inválido nos Secrets (DOMAIN)."
     for tentativa in range(3):
         try:
             sf = Salesforce(
                 username=username,
                 password=password,
                 security_token=token,
-                domain="login",
+                domain=domain,
             )
             return sf, None
         except SalesforceAuthenticationFailed as e:
-            return None, f"Autenticacao recusada pelo Salesforce: {e}"
+            codigo = str(getattr(e, "code", "") or "AUTHENTICATION_FAILED")
+            return None, f"Salesforce recusou a autenticação ({codigo}). Verifique usuário, senha, token e permissão de login por API nos Secrets."
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             if tentativa == 2:
                 return None, f"Falha de rede ao conectar ao Salesforce: {type(e).__name__}"
             time.sleep(tentativa + 1)
         except Exception as e:
-            return None, f"{type(e).__name__}: {e}"
+            return None, f"Falha de conexão Salesforce ({type(e).__name__}). Consulte a configuração de autenticação."
 
 
 def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
@@ -3284,7 +3289,7 @@ def _parse_json_conta_servico_google(s: str) -> Optional[Dict[str, Any]]:
 
 # ID padrão da planilha informada pelo usuário
 DEFAULT_SPREADSHEET_ID = "1_9x4rfHoP2M47qXJENoD3vMLf_7rWUhNjrU8EtESxy8"
-DEFAULT_WORKSHEET_NAME = "Corretores"
+DEFAULT_WORKSHEET_NAME = "Corretores Nova Base"
 # Segunda aba: documentação de valores preenchidos automaticamente (não digitados pelo corretor).
 DEFAULT_VALORES_FIXOS_WORKSHEET = "Valores fixos (automáticos)"
 # Aba de referência: rótulos do formulário × nomes de API Salesforce (criada/atualizada a cada envio).
@@ -3678,21 +3683,17 @@ def _credenciais_google_sheets(st_secrets: Any = None) -> Optional[Dict[str, Any
 
 
 def _resolver_worksheet_planilha(sh: Any, worksheet_name: str) -> Any:
-    """Abre a aba pelo nome; se não existir, usa a primeira aba (gid=0 na URL)."""
-    wn = (worksheet_name or "").strip()
-    if wn:
-        try:
-            return sh.worksheet(wn)
-        except Exception:
-            pass
-    sheets = sh.worksheets()
-    if not sheets:
+    """Abre a aba exata ou a cria, sem redirecionar dados para outra aba."""
+    from gspread.exceptions import WorksheetNotFound
+    wn = (worksheet_name or DEFAULT_WORKSHEET_NAME).strip()
+    try:
+        return sh.worksheet(wn)
+    except WorksheetNotFound:
         return sh.add_worksheet(
-            title=wn or DEFAULT_WORKSHEET_NAME,
+            title=wn,
             rows=1000,
-            cols=30,
+            cols=max(len(cabecalho_planilha()), 30),
         )
-    return sheets[0]
 
 
 def _cliente_gspread(creds_dict: Dict[str, Any]):
@@ -4891,12 +4892,14 @@ def _aplicar_secrets_sf(secrets_dict: Optional[Dict[str, Any]] = None):
             if isinstance(local.get("salesforce"), dict):
                 sec = dict(local["salesforce"])
     try:
-        if sec.get("USER") and not (os.environ.get("SALESFORCE_USER") or "").strip():
-            os.environ["SALESFORCE_USER"] = str(sec["USER"]).strip()
-        if sec.get("PASSWORD") and not (os.environ.get("SALESFORCE_PASSWORD") or "").strip():
-            os.environ["SALESFORCE_PASSWORD"] = str(sec["PASSWORD"]).strip()
-        if sec.get("TOKEN") and not (os.environ.get("SALESFORCE_TOKEN") or "").strip():
-            os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"]).strip()
+        if "USER" in sec:
+            os.environ["SALESFORCE_USER"] = str(sec["USER"] or "").strip()
+        if "PASSWORD" in sec:
+            os.environ["SALESFORCE_PASSWORD"] = str(sec["PASSWORD"] or "").strip()
+        if "TOKEN" in sec:
+            os.environ["SALESFORCE_TOKEN"] = str(sec["TOKEN"] or "").strip()
+        if sec.get("DOMAIN"):
+            os.environ["SALESFORCE_DOMAIN"] = str(sec["DOMAIN"]).strip()
         if not (os.environ.get("SF_RECORD_TYPE_ID") or "").strip():
             os.environ.pop("SF_RECORD_TYPE_ID", None)
             for rt_key in ("RECORD_TYPE_ID", "record_type_id", "RECORD_TYPE_CORRETOR"):
@@ -7091,7 +7094,8 @@ def _processar_envio_cadastro_impl() -> None:
         except Exception:
             gs = {}
     sid = str(gs.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
-    wname = str(gs.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME).strip() or DEFAULT_WORKSHEET_NAME
+    # Destino solicitado: ignora WORKSHEET_NAME legado nos Secrets.
+    wname = DEFAULT_WORKSHEET_NAME
 
     st.caption(
         "Estamos salvando seu cadastro. Pode aguardar nesta tela — em instantes você verá a confirmação."
@@ -7131,7 +7135,7 @@ def _processar_envio_cadastro_impl() -> None:
         sf, diagnostico_sf = conectar_salesforce_diagnostico()
         if not sf:
             _registrar_debug_envio("sf_conexao_falhou", diagnostico_sf or "Falha na autenticação/rede ao conectar no Salesforce.")
-            msg_amigavel = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
+            msg_amigavel = diagnostico_sf or "Falha ao conectar ao Salesforce."
         else:
             cid, err, payload_utilizado = criar_contato_salesforce_preparado(
                 sf, payload, dados, avisos, reutilizar_existente=True
@@ -7281,9 +7285,9 @@ def _retentar_salesforce_ultimo_envio() -> None:
         return
 
     with st.spinner("Só um momento — estamos concluindo o envio."):
-        sf = conectar_salesforce()
+        sf, diagnostico_sf = conectar_salesforce_diagnostico()
     if not sf:
-        msg = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
+        msg = diagnostico_sf or "Falha ao conectar ao Salesforce."
         atualizar_status_envio_salesforce(
             str(sid),
             str(wname),

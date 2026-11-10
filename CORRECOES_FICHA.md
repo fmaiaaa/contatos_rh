@@ -43,3 +43,20 @@ Somente a regional de cadastro RJ explicitamente salva no envio abre vídeos/map
 MG e regional ausente não recebem essa tela, independentemente da conta Salesforce.
 O tema padrão é claro em `.streamlit/config.toml`, com CSS claro também nos menus,
 calendários e popups, independentemente da preferência do sistema operacional.
+
+## Nova base e diagnóstico de login
+
+O fluxo principal grava em **Corretores Nova Base**, na mesma planilha configurada.
+WORKSHEET_NAME antigo nos Secrets não muda esse destino. Se a aba estiver ausente,
+a aplicação cria a aba pelo nome exato. Erros de permissão não redirecionam para a
+primeira aba. Os dados das abas anteriores permanecem preservados.
+
+O login usa por padrão o domínio `direcional.my`; pode ser configurado com
+`[salesforce] DOMAIN = "direcional.my"` (também aceita URL Salesforce completa).
+USER, PASSWORD e TOKEN explícitos nos Secrets substituem os valores antigos do
+ambiente. TOKEN vazio também limpa um token antigo.
+
+Falhas de conexão agora mantêm o diagnóstico da autenticação na mensagem de envio
+e na retentativa. Credenciais inválidas, usuário bloqueado ou login por API recusado
+exigem ajuste no ambiente/na organização Salesforce. Esta alteração não confirma
+uma autenticação real sem as credenciais do deploy.
