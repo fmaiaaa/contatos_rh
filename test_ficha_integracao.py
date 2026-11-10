@@ -39,11 +39,11 @@ class IntegracaoTests(unittest.TestCase):
         with patch.object(app, '_resolver_account_id_por_nome', return_value=None):
             cid, err, _ = app.criar_contato_salesforce_preparado(self.sf, {}, {}, [])
         self.assertIsNone(cid)
-        self.assertIn('Conta obrigatória', err)
+        self.assertIn('Conta obrigatória', str(err))
         self.sf.Contact.create.assert_not_called()
 
     def test_cpf_mascarado_sem_reutilizar_celular_compartilhado(self):
-        self.sf.query.side_effect = [{'records': []}, {'records': [{'Id': self.cid}]}]
+        self.sf.query.return_value = {'records': [{'Id': self.cid}]}
         cid, campo = app._buscar_contact_id_existente(self.sf, {'CPF__c': '12345678901', 'MobilePhone': '21999999999'})
         self.assertEqual((cid, campo), (self.cid, 'CPF'))
         self.assertIn('123.456.789-01', self.sf.query.call_args.args[0])
@@ -51,21 +51,25 @@ class IntegracaoTests(unittest.TestCase):
         self.assertEqual(app._buscar_contact_id_existente(self.sf, {'MobilePhone': '21999999999', 'CRECI__c': 1}), (None, None))
         self.sf.query.assert_not_called()
 
-    def test_duplicata_cpf_retorna_contato_e_atualiza_arvore(self):
-        payload = {'AccountId': self.aid, 'CPF__c': '12345678901'}
-        err = f"DUPLICATES_DETECTED CPF_Contato /Contact/{self.cid}"
-        with patch.object(app, '_preparar_payload_insert_salesforce', return_value=payload), patch.object(app, '_buscar_contact_id_existente', return_value=(None, None)), patch.object(app, 'criar_contato_payload_com_fallback_naturalidade', return_value=(None, err, payload)):
-            cid, erro, _ = app.criar_contato_salesforce_preparado(self.sf, payload, {}, [])
+    def test_existente_nao_altera_arvore_nem_proprietario(self):
+        payload = {'CPF__c': '12345678901', 'LastName': 'Teste'}
+        self.sf.Contact.get.return_value = dict(payload, AccountId='001ANTIGA', OwnerId='005INATIVO')
+        with patch.object(app, '_buscar_contact_id_existente', return_value=(self.cid, 'CPF')), patch.object(app, '_preparar_payload_insert_salesforce') as preparar:
+            cid, erro, usado = app.criar_contato_salesforce_preparado(self.sf, payload, {}, [])
         self.assertEqual(cid, self.cid)
         self.assertIsNone(erro)
-        self.sf.Contact.update.assert_called_once_with(self.cid, {'AccountId': self.aid})
+        self.assertEqual(usado['AccountId'], '001ANTIGA')
+        self.sf.Contact.update.assert_not_called()
+        self.sf.Contact.create.assert_not_called()
+        preparar.assert_not_called()
 
-    def test_falha_ao_mover_existente_nao_indica_sucesso(self):
-        self.sf.Contact.update.side_effect = RuntimeError('sem permissão')
-        with patch.object(app, '_preparar_payload_insert_salesforce', return_value={'AccountId': self.aid}), patch.object(app, '_buscar_contact_id_existente', return_value=(self.cid, 'CPF')):
-            cid, err, _ = app.criar_contato_salesforce_preparado(self.sf, {}, {}, [])
+    def test_identidade_divergente_nao_indica_sucesso(self):
+        self.sf.Contact.get.return_value = {'CPF__c': '12345678901', 'Name': 'Outra Pessoa', 'Email': 'outro@example.org'}
+        with patch.object(app, '_buscar_contact_id_existente', return_value=(self.cid, 'CPF')):
+            cid, err, _ = app.criar_contato_salesforce_preparado(self.sf, {'CPF__c': '12345678901', 'LastName': 'Teste'}, {}, [])
         self.assertIsNone(cid)
-        self.assertIn('sem permissão', err)
+        self.assertIn('identidade divergente', str(err))
+        self.sf.Contact.update.assert_not_called()
 
     def test_token_opcional(self):
         with patch.dict(os.environ, {'SALESFORCE_USER': 'teste', 'SALESFORCE_PASSWORD': 'teste', 'SALESFORCE_TOKEN': ''}):
@@ -93,7 +97,7 @@ class IntegracaoTests(unittest.TestCase):
 
     def test_append_usa_linha_confirmada_pela_api_em_envios_simultaneos(self):
         ws = Mock(id=10)
-        ws.get_all_values.return_value = [['A']]
+        ws.row_values.return_value = ['A']
         ws.append_row.return_value = {'updates': {'updatedRange': "'Corretores'!A42:B42"}}
         sh = Mock()
         cliente = Mock()
@@ -102,7 +106,7 @@ class IntegracaoTests(unittest.TestCase):
             self.assertEqual(app.anexar_linha(['00123'], ['A'], 'planilha-associada', 'Corretores', {}), 42)
         cliente.open_by_key.assert_called_once_with('planilha-associada')
         ws.append_row.assert_called_once_with(['00123'], value_input_option='RAW')
-        self.assertEqual(ws.get_all_values.call_count, 1)
+        ws.get_all_values.assert_not_called()
 
     def test_confirmacao_exige_salesforce_e_planilha(self):
         for cid, linha, esperado in [(None, 42, False), (self.cid, None, False), (self.cid, 42, True)]:

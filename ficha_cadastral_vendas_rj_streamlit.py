@@ -30,6 +30,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
+from salesforce_integracao import (SessaoSalesforceLimitada, normalizar_payload, usuario_integracao,
+    mesma_identidade, ids_duplicados_cpf, apelido_duplicado, resumo_erro, digitos,
+    validar_dados_integracao, alinhar_linha_legada, alinhar_cabecalhos_existentes)
 
 _DIR_APP = Path(__file__).resolve().parent
 
@@ -70,11 +73,12 @@ def conectar_salesforce_diagnostico() -> Tuple[Any, Optional[str]]:
                 password=password,
                 security_token=token,
                 domain=domain,
+                session=SessaoSalesforceLimitada(),
             )
             return sf, None
         except SalesforceAuthenticationFailed as e:
             codigo = str(getattr(e, "code", "") or "AUTHENTICATION_FAILED")
-            return None, f"Salesforce recusou a autenticação ({codigo}). Verifique usuário, senha, token e permissão de login por API nos Secrets."
+            return None, resumo_erro(e) or f"Salesforce recusou a autenticação ({codigo}). Confira os Secrets."
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             if tentativa == 2:
                 return None, f"Falha de rede ao conectar ao Salesforce: {type(e).__name__}"
@@ -89,10 +93,7 @@ def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
         res = sf.Contact.create(limpo)
         return res.get("id"), None
     except Exception as e:
-        err_msg = str(e)
-        err_trace = traceback.format_exc()
-        err_kind = type(e).__name__
-        return None, f"[{err_kind}] {err_msg}\n\n{err_trace}"
+        return None, e
 
 
 def _agora_texto_brasilia() -> str:
@@ -136,27 +137,17 @@ def _garantir_obs_automacao(
 def criar_contato_payload_com_fallback_naturalidade(
     sf: Any, payload: Dict[str, Any], avisos: List[str]
 ) -> tuple[Any, Any, Dict[str, Any]]:
-    """
-    Tenta create padrão; se erro de naturalidade/UF, tenta novamente com Naturalidade__c = Brasília.
-    Não expõe fallback no front: registra apenas aviso técnico.
-    """
-    payload_envio = dict(payload)
-    cid, err = criar_contato_payload(sf, payload_envio)
-    if cid or not _erro_relacionado_naturalidade_uf(err):
-        return cid, err, payload_envio
-
-    payload_retry = dict(payload_envio)
-    payload_retry["Naturalidade__c"] = "Brasília"
-    _garantir_obs_automacao(payload_retry, naturalidade_fallback=True)
-    cid2, err2 = criar_contato_payload(sf, payload_retry)
-    if cid2:
-        avisos.append("Ajuste técnico aplicado no envio ao Salesforce.")
-        return cid2, None, payload_retry
-    return None, err2, payload_retry
+    """Preserva naturalidade informada; erros de validação não alteram dados pessoais."""
+    enviado = dict(payload)
+    cid, erro = criar_contato_payload(sf, enviado)
+    return cid, erro, enviado
 
 
 def _mensagem_erro_sf_amigavel(err: Any) -> str:
     """Resumo curto para a planilha (coluna link / log) — sem stack trace."""
+    detalhe = resumo_erro(err)
+    if detalhe:
+        return detalhe
     txt = (str(err).strip() if err is not None else "") or ""
     u = txt.upper()
     compact = re.sub(r"\s+", "", u)
@@ -298,7 +289,7 @@ def email_corporativo_direcionalvendas_obrigatorio(val: Any) -> bool:
     if not email_contato_formato_valido(val):
         return False
     s = (str(val).strip() if val is not None else "") or ""
-    s_low = s.lower()
+    s_low = s.lower().split("@", 1)[0]
     return any(marker in s_low for marker in _EMAIL_CORP_MARKERS)
 
 
@@ -339,7 +330,7 @@ CONTA_CADASTRO_OBRIGATORIA = "COORDENADORES DV - RJ"
 SF_TEXTO_CURTO_MAX = 255
 SF_OBSERVACOES_MAX = 32000
 SF_CONTA_BANCARIA_MAX = 20
-SF_AGENCIA_BANCARIA_MAX = 4
+SF_AGENCIA_BANCARIA_MAX = 10
 DEFAULT_ESCOLARIDADE_SF = "Ensino Médio"
 
 SF_NOME_CONJUGE_MAX = 50
@@ -1384,13 +1375,13 @@ def _normalizar_unidade_negocio_ui(raw):
 
 
 def _sanear_conta_bancaria(val):
-    s = (str(val).strip() if val is not None else "") or ""
+    s = str(val or "").strip().replace(" ", "")
     if not s:
         return ""
-    if "@" in s:
-        dig = re.sub(r"\D", "", s)
-        return dig[:SF_CONTA_BANCARIA_MAX] if len(dig) >= 4 else ""
-    return re.sub(r"[^\d\-]", "", s.replace(" ", ""))[:SF_CONTA_BANCARIA_MAX]
+    erros = validar_dados_integracao({"conta_bancaria": s})
+    if erros:
+        raise ValueError(erros[0])
+    return s
 
 
 def _atividade_exige_imobiliaria(dados):
@@ -1548,37 +1539,21 @@ def _aplicar_defaults_payload_obrigatorios_sf(payload: Dict[str, Any]) -> None:
 
 
 def _buscar_contact_id_existente(sf: Any, payload: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    """Busca identidade por CPF (com ou sem máscara), ou e-mail quando não há CPF."""
-    candidatos: list[tuple[str, str, str]] = []
-
-    cpf = re.sub(r"\D", "", str(payload.get("CPF__c") or ""))
+    """Consulta CPF com e sem máscara em conjunto; nunca oculta falha de consulta."""
+    cpf = digitos(payload.get("CPF__c"))
     if cpf:
-        candidatos.append(("CPF__c", "CPF", cpf))
-
-    email = str(payload.get("Email") or "").strip().lower()
-    if email:
-        candidatos.append(("Email", "e-mail", email))
-
-    if cpf:
-        candidatos = [("CPF__c", "CPF", cpf)]
-        if len(cpf) == 11:
-            candidatos.append(("CPF__c", "CPF", f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"))
-
-    for sf_field, label, val in candidatos:
-        try:
-            q = (
-                "SELECT Id FROM Contact "
-                f"WHERE {sf_field} = '{_soql_escape(val)}' "
-                "ORDER BY CreatedDate DESC LIMIT 2"
-            )
-            recs = (sf.query(q) or {}).get("records") or []
-            if len(recs) == 1:
-                cid = str(recs[0].get("Id") or "").strip() or None
-                if cid:
-                    return cid, label
-        except Exception:
-            continue
-    return None, None
+        if len(cpf) != 11:
+            raise ValueError("CPF precisa conter 11 dígitos.")
+        mask = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+        condition = f"CPF__c IN ('{cpf}', '{mask}')"
+        label = "CPF"
+    else:
+        return None, None
+    rows = (sf.query("SELECT Id FROM Contact WHERE " + condition + " LIMIT 3") or {}).get("records") or []
+    ids = {r['Id'] for r in rows}
+    if len(ids) > 1:
+        raise ValueError("Mais de um contato possui este CPF. Revisão de identidade necessária.")
+    return (next(iter(ids)), label) if ids else (None, None)
 
 
 def _erro_indica_duplicata_sf(err: Any) -> bool:
@@ -1604,8 +1579,8 @@ def _preparar_payload_insert_salesforce(
     out = dict(payload)
     _aplicar_enriquecimentos_payload_sf(out, dados, sf, avisos)
     _aplicar_defaults_payload_obrigatorios_sf(out)
-    _truncar_payload_salesforce(out)
-    return _filtrar_payload_contact_insert(out)
+    out["OwnerId"] = usuario_integracao(sf, os.environ.get("SALESFORCE_USER", ""))
+    return normalizar_payload(sf, _filtrar_payload_contact_insert(out), avisos)
 
 
 def criar_contato_salesforce_preparado(
@@ -1616,43 +1591,47 @@ def criar_contato_salesforce_preparado(
     *,
     reutilizar_existente: bool = True,
 ) -> tuple[Any, Any, Dict[str, Any]]:
-    """
-    Monta payload final e cria contato, ou vincula identidade existente por CPF/e-mail.
-    """
+    """Reutiliza identidades confirmadas sem alterar contatos; cria com proprietário da integração."""
+    enviado = dict(payload)
+
+    def existente(cid):
+        contato = sf.Contact.get(cid)
+        if not mesma_identidade(contato, payload):
+            raise ValueError("CPF encontrado com identidade divergente. Confira nome e e-mail antes de continuar.")
+        snapshot = _filtrar_payload_contact_insert(dict(contato))
+        avisos.append("Contato já existente confirmado; nenhum dado do Salesforce foi alterado.")
+        return cid, None, snapshot
+
     try:
-        payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+        # A reutilização precede validações exclusivas de uma nova criação.
+        cid, _ = _buscar_contact_id_existente(sf, payload)
+        if cid:
+            return existente(cid)
+        enviado = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+        for tentativa in range(3):
+            cid, erro, enviado = criar_contato_payload_com_fallback_naturalidade(sf, enviado, avisos)
+            if cid:
+                confirmado = sf.Contact.get(cid)
+                if not mesma_identidade(confirmado, enviado):
+                    raise ValueError("Contato criado, mas identidade não confirmada. Reenvie para consultar pelo CPF.")
+                for key in ("AccountId", "OwnerId"):
+                    if str(confirmado.get(key) or '')[:15] != str(enviado.get(key) or '')[:15]:
+                        raise ValueError(f"Contato criado, mas {key} não confirmado. Consulte a integração antes de reenviar.")
+                return cid, None, enviado
+            # Uma resposta perdida pode esconder uma criação já concluída; consultar antes de repetir.
+            existente_id, _ = _buscar_contact_id_existente(sf, enviado)
+            if existente_id:
+                return existente(existente_id)
+            duplicate_ids = ids_duplicados_cpf(erro)
+            if len(duplicate_ids) == 1:
+                return existente(next(iter(duplicate_ids)))
+            if apelido_duplicado(erro) and tentativa < 2:
+                enviado["Apelido__c"] = _proximo_apelido_disponivel(sf, enviado.get("FirstName", ""), _suffix_regional_apelido(dados))
+                continue
+            return None, erro, enviado
     except Exception as exc:
-        return None, f"Falha ao preparar contato: {exc}", dict(payload)
-
-    def _vincular_existente(cid_exist: str, campo: Optional[str]) -> tuple[Any, Any, Dict[str, Any]]:
-        try:
-            sf.Contact.update(cid_exist, {"AccountId": payload_final["AccountId"]})
-        except Exception as exc:
-            return None, f"Falha ao vincular contato existente à conta obrigatória: {exc}", payload_final
-        rotulo = campo or "cadastro duplicado"
-        avisos.append(
-            f"Contato já existia no Salesforce ({rotulo}); planilha atualizada com o vínculo."
-        )
-        return cid_exist, None, payload_final
-
-    if reutilizar_existente:
-        cid_exist, campo = _buscar_contact_id_existente(sf, payload_final)
-        if cid_exist:
-            return _vincular_existente(cid_exist, campo)
-
-    cid, err, payload_usado = criar_contato_payload_com_fallback_naturalidade(
-        sf, payload_final, avisos
-    )
-    if not cid and err and _erro_indica_duplicata_sf(err):
-        # A regra CPF_Contato pode encontrar CPF com máscara ou fora da consulta inicial.
-        ids = set(re.findall(r"/Contact/(003[A-Za-z0-9]{15}|003[A-Za-z0-9]{12})(?![A-Za-z0-9])", str(err)))
-        if len(ids) == 1 and "CPF_Contato" in str(err):
-            cid_exist, campo = ids.pop(), "CPF"
-        else:
-            cid_exist, campo = _buscar_contact_id_existente(sf, payload_usado)
-        if cid_exist:
-            return _vincular_existente(cid_exist, campo)
-    return cid, err, payload_usado
+        return None, exc, enviado
+    return None, ValueError("Não foi possível gerar um apelido exclusivo."), enviado
 
 
 def validar_payload_minimo_salesforce(payload: Dict[str, Any]) -> List[str]:
@@ -1829,7 +1808,7 @@ def _celular_resolvivel(dados: Dict[str, Any]) -> bool:
 
 
 def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
-    erros: List[str] = []
+    erros: List[str] = validar_dados_integracao(dados)
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
             continue
@@ -2131,6 +2110,9 @@ def _aplicar_enriquecimentos_payload_sf(
 
 
 def montar_payload_salesforce(dados: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    problemas = validar_dados_integracao(dados)
+    if problemas:
+        raise ValueError("; ".join(problemas))
     payload: Dict[str, Any] = {}
     rt, rt_aviso = record_type_id_contato_payload_e_aviso()
     if rt:
@@ -2835,7 +2817,8 @@ def parse_linha_planilha_corretor(
     headers: List[str], cells: List[str]
 ) -> Tuple[Dict[str, Any], int, int]:
     """Retorna (dados, deslocamento_colunas, score_qualidade)."""
-    alinhadas, shift = _realinhar_celulas_planilha(headers, cells)
+    alinhadas, diagnostico = alinhar_linha_legada(headers, cells)
+    shift = int(diagnostico.get("api_shift", 0))
     dados = _dados_dict_de_linha_planilha_bruto(headers, alinhadas)
     return dados, shift, _score_qualidade_dados_planilha(dados)
 
@@ -2874,7 +2857,7 @@ def dados_dict_de_linha_planilha(headers: List[str], cells: List[str]) -> Dict[s
     Layout esperado na linha 1: data e link nas duas primeiras colunas; rótulos de `campos_planilha_todos()`;
     colunas de API Salesforce; **Envio?** e **Log / erro**. Só rótulos que casam com `CAMPOS` entram no dict.
     """
-    alinhadas, _ = _realinhar_celulas_planilha(headers, cells)
+    alinhadas, _ = alinhar_linha_legada(headers, cells)
     return _dados_dict_de_linha_planilha_bruto(headers, alinhadas)
 
 
@@ -4117,34 +4100,16 @@ def anexar_linha(
             cols=max(len(cabecalho), 30),
         )
 
-    existing = ws.get_all_values()
-    atualizou_cabecalho = False
-    if not existing or not any(str(cell).strip() for cell in existing[0]):
-        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
-        atualizou_cabecalho = True
-    elif _cabecalho_planilha_desalinhado(list(existing[0]), cabecalho):
-        ws.update("A1", [cabecalho], value_input_option="USER_ENTERED")
-        atualizou_cabecalho = True
-    elif len(existing[0]) < len(cabecalho):
-        pad = list(existing[0]) + [""] * (len(cabecalho) - len(existing[0]))
-        for i, h in enumerate(cabecalho):
-            if i >= len(pad) or not str(pad[i] or "").strip():
-                pad[i] = h
-        ws.update("A1", [pad[: len(cabecalho)]], value_input_option="USER_ENTERED")
-        atualizou_cabecalho = True
-
-    if atualizou_cabecalho:
-        try:
-            _formatar_visual_aba_corretores(ws, cabecalho)
-        except Exception:
-            pass
+    existing = ws.row_values(1)
+    headers_finais, linha = alinhar_cabecalhos_existentes(existing, cabecalho, linha)
+    if headers_finais != existing:
+        ws.update(range_name="A1", values=[headers_finais], value_input_option="RAW")
 
     resultado = ws.append_row(linha, value_input_option="RAW")
     intervalo = (resultado.get("updates") or {}).get("updatedRange", "")
     match = re.search(r"![A-Z]+(\d+):[A-Z]+\d+$", intervalo)
     if not match:
         raise RuntimeError("Google Sheets não confirmou a linha gravada.")
-    _fixar_dimensoes_aba_corretores(ws)
     return int(match.group(1))
 
 
@@ -4194,8 +4159,8 @@ def atualizar_status_envio_salesforce(
 
     end_col = _col_letter(ncols)
     ws.update(
-        f"A{row_1based}:{end_col}{row_1based}",
-        [row_vals],
+        range_name=f"A{row_1based}:{end_col}{row_1based}",
+        values=[row_vals],
         value_input_option="RAW",
     )
     confirmado = _linha_planilha_padded(ws, row_1based, ncols)
@@ -6981,7 +6946,17 @@ def _gravar_cadastro_planilha(
 ) -> Optional[int]:
     """Anexa linha na aba Corretores e preenche status, link (ou mensagem de erro) e payload API."""
     try:
-        row_n = anexar_linha(linha, cab, sid, wname, creds, gs)
+        import hashlib
+        identidade = str((payload_final or {}).get("CPF__c") or "")
+        if not identidade:
+            identidade = hashlib.sha256(json.dumps(linha, ensure_ascii=False, default=str).encode()).hexdigest()
+        chave = (sid, wname, identidade)
+        pendente = st.session_state.get("ficha_linha_pendente")
+        if pendente and tuple(pendente["chave"]) == chave:
+            row_n = pendente["linha"]
+        else:
+            row_n = anexar_linha(linha, cab, sid, wname, creds, gs)
+            st.session_state["ficha_linha_pendente"] = {"chave": chave, "linha": row_n}
         atualizar_status_envio_salesforce(
             sid,
             wname,
@@ -6996,6 +6971,7 @@ def _gravar_cadastro_planilha(
             "planilha_gravada",
             f"linha={row_n} envio={envio} planilha={sid} aba={wname}",
         )
+        st.session_state.pop("ficha_linha_pendente", None)
         return row_n
     except Exception as e:
         erro_txt = str(e or "").strip()

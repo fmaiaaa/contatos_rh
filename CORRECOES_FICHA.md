@@ -60,3 +60,39 @@ Falhas de conexão agora mantêm o diagnóstico da autenticação na mensagem de
 e na retentativa. Credenciais inválidas, usuário bloqueado ou login por API recusado
 exigem ajuste no ambiente/na organização Salesforce. Esta alteração não confirma
 uma autenticação real sem as credenciais do deploy.
+
+
+## Recuperação de falhas e preservação de contatos existentes
+
+A consulta procura CPF com e sem máscara em conjunto e exige identidade compatível
+(nome ou e-mail). CPFs ambíguos ou divergentes bloqueiam o envio. Contatos existentes
+são somente consultados: a aplicação não muda sua árvore, proprietário ou outros dados,
+mesmo quando o proprietário está inativo. Novos contatos recebem a conta
+COORDENADORES DV - RJ e o usuário ativo autenticado da integração como OwnerId.
+
+O módulo salesforce_integracao.py valida os campos graváveis e limites via Contact.describe,
+o tipo de registro Corretor disponível e as picklists por tipo e seus controladores via UI API.
+O CPF é validado pelos dígitos verificadores e enviado sem máscara, conforme verificado na
+organização. Identificadores bancários inválidos ou longos são recusados, sem cortar números
+ou transformar e-mail em conta bancária. Erros mantêm código, campo e mensagem do Salesforce.
+Falhas de naturalidade não substituem a cidade informada por Brasília.
+
+Login e chamadas REST têm timeout de conexão de 10s e leitura de 30s. Uma criação com resposta
+incerta é seguida de consulta por CPF antes de qualquer nova criação. Colisão de apelido
+permite no máximo três tentativas com novo apelido; duplicidade por e-mail não reutiliza outra
+pessoa. A criação é relida para conferir identidade, conta e proprietário antes de confirmar.
+
+O cabeçalho existente no Sheets mantém sua ordem; campos novos são adicionados ao final e a
+linha é mapeada pelo nome de coluna. Cabeçalhos humanos e nomes de API permanecem distintos.
+Não há substituição de cabeçalho sobre dados históricos. Importações legadas alinham os
+blocos pessoal e de API separadamente, exigindo concordância de nome e CPF; ambiguidade é
+recusada. Uma falha de status/formatação após append conserva o número da linha na sessão
+para evitar outro append na retentativa. A confirmação continua exigindo Salesforce e Sheets.
+
+Validação: `python -m unittest discover -p "test_*.py"` executa 38 regressões isoladas,
+incluindo a política de não alterar contatos existentes, respostas perdidas, colisão de apelido,
+conflitos de identidade, picklists, limites, cabeçalhos e falha parcial de persistência.
+Foram também realizadas autenticação e operações reais de recuperação no Salesforce usando
+credenciais locais autorizadas; nenhuma credencial, planilha de pessoas ou relatório individual
+é incluído no repositório. O teste automatizado não substitui um teste do formulário no navegador
+de produção após o deploy do Streamlit.
