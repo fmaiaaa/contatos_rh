@@ -59,21 +59,23 @@ def conectar_salesforce_diagnostico() -> Tuple[Any, Optional[str]]:
     token = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
     if not username or not password:
         return None, "SALESFORCE_USER ou SALESFORCE_PASSWORD nao definidos."
-    try:
-        if token:
+    for tentativa in range(3):
+        try:
             sf = Salesforce(
                 username=username,
                 password=password,
                 security_token=token,
                 domain="login",
             )
-        else:
-            sf = Salesforce(username=username, password=password, domain="login")
-        return sf, None
-    except SalesforceAuthenticationFailed as e:
-        return None, f"Autenticacao recusada pelo Salesforce: {e}"
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+            return sf, None
+        except SalesforceAuthenticationFailed as e:
+            return None, f"Autenticacao recusada pelo Salesforce: {e}"
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if tentativa == 2:
+                return None, f"Falha de rede ao conectar ao Salesforce: {type(e).__name__}"
+            time.sleep(tentativa + 1)
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
 
 
 def criar_contato_payload(sf, payload: dict) -> tuple[Any, Any]:
@@ -327,6 +329,8 @@ def record_type_id_contato_payload() -> str:
 # Ordem de navegação no Streamlit (não altera mapeamento de campos para Salesforce)
 REGIONAL_CADASTRO_OPTS: Tuple[str, ...] = ("RJ", "MG")
 # Limites conservadores de campos texto no Contact (evita STRING_TOO_LONG).
+CONTA_CADASTRO_OBRIGATORIA = "COORDENADORES DV - RJ"
+
 SF_TEXTO_CURTO_MAX = 255
 SF_OBSERVACOES_MAX = 32000
 SF_CONTA_BANCARIA_MAX = 20
@@ -1265,6 +1269,7 @@ CAMPOS_OCULTOS_FORMULARIO: frozenset[str] = frozenset(
         "regional",
         "origem",
         "account_id",
+        "gerente_vendas",
         "owner_id",
         "tipo_corretor",
         "apelido",
@@ -1288,7 +1293,8 @@ def campos_planilha_corretor() -> List[Campo]:
     seen: set[str] = set()
     for sec in SEC_ORDER:
         for c in CAMPOS:
-            if c["sec"] != sec or c["key"] in CAMPOS_OCULTOS_FORMULARIO:
+            # Preserva a coluna histórica para não deslocar dados já gravados.
+            if c["sec"] != sec or (c["key"] in CAMPOS_OCULTOS_FORMULARIO and c["key"] != "gerente_vendas"):
                 continue
             k = c["key"]
             if k in seen:
@@ -1350,6 +1356,10 @@ def _filtrar_payload_contact_insert(payload):
             continue
         if not _SF_API_FIELD_RE.match(ks):
             continue
+        if ks == "Email":
+            v = _sanear_email_contato(v)
+            if not email_contato_formato_valido(v):
+                raise ValueError("E-mail inválido; corrija o endereço antes de enviar ao Salesforce.")
         out[ks] = v
     return out
 
@@ -1533,7 +1543,7 @@ def _aplicar_defaults_payload_obrigatorios_sf(payload: Dict[str, Any]) -> None:
 
 
 def _buscar_contact_id_existente(sf: Any, payload: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    """Busca contato já cadastrado por CPF, e-mail, apelido, celular ou CRECI."""
+    """Busca identidade por CPF (com ou sem máscara), ou e-mail quando não há CPF."""
     candidatos: list[tuple[str, str, str]] = []
 
     cpf = re.sub(r"\D", "", str(payload.get("CPF__c") or ""))
@@ -1544,27 +1554,20 @@ def _buscar_contact_id_existente(sf: Any, payload: Dict[str, Any]) -> tuple[Opti
     if email:
         candidatos.append(("Email", "e-mail", email))
 
-    apelido = str(payload.get("Apelido__c") or "").strip()
-    if apelido:
-        candidatos.append(("Apelido__c", "apelido", apelido))
-
-    mobile = re.sub(r"\D", "", str(payload.get("MobilePhone") or ""))
-    if len(mobile) >= 10:
-        candidatos.append(("MobilePhone", "celular", mobile))
-
-    creci = str(payload.get("CRECI__c") or "").strip()
-    if creci:
-        candidatos.append(("CRECI__c", "CRECI", creci))
+    if cpf:
+        candidatos = [("CPF__c", "CPF", cpf)]
+        if len(cpf) == 11:
+            candidatos.append(("CPF__c", "CPF", f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"))
 
     for sf_field, label, val in candidatos:
         try:
             q = (
                 "SELECT Id FROM Contact "
                 f"WHERE {sf_field} = '{_soql_escape(val)}' "
-                "ORDER BY CreatedDate DESC LIMIT 1"
+                "ORDER BY CreatedDate DESC LIMIT 2"
             )
             recs = (sf.query(q) or {}).get("records") or []
-            if recs:
+            if len(recs) == 1:
                 cid = str(recs[0].get("Id") or "").strip() or None
                 if cid:
                     return cid, label
@@ -1577,7 +1580,8 @@ def _erro_indica_duplicata_sf(err: Any) -> bool:
     txt = (str(err or "")).lower()
     compact = re.sub(r"\s+", "", txt.upper())
     return (
-        "DUPLICATE_VALUE" in compact
+        "DUPLICATES_DETECTED" in compact
+        or "DUPLICATE_VALUE" in compact
         or "duplicad" in txt
         or "duplica o valor" in txt
         or "cpf ja" in txt
@@ -1608,11 +1612,18 @@ def criar_contato_salesforce_preparado(
     reutilizar_existente: bool = True,
 ) -> tuple[Any, Any, Dict[str, Any]]:
     """
-    Monta payload final e cria contato (ou reutiliza por CPF/e-mail/outros campos únicos).
+    Monta payload final e cria contato, ou vincula identidade existente por CPF/e-mail.
     """
-    payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    try:
+        payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    except Exception as exc:
+        return None, f"Falha ao preparar contato: {exc}", dict(payload)
 
     def _vincular_existente(cid_exist: str, campo: Optional[str]) -> tuple[Any, Any, Dict[str, Any]]:
+        try:
+            sf.Contact.update(cid_exist, {"AccountId": payload_final["AccountId"]})
+        except Exception as exc:
+            return None, f"Falha ao vincular contato existente à conta obrigatória: {exc}", payload_final
         rotulo = campo or "cadastro duplicado"
         avisos.append(
             f"Contato já existia no Salesforce ({rotulo}); planilha atualizada com o vínculo."
@@ -1628,7 +1639,12 @@ def criar_contato_salesforce_preparado(
         sf, payload_final, avisos
     )
     if not cid and err and _erro_indica_duplicata_sf(err):
-        cid_exist, campo = _buscar_contact_id_existente(sf, payload_usado)
+        # A regra CPF_Contato pode encontrar CPF com máscara ou fora da consulta inicial.
+        ids = set(re.findall(r"/Contact/(003[A-Za-z0-9]{15}|003[A-Za-z0-9]{12})(?![A-Za-z0-9])", str(err)))
+        if len(ids) == 1 and "CPF_Contato" in str(err):
+            cid_exist, campo = ids.pop(), "CPF"
+        else:
+            cid_exist, campo = _buscar_contact_id_existente(sf, payload_usado)
         if cid_exist:
             return _vincular_existente(cid_exist, campo)
     return cid, err, payload_usado
@@ -1672,7 +1688,10 @@ def preparar_contato_para_insert(
     payload, avisos = montar_payload_salesforce(dados)
     avisos = list(avisos)
     avisos.extend(_enriquecer_mobile_phone(payload, dados))
-    payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    try:
+        payload_final = _preparar_payload_insert_salesforce(payload, dados, sf, avisos)
+    except Exception as exc:
+        return {}, dados, avisos, [f"Falha ao preparar contato: {exc}"]
     erros_payload = validar_payload_minimo_salesforce(payload_final)
     return payload_final, dados, avisos, erros_payload
 
@@ -2087,17 +2106,11 @@ def _aplicar_enriquecimentos_payload_sf(
     """
     payload["Origem__c"] = "RH"
 
-    conta_escolhida_gerente = _norm_picklist(dados.get("gerente_vendas"))
-    nome_conta_ref = conta_escolhida_gerente or str(dados.get("account_name") or "").strip()
-
-    if not (payload.get("AccountId") or "").strip() or conta_escolhida_gerente:
-        aid = _resolver_account_id_por_nome(sf, nome_conta_ref)
-        if aid:
-            payload["AccountId"] = aid
-        else:
-            nconta = nome_conta_ref
-            if nconta:
-                avisos.append(f"Nome da conta não localizado no Salesforce: {nconta}")
+    # Nunca aceitar conta/gerente de snapshots, planilhas ou Secrets antigos.
+    aid = _resolver_account_id_por_nome(sf, CONTA_CADASTRO_OBRIGATORIA)
+    if not aid:
+        raise ValueError("Conta obrigatória COORDENADORES DV - RJ não localizada ou sem acesso no Salesforce.")
+    payload["AccountId"] = aid
 
     primeiro = (payload.get("FirstName") or "").strip()
     apel = _proximo_apelido_disponivel(sf, primeiro, _suffix_regional_apelido(dados))
@@ -2319,7 +2332,10 @@ def enriquecer_derivados_vendas_rj(dados: Dict[str, Any]) -> Dict[str, Any]:
     else:
         out["salutation"] = ""
 
-    out["account_name"] = _nome_conta_rh_padrao()
+    out["account_name"] = CONTA_CADASTRO_OBRIGATORIA
+    out["gerente_vendas"] = CONTA_CADASTRO_OBRIGATORIA
+    out.pop("account_id", None)
+    out["email"] = _sanear_email_contato(out.get("email"))
 
     rede = _norm_picklist(out.get("unidade_negocio"))
 
@@ -4880,8 +4896,7 @@ def _aplicar_secrets_sf(secrets_dict: Optional[Dict[str, Any]] = None):
 def _credenciais_salesforce_ok() -> bool:
     u = (os.environ.get("SALESFORCE_USER") or "").strip()
     p = (os.environ.get("SALESFORCE_PASSWORD") or "").strip()
-    t = (os.environ.get("SALESFORCE_TOKEN") or "").strip()
-    return bool(u and p and t)
+    return bool(u and p)
 
 
 def aplicar_estilo():
@@ -5595,26 +5610,8 @@ def _opcoes_nome_conta() -> list[str]:
 
 
 def _nome_conta_rh_padrao() -> str:
-    """
-    Conta (Account) usada no vínculo do contato — sem seleção no formulário.
-    Prioridade: [ficha_defaults] account_name → primeira de account_names → aba Gerentes → NOMES_CONTA_FIXOS.
-    """
-    fd = _ficha_defaults_de_secrets()
-    one = str(fd.get("account_name", "")).strip()
-    if one:
-        return one
-    raw = fd.get("account_names")
-    if isinstance(raw, (list, tuple)) and raw:
-        first = str(raw[0]).strip()
-        if first:
-            return first
-    opts = _opcoes_nome_conta()
-    if opts:
-        return opts[0]
-    if NOMES_CONTA_FIXOS:
-        return str(NOMES_CONTA_FIXOS[0])
-    return "RH"
-
+    """Todos os cadastros, inclusive MG, pertencem à mesma árvore."""
+    return CONTA_CADASTRO_OBRIGATORIA
 
 def _campo_api_gerente_vendas() -> str:
     """Campo API Salesforce para o gerente de vendas (configurável por Secrets)."""
@@ -5640,7 +5637,6 @@ def _campo_api_gerente_vendas() -> str:
 _CHAVES_FORA_FORM_INFO_CONTATO: Tuple[str, ...] = (
     "unidade_negocio",
     "regional_cadastro",
-    "gerente_vendas",
 )
 
 
@@ -6490,7 +6486,7 @@ def enviar_email_boas_vindas_candidato(
     if not cfg or not cfg["host"] or not cfg["user"]:
         return False, "SMTP não configurado ([ficha_email] nos Secrets)."
 
-    dest = (dados.get("email") or "").strip()
+    dest = _sanear_email_contato(dados.get("email"))
     if not dest:
         return False, "E-mail do candidato não informado no formulário."
     if not email_contato_formato_valido(dest):
@@ -7085,9 +7081,9 @@ def _processar_envio_cadastro_impl() -> None:
         _registrar_debug_envio("sf_sdk_indisponivel", "simple_salesforce não instalado.")
         msg_amigavel = _mensagem_erro_sf_amigavel("simple_salesforce não instalado.")
     else:
-        sf = conectar_salesforce()
+        sf, diagnostico_sf = conectar_salesforce_diagnostico()
         if not sf:
-            _registrar_debug_envio("sf_conexao_falhou", "Falha na autenticação/rede ao conectar no Salesforce.")
+            _registrar_debug_envio("sf_conexao_falhou", diagnostico_sf or "Falha na autenticação/rede ao conectar no Salesforce.")
             msg_amigavel = _mensagem_erro_sf_amigavel("Falha ao conectar ao Salesforce.")
         else:
             cid, err, payload_utilizado = criar_contato_salesforce_preparado(
