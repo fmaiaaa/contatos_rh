@@ -1825,7 +1825,15 @@ def _celular_resolvivel(dados: Dict[str, Any]) -> bool:
 
 
 def validar_obrigatorios(dados: Dict[str, Any]) -> List[str]:
-    erros: List[str] = validar_dados_integracao(dados) + validar_formulario(dados, CAMPOS)
+    # Campos ocultos de sistema, como AccountId e gerente_vendas, não são entrada
+    # do formulário. Eles são resolvidos/enriquecidos antes do envio ao Salesforce;
+    # validar seus valores legados como se fossem IDs rejeita nomes de conta válidos.
+    campos_formulario = [
+        c for c in CAMPOS if c["key"] not in CAMPOS_OCULTOS_FORMULARIO
+    ]
+    erros: List[str] = validar_dados_integracao(dados) + validar_formulario(
+        dados, campos_formulario
+    )
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
             continue
@@ -1879,8 +1887,11 @@ def validar_obrigatorios_secao(sec: str, dados: Dict[str, Any]) -> List[str]:
     Replica a lógica de `validar_obrigatorios` para `c['sec'] == sec` e, na seção
     «Informações para contato», as regras de conta.
     """
-    erros: List[str] = validar_formulario(dados, CAMPOS, sec)
-    chaves_secao = {c["key"] for c in CAMPOS if c["sec"] == sec}
+    campos_formulario = [
+        c for c in CAMPOS if c["key"] not in CAMPOS_OCULTOS_FORMULARIO
+    ]
+    erros: List[str] = validar_formulario(dados, campos_formulario, sec)
+    chaves_secao = {c["key"] for c in campos_formulario if c["sec"] == sec}
     erros.extend(validar_dados_integracao({k: v for k, v in dados.items() if k in chaves_secao}))
     for c in CAMPOS:
         if c["key"] in CAMPOS_OCULTOS_FORMULARIO:
